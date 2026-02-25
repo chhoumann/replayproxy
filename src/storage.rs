@@ -17,17 +17,24 @@ pub struct Storage {
     db_path: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Recording {
     pub match_key: String,
     pub request_method: String,
     pub request_uri: String,
-    pub request_headers: Vec<(String, String)>,
+    pub request_headers: Vec<(String, Vec<u8>)>,
     pub request_body: Vec<u8>,
     pub response_status: u16,
-    pub response_headers: Vec<(String, String)>,
+    pub response_headers: Vec<(String, Vec<u8>)>,
     pub response_body: Vec<u8>,
     pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredHeaderValue {
+    Bytes(Vec<u8>),
+    Text(String),
 }
 
 impl Recording {
@@ -37,6 +44,25 @@ impl Recording {
             .context("system time before unix epoch")?;
         Ok(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
     }
+}
+
+fn deserialize_headers(
+    headers_json: &str,
+    field_name: &str,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let parsed: Vec<(String, StoredHeaderValue)> = serde_json::from_str(headers_json)
+        .with_context(|| format!("deserialize {field_name} headers"))?;
+
+    Ok(parsed
+        .into_iter()
+        .map(|(name, value)| {
+            let bytes = match value {
+                StoredHeaderValue::Bytes(bytes) => bytes,
+                StoredHeaderValue::Text(text) => text.into_bytes(),
+            };
+            (name, bytes)
+        })
+        .collect())
 }
 
 impl Storage {
@@ -250,10 +276,8 @@ fn get_recording_by_match_key_blocking(
         return Ok(None);
     };
 
-    let request_headers: Vec<(String, String)> =
-        serde_json::from_str(&request_headers_json).context("deserialize request headers")?;
-    let response_headers: Vec<(String, String)> =
-        serde_json::from_str(&response_headers_json).context("deserialize response headers")?;
+    let request_headers = deserialize_headers(&request_headers_json, "request")?;
+    let response_headers = deserialize_headers(&response_headers_json, "response")?;
 
     let response_status = u16::try_from(response_status).context("deserialize response_status")?;
 
@@ -268,4 +292,93 @@ fn get_recording_by_match_key_blocking(
         response_body,
         created_at_unix_ms,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::params;
+
+    use super::{Recording, Storage};
+
+    #[tokio::test]
+    async fn insert_and_fetch_round_trips_binary_headers_and_bodies() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let recording = Recording {
+            match_key: "match-key".to_owned(),
+            request_method: "POST".to_owned(),
+            request_uri: "/v1/chat/completions".to_owned(),
+            request_headers: vec![
+                ("content-type".to_owned(), b"application/json".to_vec()),
+                ("x-request-binary".to_owned(), vec![0x80, 0xff, 0x7f]),
+            ],
+            request_body: vec![0x00, 0x01, 0x02, 0xff],
+            response_status: 201,
+            response_headers: vec![
+                ("x-response-binary".to_owned(), vec![0x80, 0xff, 0x40]),
+                ("cache-control".to_owned(), b"no-store".to_vec()),
+            ],
+            response_body: vec![0xff, 0x02, 0x01, 0x00],
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+
+        storage.insert_recording(recording.clone()).await.unwrap();
+        let fetched = storage
+            .get_recording_by_match_key(&recording.match_key)
+            .await
+            .unwrap();
+
+        assert_eq!(fetched, Some(recording));
+    }
+
+    #[tokio::test]
+    async fn fetch_supports_legacy_string_header_values() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+        let conn = rusqlite::Connection::open(storage.db_path()).unwrap();
+
+        conn.execute(
+            r#"
+            INSERT INTO recordings (
+              match_key,
+              request_method,
+              request_uri,
+              request_headers_json,
+              request_body,
+              response_status,
+              response_headers_json,
+              response_body,
+              created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                "legacy-key",
+                "GET",
+                "/legacy",
+                r#"[["x-request","legacy"]]"#,
+                vec![1u8, 2, 3],
+                200i64,
+                r#"[["x-response","legacy"]]"#,
+                vec![4u8, 5, 6],
+                Recording::now_unix_ms().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let fetched = storage
+            .get_recording_by_match_key("legacy-key")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            fetched.request_headers,
+            vec![("x-request".to_owned(), b"legacy".to_vec())]
+        );
+        assert_eq!(
+            fetched.response_headers,
+            vec![("x-response".to_owned(), b"legacy".to_vec())]
+        );
+    }
 }

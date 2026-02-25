@@ -16,6 +16,8 @@ use hyper_util::{
 use rusqlite::Connection;
 use tokio::{net::TcpListener, sync::mpsc};
 
+const BINARY_HEADER_VALUE: &[u8] = b"\x80\xffok";
+
 #[derive(Debug)]
 struct CapturedRequest {
     uri: Uri,
@@ -127,6 +129,10 @@ mode = "record"
 
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body_bytes[..], b"upstream-body");
 
@@ -188,6 +194,10 @@ mode = "passthrough-cache"
 
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body_bytes[..], b"upstream-body");
 
@@ -200,6 +210,10 @@ mode = "passthrough-cache"
         .unwrap();
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body_bytes[..], b"upstream-body");
 
@@ -257,6 +271,10 @@ mode = "record"
 
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body_bytes[..], b"upstream-body");
 
@@ -498,6 +516,10 @@ async fn spawn_upstream() -> (
                     .insert("x-resp-hop", HeaderValue::from_static("yes"));
                 res.headers_mut()
                     .insert("x-resp-end", HeaderValue::from_static("ok"));
+                res.headers_mut().insert(
+                    "x-resp-binary",
+                    HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
+                );
                 Ok::<_, hyper::Error>(res)
             }
         });

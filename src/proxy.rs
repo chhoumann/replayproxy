@@ -351,7 +351,7 @@ fn response_from_recording(recording: Recording) -> Response<Full<Bytes>> {
             tracing::debug!("invalid header name in recording");
             continue;
         };
-        let Ok(header_value) = HeaderValue::from_str(&value) else {
+        let Ok(header_value) = HeaderValue::from_bytes(&value) else {
             tracing::debug!(
                 "invalid header value in recording for {}",
                 header_name.as_str()
@@ -430,14 +430,9 @@ fn request_uri_for_recording(uri: &Uri) -> String {
         .unwrap_or_else(|| uri.path().to_owned())
 }
 
-fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
     headers
         .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_owned(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
-        })
+        .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
         .collect()
 }

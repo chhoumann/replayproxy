@@ -122,3 +122,9 @@ replayproxy session create test-session --config ./replayproxy.toml
 replayproxy recording list --config ./replayproxy.toml
 replayproxy recording search "GET /api/get" --config ./replayproxy.toml
 ```
+
+## Session export format
+
+The stable on-disk export contract for `session export` is documented in
+`docs/session-export-format.md` (layout, required fields, and deterministic
+recording filename rules).

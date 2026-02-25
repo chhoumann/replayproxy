@@ -246,18 +246,20 @@ Acceptance expectations:
 - `PRAGMA foreign_keys = ON`
 - `PRAGMA user_version = 1`
 
-### Export: JSON/YAML
+### Export: JSON
 
 - Export a session to a directory of human-readable files for version control and CI:
   ```
   session-name/
-  ├── index.yaml          # manifest with metadata
+  ├── index.json          # manifest with metadata
   ├── recordings/
-  │   ├── 001-POST-v1-chat-completions.yaml
-  │   ├── 002-GET-v1-models.yaml
+  │   ├── 0001-post-v1-chat-completions-id42.json
+  │   ├── 0002-get-v1-models-id43.json
   │   └── ...
   ```
 - Import from exported directories back into SQLite.
+- Canonical v1 schema details (manifest required fields + deterministic naming rules) live in
+  `docs/session-export-format.md`.
 
 ---
 
@@ -271,7 +273,7 @@ A companion CLI (`replayproxy`) with subcommands:
 | `replayproxy session list` | List all sessions |
 | `replayproxy session create <name>` | Create a new session |
 | `replayproxy session delete <name>` | Delete a session and its recordings |
-| `replayproxy session export <name> --format yaml --out ./dir` | Export session to files |
+| `replayproxy session export <name> --format json --out ./dir` | Export session to files |
 | `replayproxy session import <dir>` | Import session from exported files |
 | `replayproxy recording list [--session <name>]` | List recordings in a session |
 | `replayproxy recording search <query>` | Search recordings by URL, method, body content |

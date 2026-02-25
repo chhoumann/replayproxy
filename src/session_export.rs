@@ -359,3 +359,29 @@ fn slug_ascii(value: &str, max_len: usize, fallback: &str) -> String {
         slug.to_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{recording_file_name, slug_ascii};
+
+    #[test]
+    fn recording_file_name_is_deterministic() {
+        let file_name = recording_file_name(0, 42, "POST", "/v1/chat/completions?stream=true");
+        assert_eq!(
+            file_name,
+            "0001-post-v1-chat-completions-stream-true-id42.json"
+        );
+    }
+
+    #[test]
+    fn recording_file_name_uses_fallback_slugs() {
+        let file_name = recording_file_name(3, 9, "***", "////");
+        assert_eq!(file_name, "0004-request-path-id9.json");
+    }
+
+    #[test]
+    fn slug_ascii_collapses_delimiters_and_truncates() {
+        let slug = slug_ascii("AAA___BBB___CCC___DDD", 10, "fallback");
+        assert_eq!(slug, "aaa-bbb-cc");
+    }
+}

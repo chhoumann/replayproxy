@@ -412,6 +412,8 @@ pub struct RedactConfig {
     pub headers: Vec<String>,
     #[serde(default)]
     pub body_json: Vec<String>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
 }
 
 impl RedactConfig {
@@ -430,12 +432,21 @@ impl RedactConfig {
             route_name,
             &format!("{config_path}.body_json"),
         )?;
+        normalize_redact_placeholder(
+            &mut self.placeholder,
+            route_name,
+            &format!("{config_path}.placeholder"),
+        )?;
         Ok(())
     }
 
     fn merge(defaults: Option<&Self>, route: Option<&Self>) -> Option<Self> {
         let mut headers = Vec::new();
         let mut body_json = Vec::new();
+        let placeholder = route
+            .and_then(|config| config.placeholder.as_ref())
+            .or_else(|| defaults.and_then(|config| config.placeholder.as_ref()))
+            .cloned();
 
         if let Some(defaults) = defaults {
             append_unique_header_names(&mut headers, &defaults.headers);
@@ -449,7 +460,11 @@ impl RedactConfig {
         if headers.is_empty() && body_json.is_empty() {
             None
         } else {
-            Some(Self { headers, body_json })
+            Some(Self {
+                headers,
+                body_json,
+                placeholder,
+            })
         }
     }
 }
@@ -717,6 +732,27 @@ fn normalize_redact_body_json(
     Ok(())
 }
 
+fn normalize_redact_placeholder(
+    placeholder: &mut Option<String>,
+    route_name: Option<&str>,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    let Some(current_value) = placeholder.as_mut() else {
+        return Ok(());
+    };
+
+    let trimmed = current_value.trim();
+    if trimmed.is_empty() {
+        return Err(redact_error(
+            route_name,
+            format!("`{config_path}` must not be empty"),
+        ));
+    }
+
+    *current_value = trimmed.to_owned();
+    Ok(())
+}
+
 fn append_unique_header_names(target: &mut Vec<String>, values: &[String]) {
     for value in values {
         if !target.iter().any(|existing| existing == value) {
@@ -891,6 +927,7 @@ enabled = true
 
 [defaults.redact]
 headers = ["Authorization", "X-Api-Key", "Cookie"]
+placeholder = "<REDACTED>"
 
 [[routes]]
 name = "openai-chat"
@@ -1012,6 +1049,10 @@ recording_mode = "server-only"
             vec!["authorization", "x-api-key", "cookie"]
         );
         assert_eq!(openai.redact.as_ref().unwrap().body_json, vec!["$.api_key"]);
+        assert_eq!(
+            openai.redact.as_ref().unwrap().placeholder.as_deref(),
+            Some("<REDACTED>")
+        );
         assert!(openai.streaming.as_ref().unwrap().preserve_timing);
         assert_eq!(openai.rate_limit.as_ref().unwrap().requests_per_second, 10);
 
@@ -1021,6 +1062,10 @@ recording_mode = "server-only"
             vec!["authorization", "x-api-key", "cookie"]
         );
         assert!(anthropic.redact.as_ref().unwrap().body_json.is_empty());
+        assert_eq!(
+            anthropic.redact.as_ref().unwrap().placeholder.as_deref(),
+            Some("<REDACTED>")
+        );
         assert_eq!(
             anthropic.transform.as_ref().unwrap().on_request.as_deref(),
             Some("scripts/anthropic_auth.lua")
@@ -1119,6 +1164,7 @@ listen = "127.0.0.1:0"
 [defaults.redact]
 headers = ["Authorization", "X-Api-Key"]
 body_json = ["$.api_key"]
+placeholder = "<DEFAULT-MASK>"
 
 [[routes]]
 path_prefix = "/inherited"
@@ -1131,6 +1177,7 @@ upstream = "https://api.example.com"
 [routes.redact]
 headers = ["Cookie", "authorization"]
 body_json = ["$.token", "$.api_key"]
+placeholder = "<ROUTE-MASK>"
 "#,
         )
         .unwrap();
@@ -1141,6 +1188,7 @@ body_json = ["$.token", "$.api_key"]
             .expect("inherited route redaction should be present");
         assert_eq!(inherited.headers, vec!["authorization", "x-api-key"]);
         assert_eq!(inherited.body_json, vec!["$.api_key"]);
+        assert_eq!(inherited.placeholder.as_deref(), Some("<DEFAULT-MASK>"));
 
         let override_route = config.routes[1]
             .redact
@@ -1151,6 +1199,30 @@ body_json = ["$.token", "$.api_key"]
             vec!["authorization", "x-api-key", "cookie"]
         );
         assert_eq!(override_route.body_json, vec!["$.api_key", "$.token"]);
+        assert_eq!(override_route.placeholder.as_deref(), Some("<ROUTE-MASK>"));
+    }
+
+    #[test]
+    fn empty_redaction_placeholder_fails_fast() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+
+[routes.redact]
+headers = ["authorization"]
+placeholder = "   "
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`routes.redact.placeholder` must not be empty"),
+            "err: {err}"
+        );
     }
 
     #[test]

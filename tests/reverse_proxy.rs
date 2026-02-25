@@ -2339,6 +2339,100 @@ body_json = ["$.auth.token", "$.messages[*].content"]
 }
 
 #[tokio::test]
+async fn record_mode_uses_global_redaction_placeholder_in_storage() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[defaults.redact]
+headers = ["Authorization", "X-Resp-End"]
+body_json = ["$.auth.token"]
+placeholder = "<GLOBAL-MASK>"
+
+[[routes]]
+upstream = "http://{upstream_addr}"
+mode = "record"
+path_prefix = "/api/inherited"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let token = "global-secret";
+    let body = format!(r#"{{"auth":{{"token":"{token}"}}}}"#);
+    let proxy_uri: Uri = format!("http://{}/api/inherited", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/inherited");
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let (request_headers_json, response_headers_json, request_body): (String, String, Vec<u8>) =
+        conn.query_row(
+            "SELECT request_headers_json, response_headers_json, request_body FROM recordings LIMIT 1;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let request_headers: Vec<(String, Vec<u8>)> =
+        serde_json::from_str(&request_headers_json).unwrap();
+    let response_headers: Vec<(String, Vec<u8>)> =
+        serde_json::from_str(&response_headers_json).unwrap();
+    let stored_request_body: Value = serde_json::from_slice(&request_body).unwrap();
+
+    assert_eq!(
+        request_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"<GLOBAL-MASK>".as_slice())
+    );
+    assert_eq!(
+        response_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-end"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"<GLOBAL-MASK>".as_slice())
+    );
+    assert_eq!(
+        stored_request_body
+            .pointer("/auth/token")
+            .and_then(Value::as_str),
+        Some("<GLOBAL-MASK>")
+    );
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn record_mode_redacts_configured_response_json_body_before_storage() {
     let upstream_response_body = br#"{"id":"resp-123","usage":{"prompt_tokens":7,"completion_tokens":11},"choices":[{"message":{"role":"assistant","content":"top-secret-1"}},{"message":{"role":"assistant","content":"top-secret-2"}}],"metadata":{"trace_id":"trace-abc"}}"#;
     let (upstream_addr, mut upstream_rx, upstream_shutdown) =
@@ -2434,6 +2528,114 @@ body_json = ["$.usage.prompt_tokens", "$.choices[*].message.content"]
             .pointer("/metadata/trace_id")
             .and_then(Value::as_str),
         Some("trace-abc")
+    );
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn record_mode_uses_global_redaction_placeholder_before_storage() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[defaults.redact]
+headers = ["Authorization", "X-Resp-End"]
+body_json = ["$.auth.token"]
+placeholder = "<GLOBAL-MASK>"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let request_body = br#"{"auth":{"token":"client-secret"},"other":"ok"}"#;
+    let proxy_uri: Uri = format!("http://{}/api/global-mask", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .header(header::AUTHORIZATION, "Bearer top-secret")
+        .body(Full::new(Bytes::from_static(request_body)))
+        .unwrap();
+
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let _ = res.into_body().collect().await.unwrap();
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(
+        captured.headers.get(header::AUTHORIZATION).unwrap(),
+        &HeaderValue::from_static("Bearer top-secret")
+    );
+    assert_eq!(captured.body.as_ref(), request_body);
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let (request_headers_json, response_headers_json, stored_request_body): (
+        String,
+        String,
+        Vec<u8>,
+    ) = conn
+        .query_row(
+            "SELECT request_headers_json, response_headers_json, request_body FROM recordings LIMIT 1;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    let request_headers: Vec<(String, Vec<u8>)> =
+        serde_json::from_str(&request_headers_json).unwrap();
+    let response_headers: Vec<(String, Vec<u8>)> =
+        serde_json::from_str(&response_headers_json).unwrap();
+    let stored_request_body: Value = serde_json::from_slice(&stored_request_body).unwrap();
+
+    assert_eq!(
+        request_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"<GLOBAL-MASK>".as_slice())
+    );
+    assert_eq!(
+        response_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-end"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"<GLOBAL-MASK>".as_slice())
+    );
+    assert_eq!(
+        stored_request_body
+            .pointer("/auth/token")
+            .and_then(Value::as_str),
+        Some("<GLOBAL-MASK>")
+    );
+    assert_eq!(
+        stored_request_body
+            .pointer("/other")
+            .and_then(Value::as_str),
+        Some("ok")
     );
 
     proxy.shutdown().await;

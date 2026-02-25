@@ -53,7 +53,6 @@ use crate::{
 type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
 type HttpClient = Client<HttpConnector, ProxyBody>;
 const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
-const REDACTION_PLACEHOLDER_BYTES: &[u8] = b"[REDACTED]";
 const SUBSET_QUERY_CANDIDATE_LIMIT: usize = 4096;
 const ADMIN_RECORDINGS_DEFAULT_LIMIT: usize = 100;
 const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
@@ -2830,6 +2829,7 @@ fn redact_recording_headers(
     if redact.headers.is_empty() {
         return headers;
     }
+    let placeholder = redaction_placeholder(redact).as_bytes();
 
     headers
         .into_iter()
@@ -2839,7 +2839,7 @@ fn redact_recording_headers(
                 .iter()
                 .any(|configured| configured.eq_ignore_ascii_case(name.as_str()))
             {
-                (name, REDACTION_PLACEHOLDER_BYTES.to_vec())
+                (name, placeholder.to_vec())
             } else {
                 (name, value)
             }
@@ -2893,7 +2893,7 @@ fn redact_recording_body_json(body: &[u8], redact: Option<&RedactConfig>) -> Vec
     pointers.sort_unstable();
     pointers.dedup();
 
-    let placeholder = Value::String(REDACTION_PLACEHOLDER.to_owned());
+    let placeholder = Value::String(redaction_placeholder(redact).to_owned());
     for pointer in pointers {
         if let Some(node) = json.pointer_mut(pointer.as_str()) {
             *node = placeholder.clone();
@@ -2907,6 +2907,13 @@ fn redact_recording_body_json(body: &[u8], redact: Option<&RedactConfig>) -> Vec
             body.to_vec()
         }
     }
+}
+
+fn redaction_placeholder(redact: &RedactConfig) -> &str {
+    redact
+        .placeholder
+        .as_deref()
+        .unwrap_or(REDACTION_PLACEHOLDER)
 }
 
 #[cfg(test)]
@@ -3080,6 +3087,7 @@ upstream = "http://127.0.0.1:1"
         let redact = RedactConfig {
             headers: vec!["authorization".to_owned(), "X-API-KEY".to_owned()],
             body_json: Vec::new(),
+            placeholder: None,
         };
 
         let redacted = redact_recording_headers(headers, Some(&redact));
@@ -3102,6 +3110,32 @@ upstream = "http://127.0.0.1:1"
     }
 
     #[test]
+    fn redact_recording_uses_custom_placeholder_when_configured() {
+        let headers = vec![("Authorization".to_owned(), b"Bearer topsecret".to_vec())];
+        let redact = RedactConfig {
+            headers: vec!["authorization".to_owned()],
+            body_json: vec!["$.secret".to_owned()],
+            placeholder: Some("<MASKED>".to_owned()),
+        };
+
+        let redacted_headers = redact_recording_headers(headers, Some(&redact));
+        let authorization = redacted_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_slice());
+        assert_eq!(authorization, Some(b"<MASKED>".as_slice()));
+
+        let body = br#"{"secret":"super-secret","safe":"ok"}"#;
+        let redacted_body = redact_recording_body_json(body, Some(&redact));
+        let parsed: Value = serde_json::from_slice(&redacted_body).unwrap();
+        assert_eq!(
+            parsed.pointer("/secret").and_then(Value::as_str),
+            Some("<MASKED>")
+        );
+        assert_eq!(parsed.pointer("/safe").and_then(Value::as_str), Some("ok"));
+    }
+
+    #[test]
     fn redact_recording_body_json_masks_nested_object_and_array_fields() {
         let redact = RedactConfig {
             headers: Vec::new(),
@@ -3109,6 +3143,7 @@ upstream = "http://127.0.0.1:1"
                 "$.auth.token".to_owned(),
                 "$.messages[*].content".to_owned(),
             ],
+            placeholder: None,
         };
         let body = br#"{"auth":{"token":"super-secret","keep":"ok"},"messages":[{"content":"first"},{"content":"second"}]}"#;
 
@@ -3142,6 +3177,7 @@ upstream = "http://127.0.0.1:1"
         let redact = RedactConfig {
             headers: Vec::new(),
             body_json: vec!["$.secret".to_owned()],
+            placeholder: None,
         };
         let body = b"plain-text-body";
 
@@ -3155,6 +3191,7 @@ upstream = "http://127.0.0.1:1"
         let redact = RedactConfig {
             headers: Vec::new(),
             body_json: vec!["$.secret".to_owned()],
+            placeholder: None,
         };
         let secret = "sk-live-super-secret";
         let body = format!(r#"{{"secret":"{secret}""#);
@@ -3180,6 +3217,7 @@ upstream = "http://127.0.0.1:1"
         let redact = RedactConfig {
             headers: Vec::new(),
             body_json: vec![expression.clone()],
+            placeholder: None,
         };
         let body = format!(r#"{{"secret":"{secret}"}}"#);
 

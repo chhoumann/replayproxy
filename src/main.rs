@@ -9,7 +9,13 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use replayproxy::{config::Config, logging, session, storage::SessionManager};
+use replayproxy::{
+    config::Config,
+    logging, session,
+    storage::{RecordingSearch, RecordingSummary, SessionManager, Storage},
+};
+
+const DEFAULT_RECORDING_PAGE_LIMIT: usize = 100;
 
 #[derive(Debug, Parser)]
 #[command(name = "replayproxy")]
@@ -40,6 +46,14 @@ enum Command {
         #[command(subcommand)]
         action: SessionCommand,
     },
+    /// Manage stored recordings.
+    Recording {
+        /// Optional path to config TOML. If omitted, default discovery is used.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: RecordingCommand,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -59,6 +73,43 @@ enum SessionCommand {
     },
 }
 
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum RecordingCommand {
+    /// List recordings.
+    List {
+        /// Optional session to query. Defaults to active session from config.
+        #[arg(long)]
+        session: Option<String>,
+        /// Pagination offset.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Pagination limit.
+        #[arg(long, default_value_t = DEFAULT_RECORDING_PAGE_LIMIT)]
+        limit: usize,
+    },
+    /// Search recordings by URL substring and optional leading HTTP method token.
+    Search {
+        /// Query text (examples: `/chat/completions`, `POST /chat`).
+        query: String,
+        /// Optional session to query. Defaults to active session from config.
+        #[arg(long)]
+        session: Option<String>,
+        /// Pagination offset.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Pagination limit.
+        #[arg(long, default_value_t = DEFAULT_RECORDING_PAGE_LIMIT)]
+        limit: usize,
+    },
+    /// Delete a recording by id.
+    Delete {
+        id: i64,
+        /// Optional session to query. Defaults to active session from config.
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionCommandOutcome {
     Listed {
@@ -74,6 +125,23 @@ enum SessionCommandOutcome {
     Switched {
         name: String,
         admin_addr: SocketAddr,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordingCommandOutcome {
+    Listed {
+        session: String,
+        recordings: Vec<RecordingSummary>,
+    },
+    Searched {
+        session: String,
+        recordings: Vec<RecordingSummary>,
+    },
+    Deleted {
+        session: String,
+        id: i64,
+        deleted: bool,
     },
 }
 
@@ -222,6 +290,96 @@ async fn run_session_command(
     }
 }
 
+async fn resolve_recording_storage(
+    config: &Config,
+    session_override: Option<&str>,
+) -> anyhow::Result<(String, Storage)> {
+    if let Some(session_name) = session_override {
+        let session_manager = require_session_manager(config)?;
+        let storage = session_manager
+            .open_session_storage(session_name)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        return Ok((session_name.to_owned(), storage));
+    }
+
+    let storage = Storage::from_config(config)?
+        .ok_or_else(|| anyhow::anyhow!("storage not configured; set `[storage].path` in config"))?;
+    Ok((configured_active_session(config), storage))
+}
+
+fn is_http_method_token(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE" | "CONNECT"
+    )
+}
+
+fn parse_recording_search_query(query: &str) -> anyhow::Result<RecordingSearch> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("search query cannot be empty");
+    }
+
+    let mut parts = query.split_whitespace();
+    let first = parts.next().expect("split_whitespace always yields first");
+    if is_http_method_token(first) {
+        let remaining = parts.collect::<Vec<_>>().join(" ");
+        return Ok(RecordingSearch {
+            method: Some(first.to_ascii_uppercase()),
+            url_contains: (!remaining.is_empty()).then_some(remaining),
+        });
+    }
+
+    Ok(RecordingSearch {
+        method: None,
+        url_contains: Some(query.to_owned()),
+    })
+}
+
+async fn run_recording_command(
+    config: &Config,
+    command: RecordingCommand,
+) -> anyhow::Result<RecordingCommandOutcome> {
+    match command {
+        RecordingCommand::List {
+            session,
+            offset,
+            limit,
+        } => {
+            let (session, storage) = resolve_recording_storage(config, session.as_deref()).await?;
+            let recordings = storage.list_recordings(offset, limit).await?;
+            Ok(RecordingCommandOutcome::Listed {
+                session,
+                recordings,
+            })
+        }
+        RecordingCommand::Search {
+            query,
+            session,
+            offset,
+            limit,
+        } => {
+            let (session, storage) = resolve_recording_storage(config, session.as_deref()).await?;
+            let search = parse_recording_search_query(&query)?;
+            let recordings = storage.search_recordings(search, offset, limit).await?;
+            Ok(RecordingCommandOutcome::Searched {
+                session,
+                recordings,
+            })
+        }
+        RecordingCommand::Delete { id, session } => {
+            let (session, storage) = resolve_recording_storage(config, session.as_deref()).await?;
+            let deleted = storage.delete_recording(id).await?;
+            Ok(RecordingCommandOutcome::Deleted {
+                session,
+                id,
+                deleted,
+            })
+        }
+    }
+}
+
 fn print_session_command_outcome(outcome: SessionCommandOutcome) {
     match outcome {
         SessionCommandOutcome::Listed {
@@ -244,6 +402,51 @@ fn print_session_command_outcome(outcome: SessionCommandOutcome) {
         }
         SessionCommandOutcome::Switched { name, admin_addr } => {
             println!("switched active session to `{name}` via admin {admin_addr}");
+        }
+    }
+}
+
+fn print_recording_summaries(recordings: &[RecordingSummary]) {
+    println!("id\tmethod\tstatus\turi\tcreated_at_unix_ms");
+    for recording in recordings {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            recording.id,
+            recording.request_method,
+            recording.response_status,
+            recording.request_uri,
+            recording.created_at_unix_ms
+        );
+    }
+}
+
+fn print_recording_command_outcome(outcome: RecordingCommandOutcome) {
+    match outcome {
+        RecordingCommandOutcome::Listed {
+            session,
+            recordings,
+        }
+        | RecordingCommandOutcome::Searched {
+            session,
+            recordings,
+        } => {
+            if recordings.is_empty() {
+                println!("no recordings found in session `{session}`");
+                return;
+            }
+            println!("session `{session}`");
+            print_recording_summaries(&recordings);
+        }
+        RecordingCommandOutcome::Deleted {
+            session,
+            id,
+            deleted,
+        } => {
+            if deleted {
+                println!("deleted recording `{id}` in session `{session}`");
+            } else {
+                println!("recording `{id}` not found in session `{session}`");
+            }
         }
     }
 }
@@ -273,6 +476,11 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load(config.as_deref())?;
             let outcome = run_session_command(&config, action).await?;
             print_session_command_outcome(outcome);
+        }
+        Command::Recording { config, action } => {
+            let config = Config::load(config.as_deref())?;
+            let outcome = run_recording_command(&config, action).await?;
+            print_recording_command_outcome(outcome);
         }
     }
 
@@ -334,11 +542,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        Cli, Command, SessionCommand, SessionCommandOutcome, encode_uri_path_segment,
-        redact_if_present, run_session_command, startup_summary,
+        Cli, Command, RecordingCommand, RecordingCommandOutcome, SessionCommand,
+        SessionCommandOutcome, encode_uri_path_segment, redact_if_present, run_recording_command,
+        run_session_command, startup_summary,
     };
     use clap::Parser;
-    use replayproxy::config::Config;
+    use replayproxy::{
+        config::Config,
+        storage::{Recording, SessionManager, Storage},
+    };
     use tempfile::tempdir;
 
     fn config_with_storage(base_path: &Path, active_session: Option<&str>) -> Config {
@@ -383,6 +595,25 @@ active_session = "{active_session}"
             base_path.display()
         ))
         .expect("config should parse")
+    }
+
+    fn recording_fixture(
+        match_key: &str,
+        method: &str,
+        uri: &str,
+        created_at_unix_ms: i64,
+    ) -> Recording {
+        Recording {
+            match_key: match_key.to_owned(),
+            request_method: method.to_owned(),
+            request_uri: uri.to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: format!("response:{uri}").into_bytes(),
+            created_at_unix_ms,
+        }
     }
 
     #[test]
@@ -550,6 +781,89 @@ active_session = "{active_session}"
             SessionCommand::Switch {
                 name: "staging".to_owned(),
                 admin_addr: Some("127.0.0.1:9090".parse().unwrap())
+            }
+        );
+    }
+
+    #[test]
+    fn recording_list_parses_with_session_and_pagination_flags() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "recording",
+            "--config",
+            "custom.toml",
+            "list",
+            "--session",
+            "staging",
+            "--offset",
+            "10",
+            "--limit",
+            "25",
+        ])
+        .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Recording { config, action } => (config, action),
+            other => panic!("expected recording command, got {other:?}"),
+        };
+        assert_eq!(config, Some(PathBuf::from("custom.toml")));
+        assert_eq!(
+            action,
+            RecordingCommand::List {
+                session: Some("staging".to_owned()),
+                offset: 10,
+                limit: 25,
+            }
+        );
+    }
+
+    #[test]
+    fn recording_search_parses_query_and_optional_session() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "recording",
+            "search",
+            "POST /chat/completions",
+            "--session",
+            "default",
+        ])
+        .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Recording { config, action } => (config, action),
+            other => panic!("expected recording command, got {other:?}"),
+        };
+        assert_eq!(config, None);
+        assert_eq!(
+            action,
+            RecordingCommand::Search {
+                query: "POST /chat/completions".to_owned(),
+                session: Some("default".to_owned()),
+                offset: 0,
+                limit: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn recording_delete_parses() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "recording",
+            "delete",
+            "42",
+            "--session",
+            "staging",
+        ])
+        .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Recording { config, action } => (config, action),
+            other => panic!("expected recording command, got {other:?}"),
+        };
+        assert_eq!(config, None);
+        assert_eq!(
+            action,
+            RecordingCommand::Delete {
+                id: 42,
+                session: Some("staging".to_owned()),
             }
         );
     }
@@ -723,6 +1037,223 @@ active_session = "{active_session}"
         let err = run_session_command(&config, SessionCommand::List)
             .await
             .expect_err("missing storage should fail");
+        assert!(
+            err.to_string().contains("storage not configured"),
+            "error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_list_search_delete_round_trip() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        let storage = Storage::from_config(&config)
+            .expect("storage from config should parse")
+            .expect("storage should be enabled");
+
+        let base_timestamp = Recording::now_unix_ms().expect("timestamp should be available");
+        let first = recording_fixture("recording-1", "GET", "/v1/models", base_timestamp);
+        let second = recording_fixture(
+            "recording-2",
+            "POST",
+            "/v1/chat/completions",
+            base_timestamp + 1,
+        );
+
+        let first_id = storage
+            .insert_recording(first)
+            .await
+            .expect("insert first should succeed");
+        let second_id = storage
+            .insert_recording(second)
+            .await
+            .expect("insert second should succeed");
+
+        let listed = run_recording_command(
+            &config,
+            RecordingCommand::List {
+                session: None,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("recording list should succeed");
+        match listed {
+            RecordingCommandOutcome::Listed {
+                session,
+                recordings,
+            } => {
+                assert_eq!(session, "default");
+                assert_eq!(recordings.len(), 2);
+                assert_eq!(recordings[0].id, second_id);
+                assert_eq!(recordings[0].request_method, "POST");
+                assert_eq!(recordings[0].request_uri, "/v1/chat/completions");
+                assert_eq!(recordings[1].id, first_id);
+            }
+            other => panic!("expected listed outcome, got {other:?}"),
+        }
+
+        let searched = run_recording_command(
+            &config,
+            RecordingCommand::Search {
+                query: "POST /chat".to_owned(),
+                session: None,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("recording search should succeed");
+        match searched {
+            RecordingCommandOutcome::Searched {
+                session,
+                recordings,
+            } => {
+                assert_eq!(session, "default");
+                assert_eq!(recordings.len(), 1);
+                assert_eq!(recordings[0].id, second_id);
+                assert_eq!(recordings[0].request_method, "POST");
+                assert_eq!(recordings[0].request_uri, "/v1/chat/completions");
+            }
+            other => panic!("expected searched outcome, got {other:?}"),
+        }
+
+        let deleted = run_recording_command(
+            &config,
+            RecordingCommand::Delete {
+                id: first_id,
+                session: None,
+            },
+        )
+        .await
+        .expect("recording delete should succeed");
+        assert_eq!(
+            deleted,
+            RecordingCommandOutcome::Deleted {
+                session: "default".to_owned(),
+                id: first_id,
+                deleted: true,
+            }
+        );
+
+        let deleted_again = run_recording_command(
+            &config,
+            RecordingCommand::Delete {
+                id: first_id,
+                session: None,
+            },
+        )
+        .await
+        .expect("recording delete should succeed");
+        assert_eq!(
+            deleted_again,
+            RecordingCommandOutcome::Deleted {
+                session: "default".to_owned(),
+                id: first_id,
+                deleted: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_list_honors_session_override() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager init should succeed")
+            .expect("storage should be configured");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should be created");
+
+        let base_timestamp = Recording::now_unix_ms().expect("timestamp should be available");
+        let default_storage = Storage::from_config(&config)
+            .expect("storage from config should parse")
+            .expect("storage should be enabled");
+        default_storage
+            .insert_recording(recording_fixture(
+                "default-key",
+                "GET",
+                "/default",
+                base_timestamp,
+            ))
+            .await
+            .expect("insert into default should succeed");
+
+        let staging_storage = manager
+            .open_session_storage("staging")
+            .await
+            .expect("staging storage should open");
+        staging_storage
+            .insert_recording(recording_fixture(
+                "staging-key",
+                "GET",
+                "/staging",
+                base_timestamp + 1,
+            ))
+            .await
+            .expect("insert into staging should succeed");
+
+        let listed_default = run_recording_command(
+            &config,
+            RecordingCommand::List {
+                session: None,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("default list should succeed");
+        match listed_default {
+            RecordingCommandOutcome::Listed {
+                session,
+                recordings,
+            } => {
+                assert_eq!(session, "default");
+                assert_eq!(recordings.len(), 1);
+                assert_eq!(recordings[0].request_uri, "/default");
+            }
+            other => panic!("expected listed outcome, got {other:?}"),
+        }
+
+        let listed_staging = run_recording_command(
+            &config,
+            RecordingCommand::List {
+                session: Some("staging".to_owned()),
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("staging list should succeed");
+        match listed_staging {
+            RecordingCommandOutcome::Listed {
+                session,
+                recordings,
+            } => {
+                assert_eq!(session, "staging");
+                assert_eq!(recordings.len(), 1);
+                assert_eq!(recordings[0].request_uri, "/staging");
+            }
+            other => panic!("expected listed outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_commands_require_storage_configuration() {
+        let config = config_without_storage();
+        let err = run_recording_command(
+            &config,
+            RecordingCommand::List {
+                session: None,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect_err("missing storage should fail");
         assert!(
             err.to_string().contains("storage not configured"),
             "error: {err}"

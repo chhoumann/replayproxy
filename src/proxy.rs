@@ -15,7 +15,11 @@ use hyper_util::{
 };
 use tokio::{net::TcpListener, sync::oneshot};
 
-use crate::config::{Config, RouteConfig};
+use crate::{
+    config::{Config, RouteMode},
+    matching,
+    storage::{Recording, Storage},
+};
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
 
@@ -45,7 +49,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     connector.enforce_http(false);
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(connector);
 
-    let state = Arc::new(ProxyState::new(config.routes.clone(), client)?);
+    let state = Arc::new(ProxyState::new(config, client)?);
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
@@ -81,36 +85,45 @@ struct ProxyRoute {
     path_exact: Option<String>,
     path_regex: Option<String>,
     upstream: Option<Uri>,
+    mode: RouteMode,
 }
 
 #[derive(Debug)]
 struct ProxyState {
     routes: Vec<ProxyRoute>,
     client: HttpClient,
+    storage: Option<Storage>,
 }
 
 impl ProxyState {
-    fn new(routes: Vec<RouteConfig>, client: HttpClient) -> anyhow::Result<Self> {
-        let mut parsed_routes = Vec::with_capacity(routes.len());
-        for route in routes {
+    fn new(config: &Config, client: HttpClient) -> anyhow::Result<Self> {
+        let mut parsed_routes = Vec::with_capacity(config.routes.len());
+        for route in &config.routes {
             let upstream =
-                match route.upstream {
+                match route.upstream.as_deref() {
                     Some(upstream) => Some(upstream.parse().map_err(|err| {
                         anyhow::anyhow!("parse route.upstream {upstream}: {err}")
                     })?),
                     None => None,
                 };
+
+            let mode = route
+                .mode
+                .or(config.proxy.mode)
+                .unwrap_or(RouteMode::PassthroughCache);
             parsed_routes.push(ProxyRoute {
-                path_prefix: route.path_prefix,
-                path_exact: route.path_exact,
-                path_regex: route.path_regex,
+                path_prefix: route.path_prefix.clone(),
+                path_exact: route.path_exact.clone(),
+                path_regex: route.path_regex.clone(),
                 upstream,
+                mode,
             });
         }
 
         Ok(Self {
             routes: parsed_routes,
             client,
+            storage: Storage::from_config(config)?,
         })
     }
 
@@ -160,6 +173,8 @@ async fn proxy_handler(
         }
     };
 
+    let should_record = route.mode == RouteMode::Record && state.storage.is_some();
+
     let (mut parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -172,8 +187,15 @@ async fn proxy_handler(
         }
     };
 
-    parts.uri = upstream_uri.clone();
     strip_hop_by_hop_headers(&mut parts.headers);
+    let record_request_headers = should_record.then(|| header_map_to_vec(&parts.headers));
+    let record_request_uri = should_record.then(|| request_uri_for_recording(&parts.uri));
+    let record_request_method = should_record.then(|| parts.method.to_string());
+    let record_match_key = should_record
+        .then(|| matching::compute_match_key(&parts.method, &parts.uri, body_bytes.as_ref()));
+    let record_request_body = should_record.then(|| body_bytes.to_vec());
+
+    parts.uri = upstream_uri.clone();
     set_host_header(&mut parts.headers, &upstream_uri);
 
     let upstream_req = Request::from_parts(parts, Full::new(body_bytes));
@@ -191,6 +213,8 @@ async fn proxy_handler(
 
     let (mut parts, body) = upstream_res.into_parts();
     strip_hop_by_hop_headers(&mut parts.headers);
+    let record_response_status = should_record.then(|| parts.status.as_u16());
+    let record_response_headers = should_record.then(|| header_map_to_vec(&parts.headers));
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
@@ -201,6 +225,55 @@ async fn proxy_handler(
             ));
         }
     };
+
+    if should_record {
+        if let (
+            Some(storage),
+            Some(match_key),
+            Some(request_method),
+            Some(request_uri),
+            Some(request_headers),
+            Some(request_body),
+            Some(response_status),
+            Some(response_headers),
+        ) = (
+            state.storage.as_ref(),
+            record_match_key,
+            record_request_method,
+            record_request_uri,
+            record_request_headers,
+            record_request_body,
+            record_response_status,
+            record_response_headers,
+        ) {
+            let created_at_unix_ms = match Recording::now_unix_ms() {
+                Ok(ts) => ts,
+                Err(err) => {
+                    tracing::debug!("failed to compute recording timestamp: {err}");
+                    return Ok(simple_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to persist recording",
+                    ));
+                }
+            };
+
+            let recording = Recording {
+                match_key,
+                request_method,
+                request_uri,
+                request_headers,
+                request_body,
+                response_status,
+                response_headers,
+                response_body: body_bytes.to_vec(),
+                created_at_unix_ms,
+            };
+
+            if let Err(err) = storage.insert_recording(recording).await {
+                tracing::debug!("failed to persist recording: {err}");
+            }
+        }
+    }
 
     Ok(Response::from_parts(parts, Full::new(body_bytes)))
 }
@@ -262,4 +335,22 @@ fn simple_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response
+}
+
+fn request_uri_for_recording(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| uri.path().to_owned())
+}
+
+fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
 }

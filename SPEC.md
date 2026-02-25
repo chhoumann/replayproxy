@@ -185,6 +185,32 @@ Configurable sanitization of sensitive data **before** storing to the database:
 - Schema stores: request method, URL, headers, body (or body hash), response status, headers, body, chunks (for streaming), timestamps, match key hash.
 - WAL mode for concurrent read/write access.
 
+#### SQLite schema (v1)
+
+**Table: `recordings`**
+
+- `id` — `INTEGER PRIMARY KEY AUTOINCREMENT`
+- `match_key` — `TEXT NOT NULL` (hex-encoded hash of selected match dimensions)
+- `request_method` — `TEXT NOT NULL`
+- `request_uri` — `TEXT NOT NULL` (path + query)
+- `request_headers_json` — `TEXT NOT NULL` (JSON array of `[name, value]` pairs)
+- `request_body` — `BLOB NOT NULL`
+- `response_status` — `INTEGER NOT NULL`
+- `response_headers_json` — `TEXT NOT NULL` (JSON array of `[name, value]` pairs)
+- `response_body` — `BLOB NOT NULL`
+- `created_at_unix_ms` — `INTEGER NOT NULL`
+
+**Indexes**
+
+- `recordings_match_key_idx` on `recordings(match_key)`
+
+**DB settings**
+
+- `PRAGMA journal_mode = WAL`
+- `PRAGMA synchronous = NORMAL`
+- `PRAGMA foreign_keys = ON`
+- `PRAGMA user_version = 1`
+
 ### Export: JSON/YAML
 
 - Export a session to a directory of human-readable files for version control and CI:

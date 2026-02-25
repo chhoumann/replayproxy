@@ -1,4 +1,4 @@
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{cmp::Reverse, convert::Infallible, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -13,6 +13,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnectionBuilder,
 };
+use regex::Regex;
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
@@ -83,11 +84,24 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
 struct ProxyRoute {
     path_prefix: Option<String>,
     path_exact: Option<String>,
-    path_regex: Option<String>,
+    path_regex: Option<Regex>,
     upstream: Option<Uri>,
     mode: RouteMode,
     cache_miss: CacheMissPolicy,
     match_config: Option<RouteMatchConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PathMatchKind {
+    Regex,
+    Prefix,
+    Exact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PathMatchScore {
+    kind: PathMatchKind,
+    specificity: usize,
 }
 
 #[derive(Debug)]
@@ -101,6 +115,13 @@ impl ProxyState {
     fn new(config: &Config, client: HttpClient) -> anyhow::Result<Self> {
         let mut parsed_routes = Vec::with_capacity(config.routes.len());
         for route in &config.routes {
+            let path_regex =
+                match route.path_regex.as_deref() {
+                    Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
+                        anyhow::anyhow!("parse route.path_regex {pattern}: {err}")
+                    })?),
+                    None => None,
+                };
             let upstream =
                 match route.upstream.as_deref() {
                     Some(upstream) => Some(upstream.parse().map_err(|err| {
@@ -120,7 +141,7 @@ impl ProxyState {
             parsed_routes.push(ProxyRoute {
                 path_prefix: route.path_prefix.clone(),
                 path_exact: route.path_exact.clone(),
-                path_regex: route.path_regex.clone(),
+                path_regex,
                 upstream,
                 mode,
                 cache_miss,
@@ -136,23 +157,55 @@ impl ProxyState {
     }
 
     fn route_for(&self, path: &str) -> Option<&ProxyRoute> {
-        self.routes.iter().find(|route| route.matches(path))
+        select_route(&self.routes, path)
     }
 }
 
 impl ProxyRoute {
-    fn matches(&self, path: &str) -> bool {
+    fn match_score(&self, path: &str) -> Option<PathMatchScore> {
         if let Some(exact) = self.path_exact.as_deref() {
-            return path == exact;
+            if path == exact {
+                return Some(PathMatchScore {
+                    kind: PathMatchKind::Exact,
+                    specificity: exact.len(),
+                });
+            }
         }
         if let Some(prefix) = self.path_prefix.as_deref() {
-            return path.starts_with(prefix);
+            if path.starts_with(prefix) {
+                return Some(PathMatchScore {
+                    kind: PathMatchKind::Prefix,
+                    specificity: prefix.len(),
+                });
+            }
         }
-        if self.path_regex.is_some() {
-            return false;
+        if let Some(regex) = self.path_regex.as_ref() {
+            if regex.is_match(path) {
+                return Some(PathMatchScore {
+                    kind: PathMatchKind::Regex,
+                    specificity: 0,
+                });
+            }
         }
-        false
+        None
     }
+}
+
+fn select_route<'a>(routes: &'a [ProxyRoute], path: &str) -> Option<&'a ProxyRoute> {
+    routes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, route)| {
+            route
+                .match_score(path)
+                .map(|score| (score, Reverse(idx), route))
+        })
+        .max_by(|(left_score, left_idx, _), (right_score, right_idx, _)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| left_idx.cmp(right_idx))
+        })
+        .map(|(_, _, route)| route)
 }
 
 async fn proxy_handler(
@@ -435,4 +488,103 @@ fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
         .iter()
         .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProxyRoute, ProxyState, select_route};
+    use crate::config::{CacheMissPolicy, Config, RouteMode};
+
+    fn test_route(
+        path_exact: Option<&str>,
+        path_prefix: Option<&str>,
+        path_regex: Option<&str>,
+    ) -> ProxyRoute {
+        ProxyRoute {
+            path_prefix: path_prefix.map(str::to_owned),
+            path_exact: path_exact.map(str::to_owned),
+            path_regex: path_regex.map(|pattern| regex::Regex::new(pattern).unwrap()),
+            upstream: None,
+            mode: RouteMode::Record,
+            cache_miss: CacheMissPolicy::Forward,
+            match_config: None,
+        }
+    }
+
+    fn test_client() -> super::HttpClient {
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        connector.enforce_http(false);
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(connector)
+    }
+
+    #[test]
+    fn route_selection_prefers_exact_over_prefix() {
+        let routes = vec![
+            test_route(None, Some("/api"), None),
+            test_route(Some("/api/users"), None, None),
+        ];
+
+        let selected = select_route(&routes, "/api/users").expect("expected route");
+        assert_eq!(selected.path_exact.as_deref(), Some("/api/users"));
+    }
+
+    #[test]
+    fn route_selection_prefers_longest_prefix() {
+        let routes = vec![
+            test_route(None, Some("/api"), None),
+            test_route(None, Some("/api/v1"), None),
+        ];
+
+        let selected = select_route(&routes, "/api/v1/chat").expect("expected route");
+        assert_eq!(selected.path_prefix.as_deref(), Some("/api/v1"));
+    }
+
+    #[test]
+    fn route_selection_prefers_prefix_over_regex() {
+        let routes = vec![
+            test_route(None, None, Some(r"^/api/.*$")),
+            test_route(None, Some("/api/v1"), None),
+        ];
+
+        let selected = select_route(&routes, "/api/v1/chat").expect("expected route");
+        assert_eq!(selected.path_prefix.as_deref(), Some("/api/v1"));
+    }
+
+    #[test]
+    fn route_selection_falls_back_to_regex_match() {
+        let routes = vec![test_route(None, None, Some(r"^/v\d+/chat$"))];
+
+        let selected = select_route(&routes, "/v1/chat").expect("expected route");
+        assert!(selected.path_regex.is_some());
+    }
+
+    #[test]
+    fn route_selection_uses_first_defined_route_on_tie() {
+        let routes = vec![
+            test_route(None, None, Some(r"^/api/.*$")),
+            test_route(None, None, Some(r"^/api/.*$")),
+        ];
+
+        let selected = select_route(&routes, "/api/users").expect("expected route");
+        assert!(std::ptr::eq(selected, &routes[0]));
+    }
+
+    #[test]
+    fn proxy_state_new_rejects_invalid_path_regex() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_regex = "("
+upstream = "http://127.0.0.1:1"
+"#,
+        )
+        .unwrap();
+
+        let err = ProxyState::new(&config, test_client()).unwrap_err();
+        assert!(err.to_string().contains("parse route.path_regex"));
+    }
 }

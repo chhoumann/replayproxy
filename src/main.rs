@@ -12,6 +12,7 @@ use hyper_util::{
 use replayproxy::{
     config::Config,
     logging, session,
+    session_export::{self, SessionExportFormat, SessionExportRequest, SessionExportResult},
     storage::{RecordingSearch, RecordingSummary, SessionManager, Storage},
 };
 
@@ -71,6 +72,13 @@ enum SessionCommand {
         #[arg(long)]
         admin_addr: Option<SocketAddr>,
     },
+    /// Export a session into JSON files.
+    Export {
+        name: String,
+        /// Optional output directory. Must not already contain files.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -125,6 +133,9 @@ enum SessionCommandOutcome {
     Switched {
         name: String,
         admin_addr: SocketAddr,
+    },
+    Exported {
+        result: SessionExportResult,
     },
 }
 
@@ -287,6 +298,19 @@ async fn run_session_command(
             switch_session_via_admin(admin_addr, &name).await?;
             Ok(SessionCommandOutcome::Switched { name, admin_addr })
         }
+        SessionCommand::Export { name, out } => {
+            let result = session_export::export_session(
+                &session_manager,
+                SessionExportRequest {
+                    session_name: name,
+                    out_dir: out,
+                    format: SessionExportFormat::Json,
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+            Ok(SessionCommandOutcome::Exported { result })
+        }
     }
 }
 
@@ -431,6 +455,14 @@ fn print_session_command_outcome(outcome: SessionCommandOutcome) {
         }
         SessionCommandOutcome::Switched { name, admin_addr } => {
             println!("switched active session to `{name}` via admin {admin_addr}");
+        }
+        SessionCommandOutcome::Exported { result } => {
+            println!(
+                "exported session `{}`: {} recordings to {}",
+                result.session,
+                result.recordings_exported,
+                result.output_dir.display()
+            );
         }
     }
 }
@@ -818,6 +850,33 @@ active_session = "{active_session}"
     }
 
     #[test]
+    fn session_export_parses_with_out_flag() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "session",
+            "--config",
+            "custom.toml",
+            "export",
+            "staging",
+            "--out",
+            "./exports/staging",
+        ])
+        .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Session { config, action } => (config, action),
+            other => panic!("expected session command, got {other:?}"),
+        };
+        assert_eq!(config, Some(PathBuf::from("custom.toml")));
+        assert_eq!(
+            action,
+            SessionCommand::Export {
+                name: "staging".to_owned(),
+                out: Some(PathBuf::from("./exports/staging")),
+            }
+        );
+    }
+
+    #[test]
     fn recording_list_parses_with_session_and_pagination_flags() {
         let cli = Cli::try_parse_from([
             "replayproxy",
@@ -1102,6 +1161,72 @@ active_session = "{active_session}"
                 .contains("cannot delete active session `default`"),
             "error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn session_export_writes_manifest_and_recording_files() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        run_session_command(
+            &config,
+            SessionCommand::Create {
+                name: "default".to_owned(),
+            },
+        )
+        .await
+        .expect("default session should be created");
+        let storage = Storage::from_config(&config)
+            .expect("storage should load")
+            .expect("storage should be configured");
+
+        let created_at = Recording::now_unix_ms().expect("timestamp should be available");
+        storage
+            .insert_recording(recording_fixture("a", "GET", "/v1/models", created_at))
+            .await
+            .expect("first insert should succeed");
+        storage
+            .insert_recording(recording_fixture(
+                "b",
+                "POST",
+                "/v1/chat/completions",
+                created_at + 1,
+            ))
+            .await
+            .expect("second insert should succeed");
+
+        let export_dir = temp_dir.path().join("exports").join("default");
+        let outcome = run_session_command(
+            &config,
+            SessionCommand::Export {
+                name: "default".to_owned(),
+                out: Some(export_dir.clone()),
+            },
+        )
+        .await
+        .expect("session export should succeed");
+
+        let result = match outcome {
+            SessionCommandOutcome::Exported { result } => result,
+            other => panic!("expected exported outcome, got {other:?}"),
+        };
+        assert_eq!(result.session, "default");
+        assert_eq!(result.recordings_exported, 2);
+        assert_eq!(result.output_dir, export_dir);
+        assert_eq!(result.manifest_path, export_dir.join("index.json"));
+        assert!(result.manifest_path.exists());
+
+        let manifest_bytes = std::fs::read(&result.manifest_path).expect("manifest should exist");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).expect("manifest should be JSON");
+        assert_eq!(manifest["session"].as_str(), Some("default"));
+        assert_eq!(manifest["format"].as_str(), Some("json"));
+        assert_eq!(manifest["recordings"].as_array().map(Vec::len), Some(2));
+
+        let recordings_dir = export_dir.join("recordings");
+        let file_count = std::fs::read_dir(recordings_dir)
+            .expect("recordings dir should exist")
+            .count();
+        assert_eq!(file_count, 2);
     }
 
     #[tokio::test]

@@ -43,6 +43,7 @@ use crate::{
         RouteMatchConfig, RouteMode,
     },
     matching,
+    session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
     storage::{
         Recording, RecordingSearch, RecordingSummary, SessionManager, SessionManagerError, Storage,
     },
@@ -432,6 +433,14 @@ struct CreateSessionRequest {
 #[derive(Debug, Serialize)]
 struct SessionResponse {
     name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AdminSessionExportRequest {
+    #[serde(default)]
+    out_dir: Option<PathBuf>,
+    #[serde(default)]
+    format: Option<SessionExportFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2132,6 +2141,16 @@ fn status_for_session_error(err: &SessionManagerError) -> StatusCode {
     }
 }
 
+fn status_for_session_export_error(err: &SessionExportError) -> StatusCode {
+    match err {
+        SessionExportError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        SessionExportError::Session(err) => status_for_session_error(err),
+        SessionExportError::Io(_) | SessionExportError::Internal(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 fn status_for_config_reload_error(message: &str) -> StatusCode {
     if message.contains("parse config ")
         || message.contains("parse route.path_regex")
@@ -2141,6 +2160,18 @@ fn status_for_config_reload_error(message: &str) -> StatusCode {
     }
 
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn parse_admin_session_export_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/_admin/sessions/")?;
+    let (session_name, export_suffix) = rest.split_once("/export")?;
+    if session_name.is_empty() || session_name.contains('/') {
+        return None;
+    }
+    if export_suffix.is_empty() || export_suffix == "/" {
+        return Some(session_name);
+    }
+    None
 }
 
 fn parse_admin_recordings_collection_path(path: &str) -> Option<&str> {
@@ -2488,6 +2519,62 @@ async fn admin_handler(
                     "failed to list recordings",
                 ))
             }
+        };
+    }
+
+    if let Some(session_name) = parse_admin_session_export_path(&path) {
+        if method != hyper::Method::POST {
+            return Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        let body_bytes = match req.into_body().collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(err) => {
+                return Ok(admin_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read request body: {err}"),
+                ));
+            }
+        };
+        let export_request = if body_bytes.is_empty() {
+            AdminSessionExportRequest::default()
+        } else {
+            match serde_json::from_slice::<AdminSessionExportRequest>(&body_bytes) {
+                Ok(request) => request,
+                Err(err) => {
+                    return Ok(admin_error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid JSON body: {err}"),
+                    ));
+                }
+            }
+        };
+
+        return match session_export::export_session(
+            session_manager,
+            SessionExportRequest {
+                session_name: session_name.to_owned(),
+                out_dir: export_request.out_dir,
+                format: export_request.format.unwrap_or_default(),
+            },
+        )
+        .await
+        {
+            Ok(result) => Ok(admin_json_response(StatusCode::OK, &result)),
+            Err(err) => Ok(admin_error_response(
+                status_for_session_export_error(&err),
+                err.to_string(),
+            )),
         };
     }
 

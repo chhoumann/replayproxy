@@ -64,6 +64,16 @@ Each route can match on any combination of:
 
 The selected dimensions are normalized and hashed to produce a deterministic cache key. The config specifies which dimensions participate per route.
 
+#### Ordering decision: matching vs redaction
+
+For requests that are both matched and redacted, matching uses the **original request values** (after any `on_request` transform) and redaction applies only to persisted request/response data.
+
+Implications:
+
+- Route behavior remains correct when matching on sensitive inputs such as `Authorization`.
+- Fields listed in both `[routes.match]` and `[routes.redact]` are valid: the original value participates in cache lookup, while the stored value is replaced with the redaction placeholder.
+- Match-key inputs are treated as sensitive operational data: do not log raw pre-hash values.
+
 #### Normalization (match key v1)
 
 To ensure deterministic matching, request components are normalized before hashing:
@@ -164,6 +174,19 @@ Configurable sanitization of sensitive data **before** storing to the database:
 - **JSON body fields**: Redact specific fields using JSONPath expressions (e.g., `$.api_key`).
 - Redacted values are replaced with a configurable placeholder (default: `"[REDACTED]"`).
 - Redaction rules are defined per route in the TOML config.
+
+### Implementation plan for matched + redacted fields
+
+1. Compute an effective redaction config per route by merging `[defaults.redact]` with `[routes.redact]`.
+2. For each request, run `on_request` transforms first, then compute the match key from the transformed, non-redacted request according to `[routes.match]`.
+3. Before writing to SQLite, create redacted copies of request/response headers and bodies using the effective redaction config and placeholder.
+4. Persist the redacted copies and the already-computed match key.
+
+Acceptance expectations:
+
+- If two requests differ only in a matched sensitive field (for example `Authorization`), they produce different match keys.
+- Stored recordings redact that field in headers/body according to policy.
+- Logs and error messages do not emit raw matched sensitive values.
 
 ---
 

@@ -5,10 +5,11 @@ use std::{
     error::Error as StdError,
     fmt::Write as _,
     net::SocketAddr,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -31,7 +32,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json_path::JsonPath;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex as AsyncMutex, oneshot},
+};
 
 use crate::{
     config::{
@@ -113,6 +117,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         ),
         None => None,
     };
+    let runtime_config = Arc::new(RwLock::new(ProxyRuntimeConfig::from_config(config)?));
     let session_runtime = Arc::new(RwLock::new(ActiveSessionRuntime::from_config(config)?));
     let initial_recordings_total = active_session_recordings_total(&session_runtime).await;
     let runtime_status = Arc::new(RuntimeStatus::new(
@@ -133,11 +138,19 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(connector);
 
     let state = Arc::new(ProxyState::new(
-        config,
+        Arc::clone(&runtime_config),
         client,
         Arc::clone(&runtime_status),
         Arc::clone(&session_runtime),
-    )?);
+    ));
+    let config_reloader = config.source_path().map(|source_path| {
+        Arc::new(ConfigReloader {
+            source_path: source_path.to_path_buf(),
+            runtime_config: Arc::clone(&runtime_config),
+            status: Arc::clone(&runtime_status),
+            reload_lock: AsyncMutex::new(()),
+        })
+    });
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
@@ -169,6 +182,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
             session_manager,
             session_runtime,
             metrics_enabled,
+            config_reloader,
         });
         let admin_join = tokio::spawn(async move {
             loop {
@@ -229,7 +243,7 @@ async fn active_session_recordings_total(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProxyRoute {
     route_ref: String,
     path_prefix: Option<String>,
@@ -243,6 +257,60 @@ struct ProxyRoute {
     // Consumed by upcoming redaction storage steps.
     #[allow(dead_code)]
     redact: Option<RedactConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct ProxyRuntimeConfig {
+    routes: Vec<ProxyRoute>,
+    max_body_bytes: usize,
+}
+
+impl ProxyRuntimeConfig {
+    fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let mut parsed_routes = Vec::with_capacity(config.routes.len());
+        for (idx, route) in config.routes.iter().enumerate() {
+            let path_regex =
+                match route.path_regex.as_deref() {
+                    Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
+                        anyhow::anyhow!("parse route.path_regex {pattern}: {err}")
+                    })?),
+                    None => None,
+                };
+            let upstream =
+                match route.upstream.as_deref() {
+                    Some(upstream) => Some(upstream.parse().map_err(|err| {
+                        anyhow::anyhow!("parse route.upstream {upstream}: {err}")
+                    })?),
+                    None => None,
+                };
+
+            let mode = route
+                .mode
+                .or(config.proxy.mode)
+                .unwrap_or(RouteMode::PassthroughCache);
+            let cache_miss = route.cache_miss.unwrap_or(match mode {
+                RouteMode::Replay => CacheMissPolicy::Error,
+                RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
+            });
+            parsed_routes.push(ProxyRoute {
+                route_ref: format_route_ref(route, idx),
+                path_prefix: route.path_prefix.clone(),
+                path_exact: route.path_exact.clone(),
+                path_regex,
+                upstream,
+                mode,
+                cache_miss,
+                body_oversize: route.body_oversize.unwrap_or(BodyOversizePolicy::Error),
+                match_config: route.match_.clone(),
+                redact: route.redact.clone(),
+            });
+        }
+
+        Ok(Self {
+            routes: parsed_routes,
+            max_body_bytes: config.proxy.max_body_bytes,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -299,7 +367,7 @@ impl ActiveSessionRuntime {
 struct RuntimeStatus {
     started_at: Instant,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
-    routes_configured: usize,
+    routes_configured: AtomicUsize,
     proxy_listen_addr: String,
     admin_listen_addr: Option<String>,
     proxy_requests_total: AtomicU64,
@@ -318,6 +386,15 @@ struct AdminState {
     session_manager: Option<SessionManager>,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     metrics_enabled: bool,
+    config_reloader: Option<Arc<ConfigReloader>>,
+}
+
+#[derive(Debug)]
+struct ConfigReloader {
+    source_path: PathBuf,
+    runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
+    status: Arc<RuntimeStatus>,
+    reload_lock: AsyncMutex<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -460,6 +537,16 @@ struct AdminErrorResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminConfigReloadResponse {
+    source: String,
+    routes_before: usize,
+    routes_after: usize,
+    max_body_bytes_before: usize,
+    max_body_bytes_after: usize,
+    changed: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ReplayMissResponse {
     error: &'static str,
     route: String,
@@ -596,7 +683,7 @@ impl RuntimeStatus {
         Self {
             started_at: Instant::now(),
             session_runtime,
-            routes_configured: config.routes.len(),
+            routes_configured: AtomicUsize::new(config.routes.len()),
             proxy_listen_addr: proxy_listen_addr.to_string(),
             admin_listen_addr: admin_listen_addr.map(|addr| addr.to_string()),
             proxy_requests_total: AtomicU64::new(0),
@@ -621,7 +708,7 @@ impl RuntimeStatus {
             active_session: session_runtime.active_session.clone(),
             proxy_listen_addr: self.proxy_listen_addr.clone(),
             admin_listen_addr: self.admin_listen_addr.clone(),
-            routes_configured: self.routes_configured,
+            routes_configured: self.routes_configured.load(Ordering::Relaxed),
             stats: AdminStatusStats {
                 proxy_requests_total: self.proxy_requests_total.load(Ordering::Relaxed),
                 admin_requests_total: self.admin_requests_total.load(Ordering::Relaxed),
@@ -664,6 +751,10 @@ impl RuntimeStatus {
     fn increment_active_session_recordings_total(&self) {
         self.active_session_recordings_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_routes_configured(&self, count: usize) {
+        self.routes_configured.store(count, Ordering::Relaxed);
     }
 
     fn decrement_active_session_recordings_total(&self) {
@@ -714,72 +805,81 @@ impl RuntimeStatus {
     }
 }
 
+impl ConfigReloader {
+    async fn reload(&self) -> anyhow::Result<AdminConfigReloadResponse> {
+        let _reload_guard = self.reload_lock.lock().await;
+        let config = Config::from_path(&self.source_path).map_err(|err| {
+            anyhow::anyhow!("reload config from {}: {err}", self.source_path.display())
+        })?;
+        let next_runtime = ProxyRuntimeConfig::from_config(&config)?;
+
+        let (routes_before, max_body_bytes_before, routes_after, max_body_bytes_after) = {
+            let mut runtime_config = self
+                .runtime_config
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let routes_before = runtime_config.routes.len();
+            let max_body_bytes_before = runtime_config.max_body_bytes;
+            let routes_after = next_runtime.routes.len();
+            let max_body_bytes_after = next_runtime.max_body_bytes;
+            *runtime_config = next_runtime;
+            (
+                routes_before,
+                max_body_bytes_before,
+                routes_after,
+                max_body_bytes_after,
+            )
+        };
+
+        self.status.set_routes_configured(routes_after);
+
+        Ok(AdminConfigReloadResponse {
+            source: self.source_path.display().to_string(),
+            routes_before,
+            routes_after,
+            max_body_bytes_before,
+            max_body_bytes_after,
+            changed: routes_before != routes_after || max_body_bytes_before != max_body_bytes_after,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct ProxyState {
-    routes: Vec<ProxyRoute>,
+    runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
     client: HttpClient,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     status: Arc<RuntimeStatus>,
-    max_body_bytes: usize,
 }
 
 impl ProxyState {
     fn new(
-        config: &Config,
+        runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
         client: HttpClient,
         status: Arc<RuntimeStatus>,
         session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
-    ) -> anyhow::Result<Self> {
-        let mut parsed_routes = Vec::with_capacity(config.routes.len());
-        for (idx, route) in config.routes.iter().enumerate() {
-            let path_regex =
-                match route.path_regex.as_deref() {
-                    Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
-                        anyhow::anyhow!("parse route.path_regex {pattern}: {err}")
-                    })?),
-                    None => None,
-                };
-            let upstream =
-                match route.upstream.as_deref() {
-                    Some(upstream) => Some(upstream.parse().map_err(|err| {
-                        anyhow::anyhow!("parse route.upstream {upstream}: {err}")
-                    })?),
-                    None => None,
-                };
-
-            let mode = route
-                .mode
-                .or(config.proxy.mode)
-                .unwrap_or(RouteMode::PassthroughCache);
-            let cache_miss = route.cache_miss.unwrap_or(match mode {
-                RouteMode::Replay => CacheMissPolicy::Error,
-                RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
-            });
-            parsed_routes.push(ProxyRoute {
-                route_ref: format_route_ref(route, idx),
-                path_prefix: route.path_prefix.clone(),
-                path_exact: route.path_exact.clone(),
-                path_regex,
-                upstream,
-                mode,
-                cache_miss,
-                body_oversize: route.body_oversize.unwrap_or(BodyOversizePolicy::Error),
-                match_config: route.match_.clone(),
-                redact: route.redact.clone(),
-            });
-        }
-
-        Ok(Self {
-            routes: parsed_routes,
+    ) -> Self {
+        Self {
+            runtime_config,
             client,
             session_runtime,
             status,
-            max_body_bytes: config.proxy.max_body_bytes,
-        })
+        }
     }
 
-    fn route_for(&self, path: &str) -> Option<&ProxyRoute> {
-        select_route(&self.routes, path)
+    fn route_for(&self, path: &str) -> Option<ProxyRoute> {
+        let runtime_config = self
+            .runtime_config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        select_route(&runtime_config.routes, path).cloned()
+    }
+
+    fn max_body_bytes(&self) -> usize {
+        self.runtime_config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .max_body_bytes
     }
 
     fn active_session_snapshot(&self) -> ActiveSessionRuntime {
@@ -973,6 +1073,7 @@ async fn proxy_handler(
     let mut mode: Option<RouteMode> = None;
     let mut cache_outcome = CacheLogOutcome::Bypass;
     let mut replay_latency: Option<Duration> = None;
+    let max_body_bytes = state.max_body_bytes();
 
     macro_rules! respond {
         ($upstream_latency:expr, $response:expr) => {{
@@ -1022,7 +1123,7 @@ async fn proxy_handler(
 
     let request_content_length = parse_content_length(req.headers());
     let request_known_oversize = request_content_length
-        .map(|len| len > bytes_limit_u64(state.max_body_bytes))
+        .map(|len| len > bytes_limit_u64(max_body_bytes))
         .unwrap_or(false);
     let allow_oversize_bypass_cache =
         route.body_oversize == BodyOversizePolicy::BypassCache && route.mode != RouteMode::Replay;
@@ -1042,7 +1143,7 @@ async fn proxy_handler(
 
     if bypass_request_buffering {
         tracing::debug!(
-            limit_bytes = state.max_body_bytes,
+            limit_bytes = max_body_bytes,
             content_length = request_content_length.unwrap_or_default(),
             "bypassing cache for oversized request body"
         );
@@ -1077,7 +1178,7 @@ async fn proxy_handler(
         );
     }
 
-    let body_bytes = match read_body_with_limit(body, state.max_body_bytes).await {
+    let body_bytes = match read_body_with_limit(body, max_body_bytes).await {
         Ok(BodyReadOutcome::Buffered(bytes)) => bytes,
         Ok(BodyReadOutcome::TooLarge {
             limit_bytes,
@@ -1086,7 +1187,7 @@ async fn proxy_handler(
         }) => {
             if allow_oversize_bypass_cache {
                 tracing::debug!(
-                    limit_bytes = state.max_body_bytes,
+                    limit_bytes = max_body_bytes,
                     "bypassing cache after request body exceeded configured limit mid-stream"
                 );
 
@@ -1218,7 +1319,7 @@ async fn proxy_handler(
                     if route.cache_miss == CacheMissPolicy::Error {
                         respond!(
                             None,
-                            replay_miss_response(route, &active_session_name, match_key,)
+                            replay_miss_response(&route, &active_session_name, match_key,)
                         );
                     }
                 }
@@ -1314,12 +1415,12 @@ async fn proxy_handler(
     }
 
     let response_known_oversize = parse_content_length(&parts.headers)
-        .map(|len| len > bytes_limit_u64(state.max_body_bytes))
+        .map(|len| len > bytes_limit_u64(max_body_bytes))
         .unwrap_or(false);
     if response_known_oversize {
         if route.body_oversize == BodyOversizePolicy::BypassCache {
             tracing::debug!(
-                limit_bytes = state.max_body_bytes,
+                limit_bytes = max_body_bytes,
                 "bypassing cache for oversized upstream response body"
             );
             respond!(
@@ -1336,7 +1437,7 @@ async fn proxy_handler(
         );
     }
 
-    let body_bytes = match read_body_with_limit(body, state.max_body_bytes).await {
+    let body_bytes = match read_body_with_limit(body, max_body_bytes).await {
         Ok(BodyReadOutcome::Buffered(bytes)) => bytes,
         Ok(BodyReadOutcome::TooLarge {
             limit_bytes,
@@ -1345,7 +1446,7 @@ async fn proxy_handler(
         }) => {
             if route.body_oversize == BodyOversizePolicy::BypassCache {
                 tracing::debug!(
-                    limit_bytes = state.max_body_bytes,
+                    limit_bytes = max_body_bytes,
                     "bypassing cache after upstream response body exceeded configured limit mid-stream"
                 );
                 respond!(
@@ -2031,6 +2132,17 @@ fn status_for_session_error(err: &SessionManagerError) -> StatusCode {
     }
 }
 
+fn status_for_config_reload_error(message: &str) -> StatusCode {
+    if message.contains("parse config ")
+        || message.contains("parse route.path_regex")
+        || message.contains("parse route.upstream")
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
 fn parse_admin_recordings_collection_path(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/_admin/sessions/")?;
     let (session_name, recordings_suffix) = rest.split_once("/recordings")?;
@@ -2143,6 +2255,33 @@ async fn admin_handler(
             ));
         }
         return Ok(admin_status_response(&state.status));
+    }
+
+    if path == "/_admin/config/reload" {
+        if method != hyper::Method::POST {
+            return Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+        let Some(config_reloader) = state.config_reloader.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::CONFLICT,
+                "config reload unavailable; start proxy from a config file path",
+            ));
+        };
+
+        return match config_reloader.reload().await {
+            Ok(summary) => Ok(admin_json_response(StatusCode::OK, &summary)),
+            Err(err) => {
+                let message = err.to_string();
+                tracing::debug!("failed to reload config: {message}");
+                Ok(admin_error_response(
+                    status_for_config_reload_error(&message),
+                    message,
+                ))
+            }
+        };
     }
 
     if path == "/_admin/sessions" {

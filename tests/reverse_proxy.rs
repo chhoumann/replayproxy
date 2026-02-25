@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     convert::Infallible,
+    fs,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -662,6 +663,219 @@ mode = "passthrough-cache"
     assert_eq!(body["stats"]["cache_hits_total"].as_u64(), Some(0));
     assert_eq!(body["stats"]["cache_misses_total"].as_u64(), Some(1));
     assert_eq!(body["stats"]["upstream_requests_total"].as_u64(), Some(1));
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_config_reload_endpoint_applies_config_updates() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("replayproxy.toml");
+    let config_source = config_path.display().to_string();
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+max_body_bytes = 64
+
+[[routes]]
+path_prefix = "/v1"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let config = replayproxy::config::Config::from_path(&config_path).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+max_body_bytes = 128
+
+[[routes]]
+path_prefix = "/v2"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let reload_uri: Uri = format!("http://{admin_addr}/_admin/config/reload")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(reload_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["source"].as_str(), Some(config_source.as_str()));
+    assert_eq!(body["routes_before"].as_u64(), Some(1));
+    assert_eq!(body["routes_after"].as_u64(), Some(1));
+    assert_eq!(body["max_body_bytes_before"].as_u64(), Some(64));
+    assert_eq!(body["max_body_bytes_after"].as_u64(), Some(128));
+    assert_eq!(body["changed"].as_bool(), Some(true));
+
+    let stale_route_uri: Uri = format!("http://{}/v1/after-reload", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(stale_route_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        timeout(Duration::from_millis(100), upstream_rx.recv())
+            .await
+            .is_err()
+    );
+
+    let reloaded_route_uri: Uri = format!("http://{}/v2/after-reload", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(reloaded_route_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/v2/after-reload");
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_config_reload_endpoint_returns_errors_for_unavailable_and_invalid_config() {
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let reload_uri: Uri = format!("http://{admin_addr}/_admin/config/reload")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(reload_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("config reload unavailable")
+    );
+    proxy.shutdown().await;
+
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("replayproxy.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let config = replayproxy::config::Config::from_path(&config_path).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    fs::write(
+        &config_path,
+        r#"
+[proxy
+listen = "127.0.0.1:0"
+"#,
+    )
+    .unwrap();
+
+    let reload_uri: Uri = format!("http://{admin_addr}/_admin/config/reload")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(reload_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("parse config"));
+
+    let proxy_uri: Uri = format!("http://{}/api/still-active", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    let _captured = upstream_rx.recv().await.unwrap();
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;

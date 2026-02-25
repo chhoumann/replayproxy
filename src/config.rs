@@ -29,6 +29,8 @@ pub struct Config {
     pub defaults: Option<DefaultsConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    #[serde(skip)]
+    source_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -69,13 +71,18 @@ impl Config {
                 }
             };
 
-            return Self::from_toml_str(&toml).map_err(|err| {
-                anyhow::anyhow!(
-                    "parse config from {source}: {}\n{}",
-                    summarize_config_parse_error(&err),
-                    format_attempted_sources(&attempted_sources)
-                )
-            });
+            return Self::from_toml_str(&toml)
+                .map(|mut config| {
+                    config.source_path = Some(resolved_path);
+                    config
+                })
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "parse config from {source}: {}\n{}",
+                        summarize_config_parse_error(&err),
+                        format_attempted_sources(&attempted_sources)
+                    )
+                });
         }
 
         bail!(
@@ -89,11 +96,19 @@ impl Config {
         let toml = fs::read_to_string(&path)
             .map_err(|err| anyhow::anyhow!("read config {}: {err}", path.display()))?;
         Self::from_toml_str(&toml)
+            .map(|mut config| {
+                config.source_path = Some(path.clone());
+                config
+            })
             .map_err(|err| anyhow::anyhow!("parse config {}: {err}", path.display()))
     }
 
     pub fn from_toml_str(toml: &str) -> anyhow::Result<Self> {
         toml.parse()
+    }
+
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
     }
 
     pub fn apply_active_session_override(

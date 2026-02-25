@@ -59,6 +59,22 @@ pub struct Recording {
     pub created_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingSummary {
+    pub id: i64,
+    pub match_key: String,
+    pub request_method: String,
+    pub request_uri: String,
+    pub response_status: u16,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingSearch {
+    pub method: Option<String>,
+    pub url_contains: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum StoredHeaderValue {
@@ -172,6 +188,48 @@ impl Storage {
         })
         .await
         .context("join get_latest_recording_by_match_key_and_query_subset task")?
+    }
+
+    pub async fn list_recordings(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RecordingSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (offset, limit) = validate_pagination(offset, limit)?;
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || list_recordings_blocking(&db_path, offset, limit))
+            .await
+            .context("join list_recordings task")?
+    }
+
+    pub async fn search_recordings(
+        &self,
+        search: RecordingSearch,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RecordingSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (offset, limit) = validate_pagination(offset, limit)?;
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            search_recordings_blocking(&db_path, &search, offset, limit)
+        })
+        .await
+        .context("join search_recordings task")?
+    }
+
+    pub async fn delete_recording(&self, id: i64) -> anyhow::Result<bool> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || delete_recording_blocking(&db_path, id))
+            .await
+            .context("join delete_recording task")?
     }
 
     fn init(&self) -> anyhow::Result<()> {
@@ -517,6 +575,12 @@ fn normalized_query_from_request_uri(uri: &str) -> String {
     matching::normalized_query(recording_query_from_uri(uri))
 }
 
+fn validate_pagination(offset: usize, limit: usize) -> anyhow::Result<(i64, i64)> {
+    let offset = i64::try_from(offset).context("pagination offset exceeds sqlite range")?;
+    let limit = i64::try_from(limit).context("pagination limit exceeds sqlite range")?;
+    Ok((offset, limit))
+}
+
 fn deserialize_recording_at(row: &rusqlite::Row<'_>, offset: usize) -> anyhow::Result<Recording> {
     let match_key = row
         .get::<_, String>(offset)
@@ -559,6 +623,39 @@ fn deserialize_recording_at(row: &rusqlite::Row<'_>, offset: usize) -> anyhow::R
         response_status,
         response_headers,
         response_body,
+        created_at_unix_ms,
+    })
+}
+
+fn deserialize_recording_summary_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> anyhow::Result<RecordingSummary> {
+    let id = row
+        .get::<_, i64>(offset)
+        .context("deserialize recording id")?;
+    let match_key = row
+        .get::<_, String>(offset + 1)
+        .context("deserialize match_key")?;
+    let request_method = row
+        .get::<_, String>(offset + 2)
+        .context("deserialize request_method")?;
+    let request_uri = row
+        .get::<_, String>(offset + 3)
+        .context("deserialize request_uri")?;
+    let response_status = row
+        .get::<_, i64>(offset + 4)
+        .context("deserialize response_status")?;
+    let created_at_unix_ms = row
+        .get::<_, i64>(offset + 5)
+        .context("deserialize created_at_unix_ms")?;
+
+    Ok(RecordingSummary {
+        id,
+        match_key,
+        request_method,
+        request_uri,
+        response_status: u16::try_from(response_status).context("deserialize response_status")?,
         created_at_unix_ms,
     })
 }
@@ -721,11 +818,103 @@ fn get_recordings_by_match_key_blocking(
     Ok(recordings)
 }
 
+fn list_recordings_blocking(
+    path: &Path,
+    offset: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<RecordingSummary>> {
+    let conn = open_connection(path)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+              id,
+              match_key,
+              request_method,
+              request_uri,
+              response_status,
+              created_at_unix_ms
+            FROM recordings
+            ORDER BY id DESC
+            LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .context("prepare list recordings")?;
+
+    let mut rows = stmt
+        .query(params![limit, offset])
+        .context("query list recordings")?;
+
+    let mut summaries = Vec::new();
+    while let Some(row) = rows.next().context("iterate list recordings")? {
+        summaries.push(deserialize_recording_summary_at(row, 0)?);
+    }
+    Ok(summaries)
+}
+
+fn search_recordings_blocking(
+    path: &Path,
+    search: &RecordingSearch,
+    offset: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<RecordingSummary>> {
+    let conn = open_connection(path)?;
+    let method = search
+        .method
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let url_contains = search
+        .url_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+              id,
+              match_key,
+              request_method,
+              request_uri,
+              response_status,
+              created_at_unix_ms
+            FROM recordings
+            WHERE (?1 IS NULL OR request_method = ?1)
+              AND (?2 IS NULL OR instr(request_uri, ?2) > 0)
+            ORDER BY id DESC
+            LIMIT ?3 OFFSET ?4
+            "#,
+        )
+        .context("prepare search recordings")?;
+
+    let mut rows = stmt
+        .query(params![method, url_contains, limit, offset])
+        .context("query search recordings")?;
+
+    let mut summaries = Vec::new();
+    while let Some(row) = rows.next().context("iterate search recordings")? {
+        summaries.push(deserialize_recording_summary_at(row, 0)?);
+    }
+    Ok(summaries)
+}
+
+fn delete_recording_blocking(path: &Path, id: i64) -> anyhow::Result<bool> {
+    let conn = open_connection(path)?;
+    let deleted = conn
+        .execute("DELETE FROM recordings WHERE id = ?1", params![id])
+        .context("delete recording by id")?;
+    Ok(deleted == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::params;
 
-    use super::{Recording, SessionManager, SessionManagerError, Storage};
+    use super::{Recording, RecordingSearch, SessionManager, SessionManagerError, Storage};
     use crate::matching;
 
     #[tokio::test]
@@ -842,6 +1031,126 @@ mod tests {
         assert_eq!(recordings.len(), 2);
         assert_eq!(recordings[0].request_uri, "/newer?a=1");
         assert_eq!(recordings[1].request_uri, "/older?a=1");
+    }
+
+    #[tokio::test]
+    async fn list_recordings_supports_pagination() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let first = Recording {
+            match_key: "match-1".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/one".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"one".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let mut second = first.clone();
+        second.match_key = "match-2".to_owned();
+        second.request_uri = "/two".to_owned();
+        second.response_body = b"two".to_vec();
+        second.created_at_unix_ms += 1;
+        let mut third = second.clone();
+        third.match_key = "match-3".to_owned();
+        third.request_uri = "/three".to_owned();
+        third.response_body = b"three".to_vec();
+        third.created_at_unix_ms += 1;
+
+        storage.insert_recording(first).await.unwrap();
+        storage.insert_recording(second).await.unwrap();
+        storage.insert_recording(third).await.unwrap();
+
+        let first_page = storage.list_recordings(0, 2).await.unwrap();
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page[0].request_uri, "/three");
+        assert_eq!(first_page[1].request_uri, "/two");
+
+        let second_page = storage.list_recordings(2, 2).await.unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].request_uri, "/one");
+    }
+
+    #[tokio::test]
+    async fn search_recordings_filters_by_method_and_url_substring() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let mut base = Recording {
+            match_key: "search-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/v1/chat/completions".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"body".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_method = "POST".to_owned();
+        base.request_uri = "/v1/chat/completions".to_owned();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_method = "POST".to_owned();
+        base.request_uri = "/v1/embeddings".to_owned();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base).await.unwrap();
+
+        let results = storage
+            .search_recordings(
+                RecordingSearch {
+                    method: Some("POST".to_owned()),
+                    url_contains: Some("/chat".to_owned()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request_method, "POST");
+        assert_eq!(results[0].request_uri, "/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn delete_recording_removes_only_target_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let base = Recording {
+            match_key: "delete-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/first".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"first".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let mut second = base.clone();
+        second.request_uri = "/second".to_owned();
+        second.response_body = b"second".to_vec();
+        second.created_at_unix_ms += 1;
+
+        let first_id = storage.insert_recording(base).await.unwrap();
+        let second_id = storage.insert_recording(second).await.unwrap();
+
+        assert!(storage.delete_recording(first_id).await.unwrap());
+        assert!(!storage.delete_recording(first_id).await.unwrap());
+
+        let remaining = storage.list_recordings(0, 10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, second_id);
+        assert_eq!(remaining[0].request_uri, "/second");
     }
 
     #[tokio::test]

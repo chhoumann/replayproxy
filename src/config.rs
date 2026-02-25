@@ -33,45 +33,54 @@ pub struct Config {
 
 impl Config {
     pub fn load(config_override: Option<&Path>) -> anyhow::Result<Self> {
-        let mut attempted_paths = Vec::new();
+        let mut attempted_sources = Vec::new();
+        let has_override = config_override.is_some();
 
-        for raw_path in config_candidate_paths(config_override) {
+        for (index, raw_path) in config_candidate_paths(config_override)
+            .into_iter()
+            .enumerate()
+        {
+            let source = config_source_label(index, has_override);
             let resolved_path = match expand_tilde(&raw_path) {
                 Ok(path) => path,
                 Err(err) => {
-                    attempted_paths.push(raw_path.display().to_string());
+                    attempted_sources.push(source);
+                    let reason = if err.to_string().contains("HOME is not set") {
+                        "HOME is not set"
+                    } else {
+                        "path expansion failed"
+                    };
                     return Err(anyhow::anyhow!(
-                        "{err}\n{}",
-                        format_attempted_paths(&attempted_paths)
+                        "resolve config path for {source}: {reason}\n{}",
+                        format_attempted_sources(&attempted_sources)
                     ));
                 }
             };
-            attempted_paths.push(resolved_path.display().to_string());
+            attempted_sources.push(source);
 
             let toml = match fs::read_to_string(&resolved_path) {
                 Ok(toml) => toml,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     return Err(anyhow::anyhow!(
-                        "read config {}: {err}\n{}",
-                        resolved_path.display(),
-                        format_attempted_paths(&attempted_paths)
+                        "read config from {source}: {err}\n{}",
+                        format_attempted_sources(&attempted_sources)
                     ));
                 }
             };
 
             return Self::from_toml_str(&toml).map_err(|err| {
                 anyhow::anyhow!(
-                    "parse config {}: {err}\n{}",
-                    resolved_path.display(),
-                    format_attempted_paths(&attempted_paths)
+                    "parse config from {source}: {}\n{}",
+                    summarize_config_parse_error(&err),
+                    format_attempted_sources(&attempted_sources)
                 )
             });
         }
 
         bail!(
             "unable to find a config file\n{}",
-            format_attempted_paths(&attempted_paths)
+            format_attempted_sources(&attempted_sources)
         )
     }
 
@@ -142,6 +151,18 @@ fn config_candidate_paths(config_override: Option<&Path>) -> Vec<PathBuf> {
     ]
 }
 
+fn config_source_label(index: usize, has_override: bool) -> &'static str {
+    if has_override {
+        return "cli --config override";
+    }
+
+    match index {
+        0 => "project ./replayproxy.toml",
+        1 => "home ~/.replayproxy/config.toml",
+        _ => "unknown config source",
+    }
+}
+
 fn expand_tilde(path: &Path) -> anyhow::Result<PathBuf> {
     let mut components = path.components();
     match components.next() {
@@ -159,17 +180,25 @@ fn expand_tilde(path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn format_attempted_paths(attempted_paths: &[String]) -> String {
-    if attempted_paths.is_empty() {
-        return "attempted paths: (none)".to_string();
+fn format_attempted_sources(attempted_sources: &[&str]) -> String {
+    if attempted_sources.is_empty() {
+        return "attempted config sources: (none)".to_string();
     }
 
-    let mut message = String::from("attempted paths:");
-    for path in attempted_paths {
+    let mut message = String::from("attempted config sources:");
+    for source in attempted_sources {
         message.push_str("\n- ");
-        message.push_str(path);
+        message.push_str(source);
     }
     message
+}
+
+fn summarize_config_parse_error(err: &anyhow::Error) -> &'static str {
+    if err.to_string().starts_with("parse config TOML:") {
+        "invalid TOML syntax"
+    } else {
+        "invalid configuration values"
+    }
 }
 
 impl FromStr for Config {
@@ -763,12 +792,13 @@ pub enum WebSocketRecordingMode {
 #[cfg(test)]
 mod tests {
     use std::{
-        env,
+        env, fs,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{Config, LogFormat, RouteMode, WebSocketRecordingMode};
+    use tempfile::tempdir;
 
     #[test]
     fn loads_spec_example_config() {
@@ -1223,7 +1253,7 @@ enabled = true
     }
 
     #[test]
-    fn load_errors_include_attempted_paths() {
+    fn load_errors_include_attempted_sources_without_raw_paths() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be monotonic")
@@ -1231,11 +1261,52 @@ enabled = true
         let missing_path = PathBuf::from(format!("/tmp/replayproxy-missing-{unique}.toml"));
 
         let err = Config::load(Some(missing_path.as_path())).unwrap_err();
-        assert!(err.to_string().contains("attempted paths:"), "err: {err}");
+        assert!(
+            err.to_string().contains("attempted config sources:"),
+            "err: {err}"
+        );
+        assert!(
+            err.to_string().contains("cli --config override"),
+            "err: {err}"
+        );
+        assert!(
+            !err.to_string()
+                .contains(&missing_path.display().to_string()),
+            "err leaked raw path: {err}"
+        );
+    }
+
+    #[test]
+    fn load_parse_errors_do_not_echo_secret_like_values() {
+        let temp = tempdir().expect("tempdir should create");
+        let config_path = temp.path().join("replayproxy.toml");
+        let secret = "sk_live_super_secret_value";
+
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[proxy]
+listen = "127.0.0.1:0"
+api_token = {secret}
+"#
+            ),
+        )
+        .expect("config file should be written");
+
+        let err = Config::load(Some(config_path.as_path())).unwrap_err();
         assert!(
             err.to_string()
-                .contains(&missing_path.display().to_string()),
+                .contains("parse config from cli --config override: invalid TOML syntax"),
             "err: {err}"
+        );
+        assert!(
+            !err.to_string().contains(secret),
+            "err leaked secret-like content: {err}"
+        );
+        assert!(
+            !err.to_string().contains(&config_path.display().to_string()),
+            "err leaked raw config path: {err}"
         );
     }
 

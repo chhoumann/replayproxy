@@ -492,24 +492,18 @@ fn startup_summary(
     proxy_listen_addr: std::net::SocketAddr,
     admin_listen_addr: Option<std::net::SocketAddr>,
 ) -> String {
-    let storage_path = config
-        .storage
-        .as_ref()
-        .map(|storage| storage.path.display().to_string())
-        .unwrap_or_else(|| "disabled".to_owned());
-    let active_session = config
-        .storage
-        .as_ref()
-        .and_then(|storage| storage.active_session.as_deref())
-        .unwrap_or("default");
+    let (storage_path, active_session) = match config.storage.as_ref() {
+        Some(storage) => (
+            redact_if_present(Some(&storage.path)),
+            redact_active_session(storage.active_session.as_deref()),
+        ),
+        None => ("disabled", "disabled"),
+    };
     let tls_summary = match config.proxy.tls.as_ref() {
         Some(tls) => format!(
             "enabled={},ca_cert={},ca_key={}",
             tls.enabled,
-            tls.ca_cert
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "none".to_owned()),
+            redact_if_present(tls.ca_cert.as_ref()),
             redact_if_present(tls.ca_key.as_ref())
         ),
         None => "disabled".to_owned(),
@@ -529,11 +523,19 @@ fn startup_summary(
     )
 }
 
-fn redact_if_present(value: Option<&PathBuf>) -> &'static str {
+fn redact_if_present<T>(value: Option<T>) -> &'static str {
     if value.is_some() {
         "[REDACTED]"
     } else {
         "none"
+    }
+}
+
+fn redact_active_session(value: Option<&str>) -> &'static str {
+    if value.is_some() {
+        "[REDACTED]"
+    } else {
+        "default"
     }
 }
 
@@ -543,8 +545,8 @@ mod tests {
 
     use super::{
         Cli, Command, RecordingCommand, RecordingCommandOutcome, SessionCommand,
-        SessionCommandOutcome, encode_uri_path_segment, redact_if_present, run_recording_command,
-        run_session_command, startup_summary,
+        SessionCommandOutcome, encode_uri_path_segment, redact_active_session, redact_if_present,
+        run_recording_command, run_session_command, startup_summary,
     };
     use clap::Parser;
     use replayproxy::{
@@ -1293,9 +1295,26 @@ active_session = "default"
         );
 
         assert!(summary.contains("ca_key=[REDACTED]"), "summary: {summary}");
+        assert!(summary.contains("ca_cert=[REDACTED]"), "summary: {summary}");
+        assert!(
+            summary.contains("storage_path=[REDACTED]"),
+            "summary: {summary}"
+        );
+        assert!(
+            summary.contains("active_session=[REDACTED]"),
+            "summary: {summary}"
+        );
         assert!(
             !summary.contains("private-key.pem"),
             "summary leaked secret: {summary}"
+        );
+        assert!(
+            !summary.contains("/tmp/cert.pem"),
+            "summary leaked cert path: {summary}"
+        );
+        assert!(
+            !summary.contains("/tmp/sessions"),
+            "summary leaked storage path: {summary}"
         );
     }
 
@@ -1303,5 +1322,11 @@ active_session = "default"
     fn redact_if_present_covers_some_and_none() {
         assert_eq!(redact_if_present(Some(&PathBuf::from("x"))), "[REDACTED]");
         assert_eq!(redact_if_present(Option::<&PathBuf>::None), "none");
+    }
+
+    #[test]
+    fn redact_active_session_covers_configured_and_default() {
+        assert_eq!(redact_active_session(Some("staging")), "[REDACTED]");
+        assert_eq!(redact_active_session(None), "default");
     }
 }

@@ -916,6 +916,120 @@ mode = "record"
 }
 
 #[tokio::test]
+async fn record_mode_redacts_configured_headers_before_storage() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.match]
+headers = ["Authorization"]
+
+[routes.redact]
+headers = ["Authorization", "X-Resp-End"]
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello?x=1", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .header(header::AUTHORIZATION, "Bearer top-secret")
+        .body(Full::new(Bytes::from_static(b"client-body")))
+        .unwrap();
+
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(
+        captured.headers.get(header::AUTHORIZATION).unwrap(),
+        &HeaderValue::from_static("Bearer top-secret")
+    );
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let (stored_match_key, request_headers_json, response_headers_json): (String, String, String) =
+        conn.query_row(
+            "SELECT match_key, request_headers_json, response_headers_json FROM recordings LIMIT 1;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    let request_headers: Vec<(String, Vec<u8>)> =
+        serde_json::from_str(&request_headers_json).unwrap();
+    let response_headers: Vec<(String, Vec<u8>)> =
+        serde_json::from_str(&response_headers_json).unwrap();
+    assert_eq!(
+        request_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"[REDACTED]".as_slice())
+    );
+    assert_eq!(
+        response_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-end"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"[REDACTED]".as_slice())
+    );
+
+    let expected_match_key = replayproxy::matching::compute_match_key(
+        config.routes[0].match_.as_ref(),
+        &Method::POST,
+        &captured.uri,
+        &captured.headers,
+        &captured.body,
+    )
+    .unwrap();
+    let mut redacted_match_headers = captured.headers.clone();
+    redacted_match_headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("[REDACTED]"),
+    );
+    let redacted_match_key = replayproxy::matching::compute_match_key(
+        config.routes[0].match_.as_ref(),
+        &Method::POST,
+        &captured.uri,
+        &redacted_match_headers,
+        &captured.body,
+    )
+    .unwrap();
+    assert_eq!(stored_match_key, expected_match_key);
+    assert_ne!(expected_match_key, redacted_match_key);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn passthrough_cache_serves_cached_response_on_second_request() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 

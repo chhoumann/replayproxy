@@ -38,6 +38,8 @@ use crate::{
 
 type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
 type HttpClient = Client<HttpConnector, ProxyBody>;
+const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
+const REDACTION_PLACEHOLDER_BYTES: &[u8] = b"[REDACTED]";
 
 #[derive(Debug)]
 pub struct ProxyHandle {
@@ -912,6 +914,8 @@ async fn proxy_handler(
         record_response_status,
         record_response_headers,
     ) {
+        let request_headers = redact_recording_headers(request_headers, route.redact.as_ref());
+        let response_headers = redact_recording_headers(response_headers, route.redact.as_ref());
         let created_at_unix_ms = match Recording::now_unix_ms() {
             Ok(ts) => ts,
             Err(err) => {
@@ -1149,7 +1153,7 @@ fn sanitize_match_key(match_key: &str) -> String {
     if match_key.len() == 64 && match_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return match_key.to_owned();
     }
-    "[REDACTED]".to_owned()
+    REDACTION_PLACEHOLDER.to_owned()
 }
 
 fn format_route_ref(route: &crate::config::RouteConfig, idx: usize) -> String {
@@ -1428,6 +1432,34 @@ fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+fn redact_recording_headers(
+    headers: Vec<(String, Vec<u8>)>,
+    redact: Option<&RedactConfig>,
+) -> Vec<(String, Vec<u8>)> {
+    let Some(redact) = redact else {
+        return headers;
+    };
+
+    if redact.headers.is_empty() {
+        return headers;
+    }
+
+    headers
+        .into_iter()
+        .map(|(name, value)| {
+            if redact
+                .headers
+                .iter()
+                .any(|configured| configured.eq_ignore_ascii_case(name.as_str()))
+            {
+                (name, REDACTION_PLACEHOLDER_BYTES.to_vec())
+            } else {
+                (name, value)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1437,9 +1469,11 @@ mod tests {
 
     use super::{
         CacheLogOutcome, ProxyRoute, emit_proxy_request_log, format_route_ref, mode_log_label,
-        sanitize_match_key, select_route,
+        redact_recording_headers, sanitize_match_key, select_route,
     };
-    use crate::config::{BodyOversizePolicy, CacheMissPolicy, Config, RouteConfig, RouteMode};
+    use crate::config::{
+        BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMode,
+    };
     use serde_json::Value;
     use tracing_subscriber::{filter::LevelFilter, fmt::MakeWriter};
 
@@ -1537,6 +1571,37 @@ upstream = "http://127.0.0.1:1"
             sanitize_match_key("6a9f16398d64f3fcf57ecf7855da29232ef52f01579f0f74defad5c6af53f3e0"),
             "6a9f16398d64f3fcf57ecf7855da29232ef52f01579f0f74defad5c6af53f3e0"
         );
+    }
+
+    #[test]
+    fn redact_recording_headers_masks_configured_names_case_insensitively() {
+        let headers = vec![
+            ("Authorization".to_owned(), b"Bearer topsecret".to_vec()),
+            ("x-api-key".to_owned(), b"secret-key".to_vec()),
+            ("x-trace-id".to_owned(), b"trace-1".to_vec()),
+        ];
+        let redact = RedactConfig {
+            headers: vec!["authorization".to_owned(), "X-API-KEY".to_owned()],
+            body_json: Vec::new(),
+        };
+
+        let redacted = redact_recording_headers(headers, Some(&redact));
+        let authorization = redacted
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_slice());
+        let api_key = redacted
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+            .map(|(_, value)| value.as_slice());
+        let trace_id = redacted
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-trace-id"))
+            .map(|(_, value)| value.as_slice());
+
+        assert_eq!(authorization, Some(b"[REDACTED]".as_slice()));
+        assert_eq!(api_key, Some(b"[REDACTED]".as_slice()));
+        assert_eq!(trace_id, Some(b"trace-1".as_slice()));
     }
 
     #[test]

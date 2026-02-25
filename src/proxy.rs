@@ -17,7 +17,7 @@ use regex::Regex;
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
-    config::{CacheMissPolicy, Config, RouteMatchConfig, RouteMode},
+    config::{CacheMissPolicy, Config, QueryMatchMode, RouteMatchConfig, RouteMode},
     matching,
     storage::{Recording, Storage},
 };
@@ -270,7 +270,14 @@ async fn proxy_handler(
                 ));
             };
             let match_key = match_key.as_deref().unwrap_or_default();
-            match storage.get_recording_by_match_key(match_key).await {
+            match lookup_recording_for_request(
+                storage,
+                route.match_config.as_ref(),
+                &parts.uri,
+                match_key,
+            )
+            .await
+            {
                 Ok(Some(recording)) => return Ok(response_from_recording(recording)),
                 Ok(None) => {
                     if route.cache_miss == CacheMissPolicy::Error {
@@ -292,7 +299,14 @@ async fn proxy_handler(
         RouteMode::PassthroughCache => {
             if let (Some(storage), Some(match_key)) = (state.storage.as_ref(), match_key.as_deref())
             {
-                match storage.get_recording_by_match_key(match_key).await {
+                match lookup_recording_for_request(
+                    storage,
+                    route.match_config.as_ref(),
+                    &parts.uri,
+                    match_key,
+                )
+                .await
+                {
                     Ok(Some(recording)) => return Ok(response_from_recording(recording)),
                     Ok(None) => should_record = true,
                     Err(err) => {
@@ -416,6 +430,35 @@ fn response_from_recording(recording: Recording) -> Response<Full<Bytes>> {
     strip_hop_by_hop_headers(response.headers_mut());
 
     response
+}
+
+async fn lookup_recording_for_request(
+    storage: &Storage,
+    route_match: Option<&RouteMatchConfig>,
+    request_uri: &Uri,
+    match_key: &str,
+) -> anyhow::Result<Option<Recording>> {
+    let query_mode = route_match
+        .map(|route_match| route_match.query)
+        .unwrap_or(QueryMatchMode::Exact);
+
+    if query_mode != QueryMatchMode::Subset {
+        return storage.get_recording_by_match_key(match_key).await;
+    }
+
+    let request_query = request_uri.query();
+    let recordings = storage.get_recordings_by_match_key(match_key).await?;
+    Ok(recordings.into_iter().find(|recording| {
+        matching::query_params_match(
+            QueryMatchMode::Subset,
+            recording_query_from_uri(&recording.request_uri),
+            request_query,
+        )
+    }))
+}
+
+fn recording_query_from_uri(uri: &str) -> Option<&str> {
+    uri.split_once('?').map(|(_, query)| query)
 }
 
 fn build_upstream_uri(upstream_base: &Uri, original: &Uri) -> anyhow::Result<Uri> {

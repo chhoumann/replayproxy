@@ -426,6 +426,110 @@ cache_miss = "error"
 }
 
 #[tokio::test]
+async fn replay_mode_subset_query_matches_recorded_query_as_subset() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.match]
+query = "subset"
+"#,
+        storage_dir.path().display()
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let uri: Uri = format!("http://{}/api/hello?b=2&a=1", record_proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "replay"
+cache_miss = "error"
+
+[routes.match]
+query = "subset"
+"#,
+        storage_dir.path().display()
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let uri: Uri = format!("http://{}/api/hello?a=1&c=3&b=2", replay_proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let uri: Uri = format!("http://{}/api/hello?a=1", replay_proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"Gateway Not Recorded");
+
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn replay_mode_cache_miss_forward_forwards_without_recording() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -105,13 +105,21 @@ impl Storage {
         &self,
         match_key: &str,
     ) -> anyhow::Result<Option<Recording>> {
+        let recordings = self.get_recordings_by_match_key(match_key).await?;
+        Ok(recordings.into_iter().next())
+    }
+
+    pub async fn get_recordings_by_match_key(
+        &self,
+        match_key: &str,
+    ) -> anyhow::Result<Vec<Recording>> {
         let db_path = self.db_path.clone();
         let match_key = match_key.to_owned();
         tokio::task::spawn_blocking(move || {
-            get_recording_by_match_key_blocking(&db_path, &match_key)
+            get_recordings_by_match_key_blocking(&db_path, &match_key)
         })
         .await
-        .context("join get_recording_by_match_key task")?
+        .context("join get_recordings_by_match_key task")?
     }
 
     fn init(&self) -> anyhow::Result<()> {
@@ -219,14 +227,14 @@ fn insert_recording_blocking(path: &Path, recording: Recording) -> anyhow::Resul
     Ok(conn.last_insert_rowid())
 }
 
-fn get_recording_by_match_key_blocking(
+fn get_recordings_by_match_key_blocking(
     path: &Path,
     match_key: &str,
-) -> anyhow::Result<Option<Recording>> {
+) -> anyhow::Result<Vec<Recording>> {
     let conn = open_connection(path)?;
 
-    let row = conn
-        .query_row(
+    let mut stmt = conn
+        .prepare(
             r#"
             SELECT
               match_key,
@@ -241,57 +249,59 @@ fn get_recording_by_match_key_blocking(
             FROM recordings
             WHERE match_key = ?1
             ORDER BY id DESC
-            LIMIT 1
             "#,
-            params![match_key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Vec<u8>>(7)?,
-                    row.get::<_, i64>(8)?,
-                ))
-            },
         )
-        .optional()
-        .context("select recording by match_key")?;
+        .context("prepare select recordings by match_key")?;
 
-    let Some((
-        match_key,
-        request_method,
-        request_uri,
-        request_headers_json,
-        request_body,
-        response_status,
-        response_headers_json,
-        response_body,
-        created_at_unix_ms,
-    )) = row
-    else {
-        return Ok(None);
-    };
+    let mut rows = stmt
+        .query(params![match_key])
+        .context("query recordings by match_key")?;
 
-    let request_headers = deserialize_headers(&request_headers_json, "request")?;
-    let response_headers = deserialize_headers(&response_headers_json, "response")?;
+    let mut recordings = Vec::new();
+    while let Some(row) = rows.next().context("iterate recordings by match_key")? {
+        let match_key = row.get::<_, String>(0).context("deserialize match_key")?;
+        let request_method = row
+            .get::<_, String>(1)
+            .context("deserialize request_method")?;
+        let request_uri = row.get::<_, String>(2).context("deserialize request_uri")?;
+        let request_headers_json = row
+            .get::<_, String>(3)
+            .context("deserialize request_headers_json")?;
+        let request_body = row
+            .get::<_, Vec<u8>>(4)
+            .context("deserialize request_body")?;
+        let response_status = row
+            .get::<_, i64>(5)
+            .context("deserialize response_status")?;
+        let response_headers_json = row
+            .get::<_, String>(6)
+            .context("deserialize response_headers_json")?;
+        let response_body = row
+            .get::<_, Vec<u8>>(7)
+            .context("deserialize response_body")?;
+        let created_at_unix_ms = row
+            .get::<_, i64>(8)
+            .context("deserialize created_at_unix_ms")?;
 
-    let response_status = u16::try_from(response_status).context("deserialize response_status")?;
+        let request_headers = deserialize_headers(&request_headers_json, "request")?;
+        let response_headers = deserialize_headers(&response_headers_json, "response")?;
+        let response_status =
+            u16::try_from(response_status).context("deserialize response_status")?;
 
-    Ok(Some(Recording {
-        match_key,
-        request_method,
-        request_uri,
-        request_headers,
-        request_body,
-        response_status,
-        response_headers,
-        response_body,
-        created_at_unix_ms,
-    }))
+        recordings.push(Recording {
+            match_key,
+            request_method,
+            request_uri,
+            request_headers,
+            request_body,
+            response_status,
+            response_headers,
+            response_body,
+            created_at_unix_ms,
+        });
+    }
+
+    Ok(recordings)
 }
 
 #[cfg(test)]
@@ -380,5 +390,39 @@ mod tests {
             fetched.response_headers,
             vec![("x-response".to_owned(), b"legacy".to_vec())]
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_recordings_by_match_key_returns_newest_first() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let older = Recording {
+            match_key: "same-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/older?a=1".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"older".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let mut newer = older.clone();
+        newer.request_uri = "/newer?a=1".to_owned();
+        newer.response_body = b"newer".to_vec();
+        newer.created_at_unix_ms = older.created_at_unix_ms + 1;
+
+        storage.insert_recording(older).await.unwrap();
+        storage.insert_recording(newer).await.unwrap();
+
+        let recordings = storage
+            .get_recordings_by_match_key("same-key")
+            .await
+            .unwrap();
+
+        assert_eq!(recordings.len(), 2);
+        assert_eq!(recordings[0].request_uri, "/newer?a=1");
+        assert_eq!(recordings[1].request_uri, "/older?a=1");
     }
 }

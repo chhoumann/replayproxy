@@ -693,7 +693,7 @@ async fn proxy_handler(
         ) {
             Ok(match_key) => Some(match_key),
             Err(err) => {
-                tracing::debug!("failed to compute match key: {err}");
+                tracing::debug!(error_kind = err.kind(), "failed to compute match key");
                 let (status, message) = match err {
                     matching::MatchKeyError::InvalidJsonBody(_) => (
                         StatusCode::BAD_REQUEST,
@@ -1476,19 +1476,23 @@ fn redact_recording_body_json(body: &[u8], redact: Option<&RedactConfig>) -> Vec
 
     let mut json: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
-        Err(err) => {
-            tracing::debug!("recording body is not valid JSON; skipping body redaction: {err}");
+        Err(_) => {
+            tracing::debug!(
+                body_len = body.len(),
+                "recording body is not valid JSON; skipping body redaction"
+            );
             return body.to_vec();
         }
     };
 
     let mut pointers = Vec::new();
-    for expression in &redact.body_json {
+    for (expression_idx, expression) in redact.body_json.iter().enumerate() {
         let path = match JsonPath::parse(expression) {
             Ok(path) => path,
-            Err(err) => {
+            Err(_) => {
                 tracing::debug!(
-                    "failed to parse redaction JSONPath expression `{expression}` at runtime: {err}"
+                    expression_index = expression_idx,
+                    "failed to parse redaction JSONPath expression at runtime; skipping expression"
                 );
                 continue;
             }
@@ -1516,8 +1520,8 @@ fn redact_recording_body_json(body: &[u8], redact: Option<&RedactConfig>) -> Vec
 
     match serde_json::to_vec(&json) {
         Ok(body) => body,
-        Err(err) => {
-            tracing::debug!("failed to serialize redacted recording body: {err}");
+        Err(_) => {
+            tracing::debug!("failed to serialize redacted recording body; returning original body");
             body.to_vec()
         }
     }
@@ -1718,6 +1722,59 @@ upstream = "http://127.0.0.1:1"
     }
 
     #[test]
+    fn redact_recording_body_json_logs_do_not_leak_invalid_json_body_values() {
+        let redact = RedactConfig {
+            headers: Vec::new(),
+            body_json: vec!["$.secret".to_owned()],
+        };
+        let secret = "sk-live-super-secret";
+        let body = format!(r#"{{"secret":"{secret}""#);
+
+        let output = capture_debug_logs(|| {
+            let _ = redact_recording_body_json(body.as_bytes(), Some(&redact));
+        });
+
+        assert!(
+            output.contains("recording body is not valid JSON; skipping body redaction"),
+            "log output: {output}"
+        );
+        assert!(
+            !output.contains(secret),
+            "log output leaked sensitive body value: {output}"
+        );
+    }
+
+    #[test]
+    fn redact_recording_body_json_logs_do_not_leak_invalid_expression_values() {
+        let secret = "sk-live-super-secret";
+        let expression = format!("$['{secret}'");
+        let redact = RedactConfig {
+            headers: Vec::new(),
+            body_json: vec![expression.clone()],
+        };
+        let body = format!(r#"{{"secret":"{secret}"}}"#);
+
+        let output = capture_debug_logs(|| {
+            let _ = redact_recording_body_json(body.as_bytes(), Some(&redact));
+        });
+
+        assert!(
+            output.contains(
+                "failed to parse redaction JSONPath expression at runtime; skipping expression"
+            ),
+            "log output: {output}"
+        );
+        assert!(
+            !output.contains(secret),
+            "log output leaked sensitive value: {output}"
+        );
+        assert!(
+            !output.contains(&expression),
+            "log output leaked raw expression: {output}"
+        );
+    }
+
+    #[test]
     fn cache_log_outcome_labels_are_stable() {
         assert_eq!(CacheLogOutcome::Hit.as_str(), "hit");
         assert_eq!(CacheLogOutcome::Miss.as_str(), "miss");
@@ -1864,6 +1921,19 @@ upstream = "http://127.0.0.1:1"
             let bytes = self.buffer.lock().expect("buffer lock poisoned").clone();
             String::from_utf8(bytes).expect("log output should be UTF-8")
         }
+    }
+
+    fn capture_debug_logs(f: impl FnOnce()) -> String {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(LevelFilter::DEBUG)
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        writer.as_string()
     }
 
     struct LockedWriter {

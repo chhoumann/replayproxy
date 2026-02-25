@@ -19,20 +19,23 @@ pub enum MatchKeyError {
     },
 }
 
+impl MatchKeyError {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidJsonBody(_) => "invalid_json_body",
+            Self::InvalidJsonPath { .. } => "invalid_json_path",
+            Self::SerializeJsonNode { .. } => "serialize_json_node",
+        }
+    }
+}
+
 impl std::fmt::Display for MatchKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidJsonBody(source) => {
-                write!(f, "parse request body as JSON for matching: {source}")
-            }
-            Self::InvalidJsonPath { expression, source } => {
-                write!(f, "parse JSONPath expression `{expression}`: {source}")
-            }
-            Self::SerializeJsonNode { expression, source } => {
-                write!(
-                    f,
-                    "serialize JSONPath result for expression `{expression}`: {source}"
-                )
+            Self::InvalidJsonBody(_) => write!(f, "parse request body as JSON for matching"),
+            Self::InvalidJsonPath { .. } => write!(f, "parse JSONPath expression for matching"),
+            Self::SerializeJsonNode { .. } => {
+                write!(f, "serialize JSONPath result for matching")
             }
         }
     }
@@ -385,6 +388,8 @@ mod tests {
         subset_query_candidate_normalizations,
     };
     use crate::config::{QueryMatchMode, RouteMatchConfig};
+    use serde_json::Value;
+    use serde_json_path::JsonPath;
 
     fn key(
         route_match: Option<&RouteMatchConfig>,
@@ -801,6 +806,42 @@ body_json = ["$["]
 
         assert!(matches!(err, MatchKeyError::InvalidJsonPath { .. }));
         assert!(err.to_string().contains("parse JSONPath expression"));
+    }
+
+    #[test]
+    fn match_key_error_messages_do_not_include_sensitive_inputs() {
+        let secret = "sk-live-super-secret";
+        let invalid_body = format!(r#"{{"token":"{secret}""#);
+        let route_match: RouteMatchConfig = toml::from_str(
+            r#"
+body_json = ["$.token"]
+"#,
+        )
+        .unwrap();
+        let body_err = compute_match_key(
+            Some(&route_match),
+            &hyper::Method::POST,
+            &"http://example.com/api/hello".parse().unwrap(),
+            &hyper::HeaderMap::new(),
+            invalid_body.as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(body_err.kind(), "invalid_json_body");
+        assert!(!body_err.to_string().contains(secret));
+
+        let path_err = MatchKeyError::InvalidJsonPath {
+            expression: format!("$['{secret}']"),
+            source: JsonPath::parse("$[").unwrap_err(),
+        };
+        assert_eq!(path_err.kind(), "invalid_json_path");
+        assert!(!path_err.to_string().contains(secret));
+
+        let serialize_err = MatchKeyError::SerializeJsonNode {
+            expression: format!("$['{secret}']"),
+            source: serde_json::from_str::<Value>("not-json").unwrap_err(),
+        };
+        assert_eq!(serialize_err.kind(), "serialize_json_node");
+        assert!(!serialize_err.to_string().contains(secret));
     }
 
     #[test]

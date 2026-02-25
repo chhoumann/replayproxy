@@ -1,10 +1,18 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    convert::Infallible,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
-    body::Incoming,
+    body::{Frame, Incoming},
     header::{self, HeaderValue},
     service::service_fn,
 };
@@ -24,6 +32,40 @@ struct CapturedRequest {
     uri: Uri,
     headers: hyper::HeaderMap,
     body: Bytes,
+}
+
+#[derive(Debug)]
+struct ChunkedBody {
+    chunks: VecDeque<Bytes>,
+}
+
+impl ChunkedBody {
+    fn from_slices(chunks: &[&[u8]]) -> Self {
+        Self {
+            chunks: chunks
+                .iter()
+                .map(|chunk| Bytes::copy_from_slice(chunk))
+                .collect(),
+        }
+    }
+
+    fn new(chunks: Vec<Bytes>) -> Self {
+        Self {
+            chunks: chunks.into(),
+        }
+    }
+}
+
+impl hyper::body::Body for ChunkedBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(self.chunks.pop_front().map(|chunk| Ok(Frame::data(chunk))))
+    }
 }
 
 #[tokio::test]
@@ -201,6 +243,119 @@ body_oversize = "bypass-cache"
 }
 
 #[tokio::test]
+async fn oversized_chunked_request_body_can_bypass_cache_per_route() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, ChunkedBody> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(ChunkedBody::from_slices(&[b"12345", b"67890"]))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(&captured.body[..], b"1234567890");
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_chunked_request_body_replay_mode_still_returns_413() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "replay"
+cache_miss = "forward"
+body_oversize = "bypass-cache"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, ChunkedBody> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(ChunkedBody::from_slices(&[b"12345", b"67890"]))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body_bytes[..],
+        b"request body exceeds configured proxy.max_body_bytes"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), upstream_rx.recv())
+            .await
+            .is_err(),
+        "upstream should not receive oversized replay-mode requests"
+    );
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[tokio::test]
 async fn oversized_response_body_returns_502_without_recording() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
@@ -304,6 +459,69 @@ body_oversize = "bypass-cache"
     assert_eq!(res.status(), StatusCode::CREATED);
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_chunked_response_body_can_bypass_cache_per_route() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_with_response_chunks(vec![
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"def"),
+        ])
+        .await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 4
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"abcdef");
 
     let _captured = upstream_rx.recv().await.unwrap();
 
@@ -1755,6 +1973,64 @@ async fn spawn_upstream() -> (
                 .unwrap();
 
                 let mut res = Response::new(Full::new(Bytes::from_static(b"upstream-body")));
+                *res.status_mut() = StatusCode::CREATED;
+                res.headers_mut().insert(
+                    header::CONNECTION,
+                    HeaderValue::from_static("close, x-resp-hop"),
+                );
+                res.headers_mut()
+                    .insert("x-resp-hop", HeaderValue::from_static("yes"));
+                res.headers_mut()
+                    .insert("x-resp-end", HeaderValue::from_static("ok"));
+                res.headers_mut().insert(
+                    "x-resp-binary",
+                    HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
+                );
+                Ok::<_, hyper::Error>(res)
+            }
+        });
+
+        let builder = ConnectionBuilder::new(TokioExecutor::new());
+        builder.serve_connection(io, service).await.unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn spawn_upstream_with_response_chunks(
+    response_chunks: Vec<Bytes>,
+) -> (
+    SocketAddr,
+    mpsc::Receiver<CapturedRequest>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = mpsc::channel::<CapturedRequest>(1);
+    let response_chunks = Arc::new(response_chunks);
+
+    let join = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+        let tx = Arc::new(tx);
+        let response_chunks = Arc::clone(&response_chunks);
+        let service = service_fn(move |req: Request<Incoming>| {
+            let tx = Arc::clone(&tx);
+            let response_chunks = Arc::clone(&response_chunks);
+            async move {
+                let (parts, body) = req.into_parts();
+                let body_bytes = body.collect().await.unwrap().to_bytes();
+                tx.send(CapturedRequest {
+                    uri: parts.uri,
+                    headers: parts.headers,
+                    body: body_bytes,
+                })
+                .await
+                .unwrap();
+
+                let mut res =
+                    Response::new(ChunkedBody::new(response_chunks.iter().cloned().collect()));
                 *res.status_mut() = StatusCode::CREATED;
                 res.headers_mut().insert(
                     header::CONNECTION,

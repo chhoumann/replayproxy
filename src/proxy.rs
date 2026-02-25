@@ -1,14 +1,16 @@
 use std::{
     cmp::Reverse,
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     convert::Infallible,
     error::Error as StdError,
     fmt::Write as _,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -16,7 +18,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use hyper::{
     Request, Response, StatusCode, Uri,
-    body::Incoming,
+    body::{Frame, Incoming},
     header::{self, HeaderName, HeaderValue},
     service::service_fn,
 };
@@ -729,32 +731,90 @@ fn select_route<'a>(routes: &'a [ProxyRoute], path: &str) -> Option<&'a ProxyRou
 
 #[derive(Debug)]
 enum BodyReadError {
-    TooLarge { limit_bytes: usize },
     Read(hyper::Error),
 }
 
-async fn collect_body_with_limit(
+#[derive(Debug)]
+enum BodyReadOutcome {
+    Buffered(Bytes),
+    TooLarge {
+        limit_bytes: usize,
+        prefetched: Vec<Bytes>,
+        remaining: Incoming,
+    },
+}
+
+async fn read_body_with_limit(
     mut body: Incoming,
     max_body_bytes: usize,
-) -> Result<Bytes, BodyReadError> {
+) -> Result<BodyReadOutcome, BodyReadError> {
     let mut buffered = Vec::new();
+    let mut buffered_len = 0usize;
     while let Some(frame_result) = body.frame().await {
         let frame = frame_result.map_err(BodyReadError::Read)?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        if buffered
-            .len()
-            .saturating_add(data.len())
-            .gt(&max_body_bytes)
-        {
-            return Err(BodyReadError::TooLarge {
+        buffered_len = buffered_len.saturating_add(data.len());
+        buffered.push(data);
+        if buffered_len > max_body_bytes {
+            return Ok(BodyReadOutcome::TooLarge {
                 limit_bytes: max_body_bytes,
+                prefetched: buffered,
+                remaining: body,
             });
         }
-        buffered.extend_from_slice(&data);
     }
-    Ok(Bytes::from(buffered))
+
+    if buffered.is_empty() {
+        return Ok(BodyReadOutcome::Buffered(Bytes::new()));
+    }
+    if buffered.len() == 1 {
+        return Ok(BodyReadOutcome::Buffered(
+            buffered.pop().expect("buffered contains exactly one chunk"),
+        ));
+    }
+
+    let mut flattened = Vec::with_capacity(buffered_len);
+    for chunk in buffered {
+        flattened.extend_from_slice(&chunk);
+    }
+    Ok(BodyReadOutcome::Buffered(Bytes::from(flattened)))
+}
+
+struct PrefixedIncomingBody {
+    prefetched: VecDeque<Bytes>,
+    remaining: Incoming,
+}
+
+impl PrefixedIncomingBody {
+    fn new(prefetched: Vec<Bytes>, remaining: Incoming) -> Self {
+        Self {
+            prefetched: prefetched.into(),
+            remaining,
+        }
+    }
+}
+
+impl hyper::body::Body for PrefixedIncomingBody {
+    type Data = Bytes;
+    type Error = Box<dyn StdError + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(chunk) = this.prefetched.pop_front() {
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+        match Pin::new(&mut this.remaining).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Box::new(err)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 fn parse_content_length(headers: &hyper::HeaderMap) -> Option<u64> {
@@ -777,6 +837,10 @@ fn boxed_full(body: impl Into<Bytes>) -> ProxyBody {
 fn boxed_incoming(body: Incoming) -> ProxyBody {
     body.map_err(|err| -> Box<dyn StdError + Send + Sync> { Box::new(err) })
         .boxed()
+}
+
+fn boxed_prefetched_incoming(prefetched: Vec<Bytes>, body: Incoming) -> ProxyBody {
+    PrefixedIncomingBody::new(prefetched, body).boxed()
 }
 
 async fn proxy_handler(
@@ -852,9 +916,9 @@ async fn proxy_handler(
     let request_known_oversize = request_content_length
         .map(|len| len > bytes_limit_u64(state.max_body_bytes))
         .unwrap_or(false);
-    let bypass_request_buffering = request_known_oversize
-        && route.body_oversize == BodyOversizePolicy::BypassCache
-        && route.mode != RouteMode::Replay;
+    let allow_oversize_bypass_cache =
+        route.body_oversize == BodyOversizePolicy::BypassCache && route.mode != RouteMode::Replay;
+    let bypass_request_buffering = request_known_oversize && allow_oversize_bypass_cache;
     if request_known_oversize && !bypass_request_buffering {
         respond!(
             None,
@@ -905,9 +969,52 @@ async fn proxy_handler(
         );
     }
 
-    let body_bytes = match collect_body_with_limit(body, state.max_body_bytes).await {
-        Ok(bytes) => bytes,
-        Err(BodyReadError::TooLarge { limit_bytes }) => {
+    let body_bytes = match read_body_with_limit(body, state.max_body_bytes).await {
+        Ok(BodyReadOutcome::Buffered(bytes)) => bytes,
+        Ok(BodyReadOutcome::TooLarge {
+            limit_bytes,
+            prefetched,
+            remaining,
+        }) => {
+            if allow_oversize_bypass_cache {
+                tracing::debug!(
+                    limit_bytes = state.max_body_bytes,
+                    "bypassing cache after request body exceeded configured limit mid-stream"
+                );
+
+                parts.uri = upstream_uri.clone();
+                set_host_header(&mut parts.headers, &upstream_uri);
+                let upstream_req =
+                    Request::from_parts(parts, boxed_prefetched_incoming(prefetched, remaining));
+
+                state
+                    .status
+                    .upstream_requests_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let upstream_started_at = Instant::now();
+                let upstream_res = match state.client.request(upstream_req).await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        let upstream_latency = upstream_started_at.elapsed();
+                        tracing::debug!("upstream request failed: {err}");
+                        respond!(
+                            Some(upstream_latency),
+                            proxy_simple_response(
+                                StatusCode::BAD_GATEWAY,
+                                "upstream request failed",
+                            )
+                        );
+                    }
+                };
+                let upstream_latency = upstream_started_at.elapsed();
+
+                let (mut upstream_parts, upstream_body) = upstream_res.into_parts();
+                strip_hop_by_hop_headers(&mut upstream_parts.headers);
+                respond!(
+                    Some(upstream_latency),
+                    Response::from_parts(upstream_parts, boxed_incoming(upstream_body))
+                );
+            }
             tracing::debug!("request body exceeded configured limit of {limit_bytes} bytes");
             respond!(
                 None,
@@ -1121,9 +1228,23 @@ async fn proxy_handler(
         );
     }
 
-    let body_bytes = match collect_body_with_limit(body, state.max_body_bytes).await {
-        Ok(bytes) => bytes,
-        Err(BodyReadError::TooLarge { limit_bytes }) => {
+    let body_bytes = match read_body_with_limit(body, state.max_body_bytes).await {
+        Ok(BodyReadOutcome::Buffered(bytes)) => bytes,
+        Ok(BodyReadOutcome::TooLarge {
+            limit_bytes,
+            prefetched,
+            remaining,
+        }) => {
+            if route.body_oversize == BodyOversizePolicy::BypassCache {
+                tracing::debug!(
+                    limit_bytes = state.max_body_bytes,
+                    "bypassing cache after upstream response body exceeded configured limit mid-stream"
+                );
+                respond!(
+                    Some(upstream_latency),
+                    Response::from_parts(parts, boxed_prefetched_incoming(prefetched, remaining))
+                );
+            }
             tracing::debug!(
                 "upstream response body exceeded configured limit of {limit_bytes} bytes"
             );

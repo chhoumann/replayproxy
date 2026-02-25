@@ -23,13 +23,13 @@ use hyper_util::{
     server::conn::auto::Builder as ConnectionBuilder,
 };
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
     config::{CacheMissPolicy, Config, QueryMatchMode, RouteMatchConfig, RouteMode},
     matching,
-    storage::{Recording, Storage},
+    storage::{Recording, SessionManager, SessionManagerError, Storage},
 };
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
@@ -83,6 +83,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         None => None,
     };
     let runtime_status = Arc::new(RuntimeStatus::new(config, listen_addr, admin_listen_addr));
+    let session_manager = SessionManager::from_config(config)?;
 
     let mut connector = HttpConnector::new();
     connector.enforce_http(false);
@@ -117,7 +118,10 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
 
     let (admin_shutdown_tx, admin_join) = if let Some(admin_listener) = admin_listener {
         let (admin_shutdown_tx, mut admin_shutdown_rx) = oneshot::channel::<()>();
-        let runtime_status = Arc::clone(&runtime_status);
+        let admin_state = Arc::new(AdminState {
+            status: Arc::clone(&runtime_status),
+            session_manager,
+        });
         let admin_join = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -125,10 +129,10 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
                     accept = admin_listener.accept() => {
                         let Ok((stream, _peer)) = accept else { continue };
                         let io = TokioIo::new(stream);
-                        let runtime_status = Arc::clone(&runtime_status);
+                        let admin_state = Arc::clone(&admin_state);
                         tokio::spawn(async move {
                             let service = service_fn(move |req| {
-                                admin_handler(req, Arc::clone(&runtime_status))
+                                admin_handler(req, Arc::clone(&admin_state))
                             });
                             let builder = ConnectionBuilder::new(TokioExecutor::new());
                             if let Err(err) = builder.serve_connection(io, service).await {
@@ -192,6 +196,12 @@ struct RuntimeStatus {
     upstream_requests_total: AtomicU64,
 }
 
+#[derive(Debug)]
+struct AdminState {
+    status: Arc<RuntimeStatus>,
+    session_manager: Option<SessionManager>,
+}
+
 #[derive(Debug, Serialize)]
 struct AdminStatusResponse {
     uptime_ms: u64,
@@ -209,6 +219,27 @@ struct AdminStatusStats {
     cache_hits_total: u64,
     cache_misses_total: u64,
     upstream_requests_total: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSessionsResponse {
+    active_session: String,
+    sessions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionRequest {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionResponse {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminErrorResponse {
+    error: String,
 }
 
 impl RuntimeStatus {
@@ -254,6 +285,10 @@ impl RuntimeStatus {
                 upstream_requests_total: self.upstream_requests_total.load(Ordering::Relaxed),
             },
         }
+    }
+
+    fn active_session(&self) -> &str {
+        &self.active_session
     }
 }
 
@@ -742,20 +777,186 @@ fn admin_status_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
     }
 }
 
+fn admin_error_response(status: StatusCode, message: impl Into<String>) -> Response<Full<Bytes>> {
+    let payload = AdminErrorResponse {
+        error: message.into(),
+    };
+    match serde_json::to_vec(&payload) {
+        Ok(body) => {
+            let mut response = Response::new(Full::new(Bytes::from(body)));
+            *response.status_mut() = status;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        }
+        Err(err) => {
+            tracing::debug!("failed to serialize admin error response: {err}");
+            simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize admin error response",
+            )
+        }
+    }
+}
+
+fn admin_json_response<T: Serialize>(status: StatusCode, payload: &T) -> Response<Full<Bytes>> {
+    match serde_json::to_vec(payload) {
+        Ok(body) => {
+            let mut response = Response::new(Full::new(Bytes::from(body)));
+            *response.status_mut() = status;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        }
+        Err(err) => {
+            tracing::debug!("failed to serialize admin JSON response: {err}");
+            admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize admin response",
+            )
+        }
+    }
+}
+
+fn status_for_session_error(err: &SessionManagerError) -> StatusCode {
+    match err {
+        SessionManagerError::InvalidName(_) => StatusCode::BAD_REQUEST,
+        SessionManagerError::AlreadyExists(_) => StatusCode::CONFLICT,
+        SessionManagerError::NotFound(_) => StatusCode::NOT_FOUND,
+        SessionManagerError::Io(_) | SessionManagerError::Internal(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 async fn admin_handler(
     req: Request<Incoming>,
-    status: Arc<RuntimeStatus>,
+    state: Arc<AdminState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    status.admin_requests_total.fetch_add(1, Ordering::Relaxed);
-    if req.uri().path() == "/_admin/status" {
-        if req.method() != hyper::Method::GET {
+    state
+        .status
+        .admin_requests_total
+        .fetch_add(1, Ordering::Relaxed);
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+
+    if path == "/_admin/status" {
+        if method != hyper::Method::GET {
             return Ok(simple_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method not allowed",
             ));
         }
-        return Ok(admin_status_response(&status));
+        return Ok(admin_status_response(&state.status));
     }
+
+    if path == "/_admin/sessions" {
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        return match method {
+            hyper::Method::GET => match session_manager.list_sessions().await {
+                Ok(sessions) => {
+                    let response = AdminSessionsResponse {
+                        active_session: state.status.active_session().to_owned(),
+                        sessions,
+                    };
+                    Ok(admin_json_response(StatusCode::OK, &response))
+                }
+                Err(err) => Ok(admin_error_response(
+                    status_for_session_error(&err),
+                    err.to_string(),
+                )),
+            },
+            hyper::Method::POST => {
+                let body_bytes = match req.into_body().collect().await {
+                    Ok(body) => body.to_bytes(),
+                    Err(err) => {
+                        return Ok(admin_error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("failed to read request body: {err}"),
+                        ));
+                    }
+                };
+
+                let create_request: CreateSessionRequest = match serde_json::from_slice(&body_bytes)
+                {
+                    Ok(create_request) => create_request,
+                    Err(err) => {
+                        return Ok(admin_error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid JSON body: {err}"),
+                        ));
+                    }
+                };
+
+                match session_manager.create_session(&create_request.name).await {
+                    Ok(()) => {
+                        let response = SessionResponse {
+                            name: create_request.name,
+                        };
+                        Ok(admin_json_response(StatusCode::CREATED, &response))
+                    }
+                    Err(err) => Ok(admin_error_response(
+                        status_for_session_error(&err),
+                        err.to_string(),
+                    )),
+                }
+            }
+            _ => Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            )),
+        };
+    }
+
+    if let Some(session_name) = path.strip_prefix("/_admin/sessions/") {
+        if session_name.is_empty() || session_name.contains('/') {
+            return Ok(admin_error_response(StatusCode::NOT_FOUND, "not found"));
+        }
+
+        if method != hyper::Method::DELETE {
+            return Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        if session_name == state.status.active_session() {
+            return Ok(admin_error_response(
+                StatusCode::CONFLICT,
+                format!("cannot delete active session `{session_name}`"),
+            ));
+        }
+
+        return match session_manager.delete_session(session_name).await {
+            Ok(()) => {
+                let mut response = Response::new(Full::new(Bytes::new()));
+                *response.status_mut() = StatusCode::NO_CONTENT;
+                Ok(response)
+            }
+            Err(err) => Ok(admin_error_response(
+                status_for_session_error(&err),
+                err.to_string(),
+            )),
+        };
+    }
+
     Ok(simple_response(StatusCode::NOT_FOUND, "not found"))
 }
 

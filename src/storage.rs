@@ -19,6 +19,33 @@ pub struct Storage {
     db_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionManager {
+    base_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionManagerError {
+    InvalidName(String),
+    AlreadyExists(String),
+    NotFound(String),
+    Io(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for SessionManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName(reason) => write!(f, "{reason}"),
+            Self::AlreadyExists(name) => write!(f, "session `{name}` already exists"),
+            Self::NotFound(name) => write!(f, "session `{name}` was not found"),
+            Self::Io(message) | Self::Internal(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionManagerError {}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Recording {
     pub match_key: String,
@@ -154,6 +181,56 @@ impl Storage {
     }
 }
 
+impl SessionManager {
+    pub fn from_config(config: &Config) -> anyhow::Result<Option<Self>> {
+        let Some(storage) = config.storage.as_ref() else {
+            return Ok(None);
+        };
+
+        fs::create_dir_all(&storage.path)
+            .with_context(|| format!("create sessions dir {}", storage.path.display()))?;
+
+        Ok(Some(Self::new(storage.path.clone())))
+    }
+
+    pub fn new(base_path: PathBuf) -> Self {
+        Self { base_path }
+    }
+
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<String>, SessionManagerError> {
+        let base_path = self.base_path.clone();
+        tokio::task::spawn_blocking(move || list_sessions_blocking(&base_path))
+            .await
+            .map_err(|err| {
+                SessionManagerError::Internal(format!("join list sessions task failed: {err}"))
+            })?
+    }
+
+    pub async fn create_session(&self, name: &str) -> Result<(), SessionManagerError> {
+        let base_path = self.base_path.clone();
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || create_session_blocking(&base_path, &name))
+            .await
+            .map_err(|err| {
+                SessionManagerError::Internal(format!("join create session task failed: {err}"))
+            })?
+    }
+
+    pub async fn delete_session(&self, name: &str) -> Result<(), SessionManagerError> {
+        let base_path = self.base_path.clone();
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || delete_session_blocking(&base_path, &name))
+            .await
+            .map_err(|err| {
+                SessionManagerError::Internal(format!("join delete session task failed: {err}"))
+            })?
+    }
+}
+
 fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
@@ -232,6 +309,122 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> anyhow::Result<()> {
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .context("set PRAGMA user_version=2")?;
+    Ok(())
+}
+
+fn validate_session_name(name: &str) -> Result<(), SessionManagerError> {
+    if name.trim().is_empty() {
+        return Err(SessionManagerError::InvalidName(
+            "session name cannot be empty".to_owned(),
+        ));
+    }
+    if name != name.trim() {
+        return Err(SessionManagerError::InvalidName(
+            "session name cannot have leading or trailing whitespace".to_owned(),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(SessionManagerError::InvalidName(
+            "session name cannot contain path separators".to_owned(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(SessionManagerError::InvalidName(
+            "session name cannot be `.` or `..`".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn list_sessions_blocking(base_path: &Path) -> Result<Vec<String>, SessionManagerError> {
+    if !base_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut sessions = Vec::new();
+    let entries = fs::read_dir(base_path).map_err(|err| {
+        SessionManagerError::Io(format!("read sessions dir {}: {err}", base_path.display()))
+    })?;
+
+    for entry_result in entries {
+        let entry = entry_result.map_err(|err| {
+            SessionManagerError::Io(format!(
+                "iterate sessions dir {}: {err}",
+                base_path.display()
+            ))
+        })?;
+
+        let file_type = entry.file_type().map_err(|err| {
+            SessionManagerError::Io(format!(
+                "read file type for session entry {}: {err}",
+                entry.path().display()
+            ))
+        })?;
+
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let session_dir = entry.path();
+        let db_path = session_dir.join("recordings.db");
+        if !db_path.exists() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        sessions.push(name);
+    }
+
+    sessions.sort();
+    Ok(sessions)
+}
+
+fn create_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionManagerError> {
+    validate_session_name(name)?;
+
+    fs::create_dir_all(base_path).map_err(|err| {
+        SessionManagerError::Io(format!(
+            "create sessions dir {}: {err}",
+            base_path.display()
+        ))
+    })?;
+
+    let session_dir = base_path.join(name);
+    match fs::create_dir(&session_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(SessionManagerError::AlreadyExists(name.to_owned()));
+        }
+        Err(err) => {
+            return Err(SessionManagerError::Io(format!(
+                "create session dir {}: {err}",
+                session_dir.display()
+            )));
+        }
+    }
+
+    let db_path = session_dir.join("recordings.db");
+    Storage::open(db_path).map_err(|err| {
+        SessionManagerError::Internal(format!("initialize session `{name}`: {err}"))
+    })?;
+    Ok(())
+}
+
+fn delete_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionManagerError> {
+    validate_session_name(name)?;
+
+    let session_dir = base_path.join(name);
+    if !session_dir.exists() {
+        return Err(SessionManagerError::NotFound(name.to_owned()));
+    }
+
+    fs::remove_dir_all(&session_dir).map_err(|err| {
+        SessionManagerError::Io(format!(
+            "delete session dir {}: {err}",
+            session_dir.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -532,7 +725,7 @@ fn get_recordings_by_match_key_blocking(
 mod tests {
     use rusqlite::params;
 
-    use super::{Recording, Storage};
+    use super::{Recording, SessionManager, SessionManagerError, Storage};
     use crate::matching;
 
     #[tokio::test]
@@ -766,5 +959,53 @@ mod tests {
             .await
             .unwrap();
         assert!(fetched.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_manager_lists_create_and_delete_sessions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+
+        assert_eq!(manager.list_sessions().await.unwrap(), Vec::<String>::new());
+
+        manager.create_session("default").await.unwrap();
+        manager.create_session("staging").await.unwrap();
+
+        let mut sessions = manager.list_sessions().await.unwrap();
+        sessions.sort();
+        assert_eq!(sessions, vec!["default".to_owned(), "staging".to_owned()]);
+        assert!(
+            temp_dir
+                .path()
+                .join("staging")
+                .join("recordings.db")
+                .exists()
+        );
+
+        manager.delete_session("default").await.unwrap();
+        let sessions = manager.list_sessions().await.unwrap();
+        assert_eq!(sessions, vec!["staging".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn session_manager_rejects_invalid_duplicate_and_missing_sessions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+
+        let err = manager.create_session("..").await.unwrap_err();
+        assert_eq!(
+            err,
+            SessionManagerError::InvalidName("session name cannot be `.` or `..`".to_owned())
+        );
+
+        manager.create_session("default").await.unwrap();
+        let err = manager.create_session("default").await.unwrap_err();
+        assert_eq!(
+            err,
+            SessionManagerError::AlreadyExists("default".to_owned())
+        );
+
+        let err = manager.delete_session("missing").await.unwrap_err();
+        assert_eq!(err, SessionManagerError::NotFound("missing".to_owned()));
     }
 }

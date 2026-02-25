@@ -219,6 +219,189 @@ mode = "passthrough-cache"
 }
 
 #[tokio::test]
+async fn admin_sessions_crud_endpoints_manage_sessions() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "default"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let list_uri: Uri = format!("http://{admin_addr}/_admin/sessions")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(list_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["active_session"].as_str(), Some("default"));
+    let sessions = body["sessions"].as_array().unwrap();
+    assert!(
+        sessions
+            .iter()
+            .any(|value| value.as_str() == Some("default"))
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(list_uri.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(br#"{"name":"staging"}"#)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body = response_json(res).await;
+    assert_eq!(body["name"].as_str(), Some("staging"));
+    assert!(
+        storage_dir
+            .path()
+            .join("staging")
+            .join("recordings.db")
+            .exists()
+    );
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(list_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    let sessions = body["sessions"].as_array().unwrap();
+    assert!(
+        sessions
+            .iter()
+            .any(|value| value.as_str() == Some("staging"))
+    );
+
+    let delete_uri: Uri = format!("http://{admin_addr}/_admin/sessions/staging")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(delete_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(!storage_dir.path().join("staging").exists());
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_sessions_endpoints_return_informative_errors() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "default"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let list_uri: Uri = format!("http://{admin_addr}/_admin/sessions")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(list_uri.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(b"not-json")))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON body")
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(list_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(br#"{"name":"default"}"#)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("already exists"));
+
+    let delete_active_uri: Uri = format!("http://{admin_addr}/_admin/sessions/default")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(delete_active_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot delete active session")
+    );
+
+    let delete_missing_uri: Uri = format!("http://{admin_addr}/_admin/sessions/missing")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(delete_missing_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("was not found"));
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn record_mode_persists_recording() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
@@ -768,4 +951,9 @@ async fn spawn_upstream() -> (
     });
 
     (addr, rx, move || join)
+}
+
+async fn response_json(response: Response<Incoming>) -> Value {
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body_bytes).unwrap()
 }

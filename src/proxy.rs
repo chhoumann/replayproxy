@@ -44,6 +44,7 @@ type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
 type HttpClient = Client<HttpConnector, ProxyBody>;
 const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 const REDACTION_PLACEHOLDER_BYTES: &[u8] = b"[REDACTED]";
+const SUBSET_QUERY_CANDIDATE_LIMIT: usize = 4096;
 const DURATION_HISTOGRAM_BUCKETS: [(&str, u64); 12] = [
     ("0.001", 1_000),
     ("0.005", 5_000),
@@ -1311,6 +1312,23 @@ async fn lookup_recording_for_request(
     request_uri: &Uri,
     match_key: &str,
 ) -> anyhow::Result<Option<Recording>> {
+    lookup_recording_for_request_with_subset_limit(
+        storage,
+        route_match,
+        request_uri,
+        match_key,
+        SUBSET_QUERY_CANDIDATE_LIMIT,
+    )
+    .await
+}
+
+async fn lookup_recording_for_request_with_subset_limit(
+    storage: &Storage,
+    route_match: Option<&RouteMatchConfig>,
+    request_uri: &Uri,
+    match_key: &str,
+    subset_candidate_limit: usize,
+) -> anyhow::Result<Option<Recording>> {
     let query_mode = route_match
         .map(|route_match| route_match.query)
         .unwrap_or(QueryMatchMode::Exact);
@@ -1319,11 +1337,47 @@ async fn lookup_recording_for_request(
         return storage.get_recording_by_match_key(match_key).await;
     }
 
-    let subset_query_normalizations =
-        matching::subset_query_candidate_normalizations(request_uri.query());
-    storage
-        .get_latest_recording_by_match_key_and_query_subset(match_key, subset_query_normalizations)
-        .await
+    let request_query = request_uri.query();
+    if let Some(subset_query_normalizations) =
+        matching::subset_query_candidate_normalizations_with_limit(
+            request_query,
+            subset_candidate_limit,
+        )
+    {
+        return storage
+            .get_latest_recording_by_match_key_and_query_subset(
+                match_key,
+                subset_query_normalizations,
+            )
+            .await;
+    }
+
+    let request_query_param_count = request_query
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|segment| !segment.is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    tracing::debug!(
+        match_key = %sanitize_match_key(match_key),
+        subset_candidate_limit,
+        request_query_param_count,
+        "subset candidate combinations exceeded limit; falling back to recording scan"
+    );
+
+    let matched = storage
+        .get_latest_recording_by_match_key_and_query_subset_scan(match_key, request_query)
+        .await?;
+    tracing::debug!(
+        match_key = %sanitize_match_key(match_key),
+        subset_candidate_limit,
+        request_query_param_count,
+        matched = matched.is_some(),
+        "completed subset lookup fallback recording scan"
+    );
+    Ok(matched)
 }
 
 fn build_upstream_uri(upstream_base: &Uri, original: &Uri) -> anyhow::Result<Uri> {
@@ -2057,12 +2111,14 @@ mod tests {
 
     use super::{
         CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, emit_proxy_request_log,
-        format_route_ref, mode_log_label, redact_recording_body_json, redact_recording_headers,
-        sanitize_match_key, select_route,
+        format_route_ref, lookup_recording_for_request_with_subset_limit, mode_log_label,
+        redact_recording_body_json, redact_recording_headers, sanitize_match_key, select_route,
     };
     use crate::config::{
-        BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMode,
+        BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
+        RouteMode,
     };
+    use crate::storage::{Recording, Storage};
     use serde_json::Value;
     use tracing_subscriber::{filter::LevelFilter, fmt::MakeWriter};
 
@@ -2160,6 +2216,51 @@ upstream = "http://127.0.0.1:1"
             sanitize_match_key("6a9f16398d64f3fcf57ecf7855da29232ef52f01579f0f74defad5c6af53f3e0"),
             "6a9f16398d64f3fcf57ecf7855da29232ef52f01579f0f74defad5c6af53f3e0"
         );
+    }
+
+    #[tokio::test]
+    async fn subset_lookup_fallback_scan_returns_newest_matching_recording() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let mut base = Recording {
+            match_key: "same-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/api?a=1".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"older-matching".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_uri = "/api?a=1&b=2".to_owned();
+        base.response_body = b"newer-matching".to_vec();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_uri = "/api?x=9".to_owned();
+        base.response_body = b"newest-nonmatching".to_vec();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base).await.unwrap();
+
+        let route_match: RouteMatchConfig = toml::from_str("query = \"subset\"\n").unwrap();
+        let request_uri: hyper::Uri = "http://example.com/api?a=1&b=2&c=3".parse().unwrap();
+        let fetched = lookup_recording_for_request_with_subset_limit(
+            &storage,
+            Some(&route_match),
+            &request_uri,
+            "same-key",
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fetched.request_uri, "/api?a=1&b=2");
+        assert_eq!(fetched.response_body, b"newer-matching");
     }
 
     #[test]

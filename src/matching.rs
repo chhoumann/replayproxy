@@ -233,16 +233,7 @@ fn append_subset_query_candidates<'a>(
     }
 }
 
-pub(crate) fn normalized_query(query: Option<&str>) -> String {
-    normalized_query_from_sorted(&query_params_sorted(query))
-}
-
-pub(crate) fn subset_query_candidate_normalizations(query: Option<&str>) -> Vec<String> {
-    let sorted = query_params_sorted(query);
-    if sorted.is_empty() {
-        return vec![String::new()];
-    }
-
+fn grouped_query_params<'a>(sorted: Vec<(&'a str, &'a str)>) -> Vec<(&'a str, &'a str, usize)> {
     let mut grouped = Vec::new();
     for (name, value) in sorted {
         if let Some((prev_name, prev_value, prev_count)) = grouped.last_mut()
@@ -254,14 +245,43 @@ pub(crate) fn subset_query_candidate_normalizations(query: Option<&str>) -> Vec<
             grouped.push((name, value, 1usize));
         }
     }
-
-    let mut out = Vec::new();
-    let mut current = Vec::new();
-    append_subset_query_candidates(&grouped, 0, &mut current, &mut out);
-    out
+    grouped
 }
 
-#[allow(dead_code)]
+fn subset_query_candidate_count(grouped: &[(&str, &str, usize)], limit: usize) -> Option<usize> {
+    let mut candidate_count = 1usize;
+    for (_, _, multiplicity) in grouped {
+        let factor = multiplicity.checked_add(1)?;
+        candidate_count = candidate_count.checked_mul(factor)?;
+        if candidate_count > limit {
+            return None;
+        }
+    }
+    Some(candidate_count)
+}
+
+pub(crate) fn normalized_query(query: Option<&str>) -> String {
+    normalized_query_from_sorted(&query_params_sorted(query))
+}
+
+pub(crate) fn subset_query_candidate_normalizations_with_limit(
+    query: Option<&str>,
+    max_candidates: usize,
+) -> Option<Vec<String>> {
+    let sorted = query_params_sorted(query);
+    if sorted.is_empty() {
+        return (max_candidates >= 1).then_some(vec![String::new()]);
+    }
+
+    let grouped = grouped_query_params(sorted);
+    let candidate_count = subset_query_candidate_count(&grouped, max_candidates)?;
+
+    let mut out = Vec::with_capacity(candidate_count);
+    let mut current = Vec::new();
+    append_subset_query_candidates(&grouped, 0, &mut current, &mut out);
+    Some(out)
+}
+
 pub(crate) fn query_params_match(
     mode: QueryMatchMode,
     recorded_query: Option<&str>,
@@ -385,7 +405,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         MatchKeyError, compute_match_key, normalized_query, query_params_match,
-        subset_query_candidate_normalizations,
+        subset_query_candidate_normalizations_with_limit,
     };
     use crate::config::{QueryMatchMode, RouteMatchConfig};
     use serde_json::Value;
@@ -686,7 +706,9 @@ headers_ignore = ["Date", "X-Request-Id"]
 
     #[test]
     fn subset_query_candidate_normalizations_cover_multiplicity() {
-        let mut actual = subset_query_candidate_normalizations(Some("b=2&a=1&a=1"));
+        let mut actual =
+            subset_query_candidate_normalizations_with_limit(Some("b=2&a=1&a=1"), usize::MAX)
+                .unwrap();
         actual.sort_unstable();
 
         let mut expected = vec![
@@ -696,6 +718,32 @@ headers_ignore = ["Date", "X-Request-Id"]
             "b=2".to_owned(),
             "a=1&b=2".to_owned(),
             "a=1&a=1&b=2".to_owned(),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn subset_query_candidate_normalizations_with_limit_returns_none_when_limit_exceeded() {
+        assert!(subset_query_candidate_normalizations_with_limit(Some("a=1&b=2&c=3"), 7).is_none());
+    }
+
+    #[test]
+    fn subset_query_candidate_normalizations_with_limit_allows_exact_limit() {
+        let mut actual =
+            subset_query_candidate_normalizations_with_limit(Some("a=1&b=2&c=3"), 8).unwrap();
+        actual.sort_unstable();
+
+        let mut expected = vec![
+            "".to_owned(),
+            "a=1".to_owned(),
+            "b=2".to_owned(),
+            "c=3".to_owned(),
+            "a=1&b=2".to_owned(),
+            "a=1&c=3".to_owned(),
+            "b=2&c=3".to_owned(),
+            "a=1&b=2&c=3".to_owned(),
         ];
         expected.sort_unstable();
 

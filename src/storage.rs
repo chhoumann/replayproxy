@@ -8,7 +8,10 @@ use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::Config, matching, session};
+use crate::{
+    config::{Config, QueryMatchMode},
+    matching, session,
+};
 
 const SCHEMA_VERSION: i32 = 2;
 const SQLITE_MAX_BIND_PARAMS: usize = 999;
@@ -188,6 +191,25 @@ impl Storage {
         })
         .await
         .context("join get_latest_recording_by_match_key_and_query_subset task")?
+    }
+
+    pub async fn get_latest_recording_by_match_key_and_query_subset_scan(
+        &self,
+        match_key: &str,
+        request_query: Option<&str>,
+    ) -> anyhow::Result<Option<Recording>> {
+        let db_path = self.db_path.clone();
+        let match_key = match_key.to_owned();
+        let request_query = request_query.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            get_latest_recording_by_match_key_and_query_subset_scan_blocking(
+                &db_path,
+                &match_key,
+                request_query.as_deref(),
+            )
+        })
+        .await
+        .context("join get_latest_recording_by_match_key_and_query_subset_scan task")?
     }
 
     pub async fn list_recordings(
@@ -717,6 +739,96 @@ fn get_recording_by_match_key_blocking(
     };
 
     Ok(Some(deserialize_recording_at(row, 0)?))
+}
+
+fn get_recording_by_id_from_conn(
+    conn: &Connection,
+    recording_id: i64,
+) -> anyhow::Result<Option<Recording>> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+              match_key,
+              request_method,
+              request_uri,
+              request_headers_json,
+              request_body,
+              response_status,
+              response_headers_json,
+              response_body,
+              created_at_unix_ms
+            FROM recordings
+            WHERE id = ?1
+            LIMIT 1
+            "#,
+        )
+        .context("prepare select recording by id")?;
+
+    let mut rows = stmt
+        .query(params![recording_id])
+        .context("query recording by id")?;
+
+    let Some(row) = rows.next().context("iterate recording by id")? else {
+        return Ok(None);
+    };
+
+    Ok(Some(deserialize_recording_at(row, 0)?))
+}
+
+fn get_latest_recording_by_match_key_and_query_subset_scan_blocking(
+    path: &Path,
+    match_key: &str,
+    request_query: Option<&str>,
+) -> anyhow::Result<Option<Recording>> {
+    let conn = open_connection(path)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+              id,
+              request_query_norm
+            FROM recordings
+            WHERE match_key = ?1
+            ORDER BY id DESC
+            "#,
+        )
+        .context("prepare scan recordings by match_key for subset lookup")?;
+
+    let mut rows = stmt
+        .query(params![match_key])
+        .context("query recordings by match_key for subset lookup scan")?;
+    let mut matched_recording_id = None;
+
+    while let Some(row) = rows
+        .next()
+        .context("iterate recordings by match_key for subset lookup scan")?
+    {
+        let recording_id = row
+            .get::<_, i64>(0)
+            .context("deserialize recording id for subset lookup scan")?;
+        let request_query_norm = row
+            .get::<_, String>(1)
+            .context("deserialize request_query_norm for subset lookup scan")?;
+        let recorded_query = if request_query_norm.is_empty() {
+            None
+        } else {
+            Some(request_query_norm.as_str())
+        };
+
+        if matching::query_params_match(QueryMatchMode::Subset, recorded_query, request_query) {
+            matched_recording_id = Some(recording_id);
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    let Some(matched_recording_id) = matched_recording_id else {
+        return Ok(None);
+    };
+
+    get_recording_by_id_from_conn(&conn, matched_recording_id)
 }
 
 fn get_latest_recording_by_match_key_and_query_subset_blocking(
@@ -1279,8 +1391,11 @@ active_session = "default"
         base.created_at_unix_ms += 1;
         storage.insert_recording(base).await.unwrap();
 
-        let subset_query_norms =
-            matching::subset_query_candidate_normalizations(Some("a=1&b=2&c=3"));
+        let subset_query_norms = matching::subset_query_candidate_normalizations_with_limit(
+            Some("a=1&b=2&c=3"),
+            usize::MAX,
+        )
+        .unwrap();
         let fetched = storage
             .get_latest_recording_by_match_key_and_query_subset("same-key", subset_query_norms)
             .await
@@ -1289,6 +1404,74 @@ active_session = "default"
 
         assert_eq!(fetched.request_uri, "/api?a=1&b=2");
         assert_eq!(&fetched.response_body[..], b"newer-matching");
+    }
+
+    #[tokio::test]
+    async fn subset_scan_lookup_returns_newest_matching_recording() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let mut base = Recording {
+            match_key: "same-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/api?a=1".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"older".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_uri = "/api?a=1&b=2".to_owned();
+        base.response_body = b"newer-matching".to_vec();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_uri = "/api?x=9".to_owned();
+        base.response_body = b"newest-nonmatching".to_vec();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base).await.unwrap();
+
+        let fetched = storage
+            .get_latest_recording_by_match_key_and_query_subset_scan(
+                "same-key",
+                Some("a=1&b=2&c=3"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fetched.request_uri, "/api?a=1&b=2");
+        assert_eq!(&fetched.response_body[..], b"newer-matching");
+    }
+
+    #[tokio::test]
+    async fn subset_scan_lookup_returns_none_when_no_recording_matches() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let recording = Recording {
+            match_key: "same-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/api?x=9".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"only-recording".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        storage.insert_recording(recording).await.unwrap();
+
+        let fetched = storage
+            .get_latest_recording_by_match_key_and_query_subset_scan("same-key", Some("a=1&b=2"))
+            .await
+            .unwrap();
+
+        assert!(fetched.is_none());
     }
 
     #[tokio::test]
@@ -1358,8 +1541,11 @@ active_session = "default"
             .unwrap();
         assert_eq!(query_norm, "a=1&b=2");
 
-        let subset_query_norms =
-            matching::subset_query_candidate_normalizations(Some("a=1&b=2&c=3"));
+        let subset_query_norms = matching::subset_query_candidate_normalizations_with_limit(
+            Some("a=1&b=2&c=3"),
+            usize::MAX,
+        )
+        .unwrap();
         let fetched = storage
             .get_latest_recording_by_match_key_and_query_subset("legacy-key", subset_query_norms)
             .await

@@ -163,29 +163,29 @@ impl ProxyState {
 
 impl ProxyRoute {
     fn match_score(&self, path: &str) -> Option<PathMatchScore> {
-        if let Some(exact) = self.path_exact.as_deref() {
-            if path == exact {
-                return Some(PathMatchScore {
-                    kind: PathMatchKind::Exact,
-                    specificity: exact.len(),
-                });
-            }
+        if let Some(exact) = self.path_exact.as_deref()
+            && path == exact
+        {
+            return Some(PathMatchScore {
+                kind: PathMatchKind::Exact,
+                specificity: exact.len(),
+            });
         }
-        if let Some(prefix) = self.path_prefix.as_deref() {
-            if path.starts_with(prefix) {
-                return Some(PathMatchScore {
-                    kind: PathMatchKind::Prefix,
-                    specificity: prefix.len(),
-                });
-            }
+        if let Some(prefix) = self.path_prefix.as_deref()
+            && path.starts_with(prefix)
+        {
+            return Some(PathMatchScore {
+                kind: PathMatchKind::Prefix,
+                specificity: prefix.len(),
+            });
         }
-        if let Some(regex) = self.path_regex.as_ref() {
-            if regex.is_match(path) {
-                return Some(PathMatchScore {
-                    kind: PathMatchKind::Regex,
-                    specificity: 0,
-                });
-            }
+        if let Some(regex) = self.path_regex.as_ref()
+            && regex.is_match(path)
+        {
+            return Some(PathMatchScore {
+                kind: PathMatchKind::Regex,
+                specificity: 0,
+            });
         }
         None
     }

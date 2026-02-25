@@ -292,6 +292,115 @@ headers = ["X-A", "x-b"]
     }
 
     #[test]
+    fn match_key_ignores_unselected_headers_when_allowlist_is_set() {
+        let route_match: crate::config::RouteMatchConfig = toml::from_str(
+            r#"
+method = true
+path = true
+headers = ["X-A"]
+"#,
+        )
+        .unwrap();
+
+        let method = hyper::Method::GET;
+        let uri: hyper::Uri = "http://example.com/api/hello".parse().unwrap();
+
+        let mut a = hyper::HeaderMap::new();
+        a.insert("X-A", hyper::header::HeaderValue::from_static("1"));
+        a.insert(
+            "X-Request-Id",
+            hyper::header::HeaderValue::from_static("aaa"),
+        );
+
+        let mut b = hyper::HeaderMap::new();
+        b.insert("x-a", hyper::header::HeaderValue::from_static("1"));
+        b.insert(
+            "x-request-id",
+            hyper::header::HeaderValue::from_static("bbb"),
+        );
+
+        assert_eq!(
+            compute_match_key(Some(&route_match), &method, &uri, &a, b""),
+            compute_match_key(Some(&route_match), &method, &uri, &b, b"")
+        );
+    }
+
+    #[test]
+    fn match_key_changes_when_selected_header_is_missing() {
+        let route_match: crate::config::RouteMatchConfig = toml::from_str(
+            r#"
+method = true
+path = true
+headers = ["X-A", "X-B"]
+"#,
+        )
+        .unwrap();
+
+        let method = hyper::Method::GET;
+        let uri: hyper::Uri = "http://example.com/api/hello".parse().unwrap();
+
+        let mut with_b = hyper::HeaderMap::new();
+        with_b.insert("X-A", hyper::header::HeaderValue::from_static("1"));
+        with_b.insert("X-B", hyper::header::HeaderValue::from_static("2"));
+
+        let mut missing_b = hyper::HeaderMap::new();
+        missing_b.insert("X-A", hyper::header::HeaderValue::from_static("1"));
+
+        assert_ne!(
+            compute_match_key(Some(&route_match), &method, &uri, &with_b, b""),
+            compute_match_key(Some(&route_match), &method, &uri, &missing_b, b"")
+        );
+    }
+
+    #[test]
+    fn match_key_ignores_explicitly_ignored_headers() {
+        let route_match: crate::config::RouteMatchConfig = toml::from_str(
+            r#"
+method = true
+path = true
+headers_ignore = ["Date", "X-Request-Id"]
+"#,
+        )
+        .unwrap();
+
+        let method = hyper::Method::GET;
+        let uri: hyper::Uri = "http://example.com/api/hello".parse().unwrap();
+
+        let mut a = hyper::HeaderMap::new();
+        a.insert(
+            "accept",
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+        a.insert(
+            "date",
+            hyper::header::HeaderValue::from_static("Mon, 01 Jan 2024 00:00:00 GMT"),
+        );
+        a.insert(
+            "x-request-id",
+            hyper::header::HeaderValue::from_static("req-a"),
+        );
+
+        let mut b = hyper::HeaderMap::new();
+        b.insert(
+            "Accept",
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+        b.insert(
+            "Date",
+            hyper::header::HeaderValue::from_static("Tue, 02 Jan 2024 00:00:00 GMT"),
+        );
+        b.insert(
+            "X-Request-Id",
+            hyper::header::HeaderValue::from_static("req-b"),
+        );
+
+        assert_eq!(
+            compute_match_key(Some(&route_match), &method, &uri, &a, b""),
+            compute_match_key(Some(&route_match), &method, &uri, &b, b"")
+        );
+    }
+
+    #[test]
     fn match_key_changes_when_body_changes() {
         let method = hyper::Method::POST;
         let uri: hyper::Uri = "http://example.com/api/hello?x=1".parse().unwrap();

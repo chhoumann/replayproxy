@@ -424,6 +424,8 @@ cache_miss = "forward"
 [routes.match]
 method = true
 path = true
+headers = ["Authorization", "X-Request-Id"]
+headers_ignore = ["Date"]
 body_json = ["$.model", "$.messages", "$.temperature"]
 
 [routes.redact]
@@ -487,6 +489,11 @@ recording_mode = "server-only"
         assert_eq!(openai.upstream.as_deref(), Some("https://api.openai.com"));
         assert_eq!(openai.mode, Some(RouteMode::PassthroughCache));
         assert_eq!(openai.cache_miss, Some(super::CacheMissPolicy::Forward));
+        assert_eq!(
+            openai.match_.as_ref().unwrap().headers,
+            vec!["Authorization", "X-Request-Id"]
+        );
+        assert_eq!(openai.match_.as_ref().unwrap().headers_ignore, vec!["Date"]);
         assert_eq!(openai.match_.as_ref().unwrap().body_json.len(), 3);
         assert!(openai.streaming.as_ref().unwrap().preserve_timing);
         assert_eq!(openai.rate_limit.as_ref().unwrap().requests_per_second, 10);

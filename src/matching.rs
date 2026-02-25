@@ -255,4 +255,83 @@ headers = ["X-A", "x-b"]
             compute_match_key(Some(&route_match), &method, &uri, &b, b"")
         );
     }
+
+    #[test]
+    fn match_key_changes_when_body_changes() {
+        let method = hyper::Method::POST;
+        let uri: hyper::Uri = "http://example.com/api/hello?x=1".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+
+        assert_ne!(
+            compute_match_key(None, &method, &uri, &headers, b"a"),
+            compute_match_key(None, &method, &uri, &headers, b"b")
+        );
+    }
+
+    #[test]
+    fn match_key_changes_when_query_changes_in_exact_mode() {
+        let method = hyper::Method::GET;
+        let headers = hyper::HeaderMap::new();
+        let a: hyper::Uri = "http://example.com/api/hello?x=1".parse().unwrap();
+        let b: hyper::Uri = "http://example.com/api/hello?x=2".parse().unwrap();
+
+        assert_ne!(
+            compute_match_key(None, &method, &a, &headers, b""),
+            compute_match_key(None, &method, &b, &headers, b"")
+        );
+    }
+
+    #[test]
+    fn match_key_ignores_query_when_configured() {
+        let route_match: crate::config::RouteMatchConfig =
+            toml::from_str("query = \"ignore\"\n").unwrap();
+
+        let method = hyper::Method::GET;
+        let headers = hyper::HeaderMap::new();
+        let a: hyper::Uri = "http://example.com/api/hello?x=1".parse().unwrap();
+        let b: hyper::Uri = "http://example.com/api/hello?x=2".parse().unwrap();
+
+        assert_eq!(
+            compute_match_key(Some(&route_match), &method, &a, &headers, b""),
+            compute_match_key(Some(&route_match), &method, &b, &headers, b"")
+        );
+    }
+
+    #[test]
+    fn match_key_respects_disabled_method_dimension() {
+        let route_match: crate::config::RouteMatchConfig =
+            toml::from_str("method = false\n").unwrap();
+
+        let uri: hyper::Uri = "http://example.com/api/hello?x=1".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+
+        assert_eq!(
+            compute_match_key(Some(&route_match), &hyper::Method::GET, &uri, &headers, b""),
+            compute_match_key(
+                Some(&route_match),
+                &hyper::Method::POST,
+                &uri,
+                &headers,
+                b""
+            )
+        );
+    }
+
+    #[test]
+    fn match_key_is_lowercase_hex_sha256() {
+        let key = compute_match_key(
+            None,
+            &hyper::Method::GET,
+            &"http://example.com/api/hello?x=1".parse().unwrap(),
+            &hyper::HeaderMap::new(),
+            b"",
+        );
+
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "key should be lowercase hex, got: {key}"
+        );
+    }
 }

@@ -647,8 +647,26 @@ cache_miss = "error"
         .unwrap();
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(&body_bytes[..], b"Gateway Not Recorded");
+    let miss_body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        miss_body,
+        serde_json::json!({
+            "error": "Gateway Not Recorded",
+            "route": "routes[0] path_prefix=/api",
+            "session": "default",
+            "match_key": miss_body["match_key"],
+        })
+    );
+    let match_key = miss_body["match_key"].as_str().unwrap();
+    assert_eq!(match_key.len(), 64);
+    assert!(match_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
 
     replay_proxy.shutdown().await;
 }
@@ -837,8 +855,26 @@ query = "subset"
         .unwrap();
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(&body_bytes[..], b"Gateway Not Recorded");
+    let miss_body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        miss_body,
+        serde_json::json!({
+            "error": "Gateway Not Recorded",
+            "route": "routes[0] path_prefix=/api",
+            "session": "default",
+            "match_key": miss_body["match_key"],
+        })
+    );
+    let match_key = miss_body["match_key"].as_str().unwrap();
+    assert_eq!(match_key.len(), 64);
+    assert!(match_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
 
     replay_proxy.shutdown().await;
 }

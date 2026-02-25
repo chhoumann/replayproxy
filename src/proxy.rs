@@ -160,6 +160,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
 
 #[derive(Debug)]
 struct ProxyRoute {
+    route_ref: String,
     path_prefix: Option<String>,
     path_exact: Option<String>,
     path_regex: Option<Regex>,
@@ -242,6 +243,14 @@ struct AdminErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ReplayMissResponse {
+    error: &'static str,
+    route: String,
+    session: String,
+    match_key: String,
+}
+
 impl RuntimeStatus {
     fn new(
         config: &Config,
@@ -307,7 +316,7 @@ impl ProxyState {
         status: Arc<RuntimeStatus>,
     ) -> anyhow::Result<Self> {
         let mut parsed_routes = Vec::with_capacity(config.routes.len());
-        for route in &config.routes {
+        for (idx, route) in config.routes.iter().enumerate() {
             let path_regex =
                 match route.path_regex.as_deref() {
                     Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
@@ -332,6 +341,7 @@ impl ProxyState {
                 RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
             });
             parsed_routes.push(ProxyRoute {
+                route_ref: format_route_ref(route, idx),
                 path_prefix: route.path_prefix.clone(),
                 path_exact: route.path_exact.clone(),
                 path_regex,
@@ -509,9 +519,10 @@ async fn proxy_handler(
                         .cache_misses_total
                         .fetch_add(1, Ordering::Relaxed);
                     if route.cache_miss == CacheMissPolicy::Error {
-                        return Ok(simple_response(
-                            StatusCode::BAD_GATEWAY,
-                            "Gateway Not Recorded",
+                        return Ok(replay_miss_response(
+                            route,
+                            state.status.active_session(),
+                            match_key,
                         ));
                     }
                 }
@@ -756,6 +767,58 @@ fn simple_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     response
 }
 
+fn replay_miss_response(
+    route: &ProxyRoute,
+    active_session: &str,
+    match_key: &str,
+) -> Response<Full<Bytes>> {
+    let payload = ReplayMissResponse {
+        error: "Gateway Not Recorded",
+        route: route.route_ref.clone(),
+        session: active_session.to_owned(),
+        match_key: sanitize_match_key(match_key),
+    };
+
+    match serde_json::to_vec(&payload) {
+        Ok(body) => {
+            let mut response = Response::new(Full::new(Bytes::from(body)));
+            *response.status_mut() = StatusCode::BAD_GATEWAY;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        }
+        Err(err) => {
+            tracing::debug!("failed to serialize replay miss response: {err}");
+            simple_response(StatusCode::BAD_GATEWAY, "Gateway Not Recorded")
+        }
+    }
+}
+
+fn sanitize_match_key(match_key: &str) -> String {
+    if match_key.len() == 64 && match_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return match_key.to_owned();
+    }
+    "[REDACTED]".to_owned()
+}
+
+fn format_route_ref(route: &crate::config::RouteConfig, idx: usize) -> String {
+    if let Some(name) = route.name.as_deref() {
+        return format!("routes[{idx}] ({name})");
+    }
+    if let Some(path_exact) = route.path_exact.as_deref() {
+        return format!("routes[{idx}] path_exact={path_exact}");
+    }
+    if let Some(path_prefix) = route.path_prefix.as_deref() {
+        return format!("routes[{idx}] path_prefix={path_prefix}");
+    }
+    if let Some(path_regex) = route.path_regex.as_deref() {
+        return format!("routes[{idx}] path_regex={path_regex}");
+    }
+    format!("routes[{idx}]")
+}
+
 fn admin_status_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
     match serde_json::to_vec(&status.snapshot()) {
         Ok(body) => {
@@ -975,8 +1038,8 @@ fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyRoute, select_route};
-    use crate::config::{CacheMissPolicy, Config, RouteMode};
+    use super::{ProxyRoute, format_route_ref, sanitize_match_key, select_route};
+    use crate::config::{CacheMissPolicy, Config, RouteConfig, RouteMode};
 
     fn test_route(
         path_exact: Option<&str>,
@@ -984,6 +1047,7 @@ mod tests {
         path_regex: Option<&str>,
     ) -> ProxyRoute {
         ProxyRoute {
+            route_ref: "test-route".to_owned(),
             path_prefix: path_prefix.map(str::to_owned),
             path_exact: path_exact.map(str::to_owned),
             path_regex: path_regex.map(|pattern| regex::Regex::new(pattern).unwrap()),
@@ -1060,5 +1124,53 @@ upstream = "http://127.0.0.1:1"
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid `path_regex` expression"));
+    }
+
+    #[test]
+    fn sanitize_match_key_redacts_unexpected_values() {
+        assert_eq!(sanitize_match_key("abc"), "[REDACTED]");
+        assert_eq!(
+            sanitize_match_key("6a9f16398d64f3fcf57ecf7855da29232ef52f01579f0f74defad5c6af53f3e0"),
+            "6a9f16398d64f3fcf57ecf7855da29232ef52f01579f0f74defad5c6af53f3e0"
+        );
+    }
+
+    #[test]
+    fn format_route_ref_prefers_name_then_matcher() {
+        let route = RouteConfig {
+            name: Some("payments".to_owned()),
+            path_prefix: Some("/api".to_owned()),
+            path_exact: None,
+            path_regex: None,
+            upstream: None,
+            mode: None,
+            cache_miss: None,
+            match_: None,
+            redact: None,
+            streaming: None,
+            websocket: None,
+            grpc: None,
+            rate_limit: None,
+            transform: None,
+        };
+        assert_eq!(format_route_ref(&route, 3), "routes[3] (payments)");
+
+        let unnamed = RouteConfig {
+            name: None,
+            path_prefix: Some("/api".to_owned()),
+            path_exact: None,
+            path_regex: None,
+            upstream: None,
+            mode: None,
+            cache_miss: None,
+            match_: None,
+            redact: None,
+            streaming: None,
+            websocket: None,
+            grpc: None,
+            rate_limit: None,
+            transform: None,
+        };
+        assert_eq!(format_route_ref(&unnamed, 4), "routes[4] path_prefix=/api");
     }
 }

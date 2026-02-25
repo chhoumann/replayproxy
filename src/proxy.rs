@@ -774,9 +774,7 @@ fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::{ProxyRoute, ProxyState, RuntimeStatus, select_route};
+    use super::{ProxyRoute, select_route};
     use crate::config::{CacheMissPolicy, Config, RouteMode};
 
     fn test_route(
@@ -793,21 +791,6 @@ mod tests {
             cache_miss: CacheMissPolicy::Forward,
             match_config: None,
         }
-    }
-
-    fn test_client() -> super::HttpClient {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-        connector.enforce_http(false);
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(connector)
-    }
-
-    fn test_runtime_status(config: &Config) -> Arc<RuntimeStatus> {
-        Arc::new(RuntimeStatus::new(
-            config,
-            "127.0.0.1:0".parse().unwrap(),
-            Some("127.0.0.1:0".parse().unwrap()),
-        ))
     }
 
     #[test]
@@ -863,8 +846,8 @@ mod tests {
     }
 
     #[test]
-    fn proxy_state_new_rejects_invalid_path_regex() {
-        let config = Config::from_toml_str(
+    fn config_rejects_invalid_path_regex() {
+        let err = Config::from_toml_str(
             r#"
 [proxy]
 listen = "127.0.0.1:0"
@@ -874,10 +857,7 @@ path_regex = "("
 upstream = "http://127.0.0.1:1"
 "#,
         )
-        .unwrap();
-
-        let err =
-            ProxyState::new(&config, test_client(), test_runtime_status(&config)).unwrap_err();
-        assert!(err.to_string().contains("parse route.path_regex"));
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid `path_regex` expression"));
     }
 }

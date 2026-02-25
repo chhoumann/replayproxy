@@ -131,7 +131,7 @@ format = "pretty"
             tracing::info!(target: "replayproxy.tests", "hello");
         });
 
-        let output = writer.into_string();
+        let output = writer.as_string();
         let line = output.lines().next().expect("expected one JSON log line");
         let log: Value = serde_json::from_str(line).expect("log line should be valid JSON");
 
@@ -159,7 +159,7 @@ format = "pretty"
     }
 
     impl SharedWriter {
-        fn into_string(&self) -> String {
+        fn as_string(&self) -> String {
             let bytes = self.buffer.lock().expect("buffer lock poisoned").clone();
             String::from_utf8(bytes).expect("log output should be UTF-8")
         }

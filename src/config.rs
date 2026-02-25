@@ -8,6 +8,8 @@ use std::{
 };
 
 use anyhow::bail;
+use hyper::Uri;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json_path::JsonPath;
 
@@ -94,9 +96,15 @@ impl Config {
         storage.active_session = Some(active_session_override.to_owned());
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
-        for (idx, route) in self.routes.iter().enumerate() {
-            route.validate(idx)?;
+    fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
+        self.proxy.normalize_and_validate()?;
+
+        if let Some(storage) = self.storage.as_mut() {
+            storage.normalize_and_validate()?;
+        }
+
+        for (idx, route) in self.routes.iter_mut().enumerate() {
+            route.normalize_and_validate(idx)?;
         }
         Ok(())
     }
@@ -147,9 +155,9 @@ impl FromStr for Config {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let config: Self =
+        let mut config: Self =
             toml::from_str(s).map_err(|err| anyhow::anyhow!("parse config TOML: {err}"))?;
-        config.validate()?;
+        config.normalize_and_validate()?;
         Ok(config)
     }
 }
@@ -177,12 +185,69 @@ pub struct TlsConfig {
     pub ca_key: Option<PathBuf>,
 }
 
+impl ProxyConfig {
+    fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
+        if let Some(admin_port) = self.admin_port
+            && admin_port != 0
+            && self.listen.port() != 0
+            && admin_port == self.listen.port()
+        {
+            bail!(
+                "`proxy.admin_port` ({admin_port}) must differ from `proxy.listen` port ({})",
+                self.listen.port()
+            );
+        }
+
+        if let Some(tls) = self.tls.as_mut() {
+            tls.normalize_and_validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl TlsConfig {
+    fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
+        if let Some(ca_cert) = self.ca_cert.as_ref() {
+            self.ca_cert = Some(expand_tilde(ca_cert)?);
+        }
+        if let Some(ca_key) = self.ca_key.as_ref() {
+            self.ca_key = Some(expand_tilde(ca_key)?);
+        }
+
+        if self.enabled {
+            if self.ca_cert.is_none() {
+                bail!("`proxy.tls.ca_cert` is required when `proxy.tls.enabled = true`");
+            }
+            if self.ca_key.is_none() {
+                bail!("`proxy.tls.ca_key` is required when `proxy.tls.enabled = true`");
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub path: PathBuf,
     #[serde(default)]
     pub active_session: Option<String>,
+}
+
+impl StorageConfig {
+    fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
+        self.path = expand_tilde(&self.path)?;
+
+        if let Some(active_session) = self.active_session.as_ref()
+            && active_session.trim().is_empty()
+        {
+            bail!("`storage.active_session` cannot be empty");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -258,20 +323,78 @@ pub struct RouteConfig {
 }
 
 impl RouteConfig {
-    fn validate(&self, idx: usize) -> anyhow::Result<()> {
-        if self.path_prefix.is_none() && self.path_exact.is_none() && self.path_regex.is_none() {
+    fn normalize_and_validate(&mut self, idx: usize) -> anyhow::Result<()> {
+        let route_name = self.display_name(idx);
+
+        let matcher_count = usize::from(self.path_prefix.is_some())
+            + usize::from(self.path_exact.is_some())
+            + usize::from(self.path_regex.is_some());
+        if matcher_count == 0 {
             bail!(
                 "{}: one of `path_prefix`, `path_exact`, or `path_regex` is required",
-                self.display_name(idx)
+                route_name
+            );
+        }
+        if matcher_count > 1 {
+            bail!(
+                "{}: `path_prefix`, `path_exact`, and `path_regex` are mutually exclusive",
+                route_name
             );
         }
 
+        if let Some(path_prefix) = self.path_prefix.take() {
+            self.path_prefix = Some(normalize_route_path(
+                &route_name,
+                "path_prefix",
+                &path_prefix,
+                true,
+            )?);
+        }
+        if let Some(path_exact) = self.path_exact.take() {
+            self.path_exact = Some(normalize_route_path(
+                &route_name,
+                "path_exact",
+                &path_exact,
+                false,
+            )?);
+        }
+        if let Some(path_regex) = self.path_regex.as_deref() {
+            Regex::new(path_regex).map_err(|err| {
+                anyhow::anyhow!(
+                    "{}: invalid `path_regex` expression `{path_regex}`: {err}",
+                    route_name
+                )
+            })?;
+        }
+
+        if let Some(upstream) = self.upstream.take() {
+            self.upstream = Some(normalize_upstream(&route_name, &upstream)?);
+        }
+
+        if self.grpc.is_some() && self.websocket.is_some() {
+            bail!("{route_name}: `grpc` and `websocket` are mutually exclusive");
+        }
+        if let Some(grpc) = self.grpc.as_mut() {
+            for proto_file in &mut grpc.proto_files {
+                *proto_file = expand_tilde(proto_file)?;
+            }
+        }
+
         if let Some(route_match) = self.match_.as_ref() {
+            if let Some(overlap) =
+                overlapping_header_name(&route_match.headers, &route_match.headers_ignore)
+            {
+                bail!(
+                    "{}: `routes.match.headers` and `routes.match.headers_ignore` overlap on `{overlap}`",
+                    route_name
+                );
+            }
+
             for expression in &route_match.body_json {
                 JsonPath::parse(expression).map_err(|err| {
                     anyhow::anyhow!(
                         "{}: invalid `routes.match.body_json` expression `{expression}`: {err}",
-                        self.display_name(idx)
+                        route_name
                     )
                 })?;
             }
@@ -286,6 +409,73 @@ impl RouteConfig {
             .map(|name| format!("routes[{idx}] ({name})"))
             .unwrap_or_else(|| format!("routes[{idx}]"))
     }
+}
+
+fn normalize_route_path(
+    route_name: &str,
+    field_name: &str,
+    raw: &str,
+    strip_trailing_slashes: bool,
+) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{route_name}: `routes.{field_name}` cannot be empty");
+    }
+
+    let mut normalized = if trimmed.starts_with('/') {
+        trimmed.to_owned()
+    } else {
+        format!("/{trimmed}")
+    };
+
+    if normalized.contains('?') || normalized.contains('#') {
+        bail!("{route_name}: `routes.{field_name}` must be a path without query/fragment");
+    }
+
+    if strip_trailing_slashes {
+        while normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_upstream(route_name: &str, raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{route_name}: `upstream` cannot be empty");
+    }
+
+    let upstream_uri: Uri = trimmed.parse().map_err(|err| {
+        anyhow::anyhow!("{route_name}: invalid `upstream` URL `{trimmed}`: {err}")
+    })?;
+    let Some(scheme) = upstream_uri.scheme_str() else {
+        bail!("{route_name}: `upstream` URL must include a scheme (`http` or `https`)");
+    };
+    if !matches!(scheme, "http" | "https") {
+        bail!("{route_name}: `upstream` URL scheme must be `http` or `https`, got `{scheme}`");
+    }
+    let Some(authority) = upstream_uri.authority().map(|authority| authority.as_str()) else {
+        bail!("{route_name}: `upstream` URL must include a host");
+    };
+    if let Some(path_and_query) = upstream_uri.path_and_query() {
+        let path_and_query = path_and_query.as_str();
+        if path_and_query != "/" {
+            bail!("{route_name}: `upstream` URL must not include a path/query");
+        }
+    }
+
+    Ok(format!("{scheme}://{authority}"))
+}
+
+fn overlapping_header_name(headers: &[String], headers_ignore: &[String]) -> Option<String> {
+    headers.iter().find_map(|header| {
+        headers_ignore
+            .iter()
+            .find(|ignored| ignored.eq_ignore_ascii_case(header))
+            .map(|_| header.to_ascii_lowercase())
+    })
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -496,10 +686,38 @@ recording_mode = "server-only"
 "#;
 
         let config = Config::from_toml_str(toml).unwrap();
+        let home =
+            PathBuf::from(env::var_os("HOME").expect("HOME should be set in test environment"));
+        let expected_ca_cert_path = home.join(".replayproxy/ca/cert.pem");
+        let expected_ca_key_path = home.join(".replayproxy/ca/key.pem");
+        let expected_storage_path = home.join(".replayproxy/sessions");
 
         assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(config.proxy.admin_port, Some(8081));
         assert_eq!(config.proxy.mode, Some(RouteMode::PassthroughCache));
+        assert_eq!(
+            config
+                .proxy
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.ca_cert.as_ref()),
+            Some(&expected_ca_cert_path)
+        );
+        assert_eq!(
+            config
+                .proxy
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.ca_key.as_ref()),
+            Some(&expected_ca_key_path)
+        );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .map(|storage| storage.path.as_path()),
+            Some(expected_storage_path.as_path())
+        );
 
         let logging = config.logging.as_ref().unwrap();
         assert_eq!(logging.level.as_deref(), Some("info"));
@@ -574,6 +792,7 @@ listen = "127.0.0.1:0"
 
 [[routes]]
 path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
 
 [routes.match]
 body_json = ["$["]
@@ -583,6 +802,121 @@ body_json = ["$["]
         assert!(
             err.to_string()
                 .contains("invalid `routes.match.body_json` expression"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn multiple_route_matchers_fail_fast() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+path_exact = "/api/users"
+upstream = "http://127.0.0.1:1234"
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`path_prefix`, `path_exact`, and `path_regex` are mutually exclusive"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn overlapping_route_match_headers_fail_fast() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+
+[routes.match]
+headers = ["Authorization"]
+headers_ignore = ["authorization"]
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`routes.match.headers` and `routes.match.headers_ignore` overlap"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn normalizes_route_paths_and_upstream_url() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "api/v1/"
+upstream = "https://api.openai.com/"
+"#,
+        )
+        .unwrap();
+
+        let route = &config.routes[0];
+        assert_eq!(route.path_prefix.as_deref(), Some("/api/v1"));
+        assert_eq!(route.upstream.as_deref(), Some("https://api.openai.com"));
+    }
+
+    #[test]
+    fn upstream_with_path_or_query_is_rejected() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "https://api.openai.com/v1"
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`upstream` URL must not include a path/query"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn admin_port_must_not_match_proxy_port() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8080
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`proxy.admin_port` (8080) must differ from `proxy.listen` port (8080)"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_enabled_requires_cert_and_key() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`proxy.tls.ca_cert` is required when `proxy.tls.enabled = true`"),
             "err: {err}"
         );
     }

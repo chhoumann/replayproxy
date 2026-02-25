@@ -170,8 +170,16 @@ pub struct ProxyConfig {
     pub admin_port: Option<u16>,
     #[serde(default)]
     pub mode: Option<RouteMode>,
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+}
+
+const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+fn default_max_body_bytes() -> usize {
+    DEFAULT_MAX_BODY_BYTES
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -196,6 +204,10 @@ impl ProxyConfig {
                 "`proxy.admin_port` ({admin_port}) must differ from `proxy.listen` port ({})",
                 self.listen.port()
             );
+        }
+
+        if self.max_body_bytes == 0 {
+            bail!("`proxy.max_body_bytes` must be greater than 0");
         }
 
         if let Some(tls) = self.tls.as_mut() {
@@ -305,6 +317,8 @@ pub struct RouteConfig {
     #[serde(default)]
     pub mode: Option<RouteMode>,
     #[serde(default)]
+    pub body_oversize: Option<BodyOversizePolicy>,
+    #[serde(default)]
     pub cache_miss: Option<CacheMissPolicy>,
     #[serde(default, rename = "match")]
     pub match_: Option<RouteMatchConfig>,
@@ -320,6 +334,13 @@ pub struct RouteConfig {
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
     pub transform: Option<TransformConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BodyOversizePolicy {
+    Error,
+    BypassCache,
 }
 
 impl RouteConfig {
@@ -632,6 +653,7 @@ name = "openai-chat"
 path_prefix = "/v1/chat/completions"
 upstream = "https://api.openai.com"
 mode = "passthrough-cache"
+body_oversize = "bypass-cache"
 cache_miss = "forward"
 
 [routes.match]
@@ -695,6 +717,7 @@ recording_mode = "server-only"
         assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(config.proxy.admin_port, Some(8081));
         assert_eq!(config.proxy.mode, Some(RouteMode::PassthroughCache));
+        assert_eq!(config.proxy.max_body_bytes, super::DEFAULT_MAX_BODY_BYTES);
         assert_eq!(
             config
                 .proxy
@@ -729,6 +752,10 @@ recording_mode = "server-only"
         assert_eq!(openai.name.as_deref(), Some("openai-chat"));
         assert_eq!(openai.upstream.as_deref(), Some("https://api.openai.com"));
         assert_eq!(openai.mode, Some(RouteMode::PassthroughCache));
+        assert_eq!(
+            openai.body_oversize,
+            Some(super::BodyOversizePolicy::BypassCache)
+        );
         assert_eq!(openai.cache_miss, Some(super::CacheMissPolicy::Forward));
         assert_eq!(
             openai.match_.as_ref().unwrap().headers,
@@ -899,6 +926,22 @@ admin_port = 8080
         assert!(
             err.to_string()
                 .contains("`proxy.admin_port` (8080) must differ from `proxy.listen` port (8080)"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_max_body_bytes_must_be_positive() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 0
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`proxy.max_body_bytes` must be greater than 0"),
             "err: {err}"
         );
     }

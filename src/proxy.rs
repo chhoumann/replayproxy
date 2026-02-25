@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     convert::Infallible,
+    error::Error as StdError,
     net::SocketAddr,
     sync::{
         Arc,
@@ -10,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use hyper::{
     Request, Response, StatusCode, Uri,
     body::Incoming,
@@ -27,12 +28,15 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
-    config::{CacheMissPolicy, Config, QueryMatchMode, RouteMatchConfig, RouteMode},
+    config::{
+        BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RouteMatchConfig, RouteMode,
+    },
     matching,
     storage::{Recording, SessionManager, SessionManagerError, Storage},
 };
 
-type HttpClient = Client<HttpConnector, Full<Bytes>>;
+type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
+type HttpClient = Client<HttpConnector, ProxyBody>;
 
 #[derive(Debug)]
 pub struct ProxyHandle {
@@ -167,6 +171,7 @@ struct ProxyRoute {
     upstream: Option<Uri>,
     mode: RouteMode,
     cache_miss: CacheMissPolicy,
+    body_oversize: BodyOversizePolicy,
     match_config: Option<RouteMatchConfig>,
 }
 
@@ -324,6 +329,7 @@ struct ProxyState {
     client: HttpClient,
     storage: Option<Storage>,
     status: Arc<RuntimeStatus>,
+    max_body_bytes: usize,
 }
 
 impl ProxyState {
@@ -365,6 +371,7 @@ impl ProxyState {
                 upstream,
                 mode,
                 cache_miss,
+                body_oversize: route.body_oversize.unwrap_or(BodyOversizePolicy::Error),
                 match_config: route.match_.clone(),
             });
         }
@@ -374,6 +381,7 @@ impl ProxyState {
             client,
             storage: Storage::from_config(config)?,
             status,
+            max_body_bytes: config.proxy.max_body_bytes,
         })
     }
 
@@ -429,10 +437,62 @@ fn select_route<'a>(routes: &'a [ProxyRoute], path: &str) -> Option<&'a ProxyRou
         .map(|(_, _, route)| route)
 }
 
+#[derive(Debug)]
+enum BodyReadError {
+    TooLarge { limit_bytes: usize },
+    Read(hyper::Error),
+}
+
+async fn collect_body_with_limit(
+    mut body: Incoming,
+    max_body_bytes: usize,
+) -> Result<Bytes, BodyReadError> {
+    let mut buffered = Vec::new();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.map_err(BodyReadError::Read)?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if buffered
+            .len()
+            .saturating_add(data.len())
+            .gt(&max_body_bytes)
+        {
+            return Err(BodyReadError::TooLarge {
+                limit_bytes: max_body_bytes,
+            });
+        }
+        buffered.extend_from_slice(&data);
+    }
+    Ok(Bytes::from(buffered))
+}
+
+fn parse_content_length(headers: &hyper::HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn bytes_limit_u64(limit_bytes: usize) -> u64 {
+    u64::try_from(limit_bytes).unwrap_or(u64::MAX)
+}
+
+fn boxed_full(body: impl Into<Bytes>) -> ProxyBody {
+    Full::new(body.into())
+        .map_err(|never| -> Box<dyn StdError + Send + Sync> { match never {} })
+        .boxed()
+}
+
+fn boxed_incoming(body: Incoming) -> ProxyBody {
+    body.map_err(|err| -> Box<dyn StdError + Send + Sync> { Box::new(err) })
+        .boxed()
+}
+
 async fn proxy_handler(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<ProxyBody>, Infallible> {
     state
         .status
         .proxy_requests_total
@@ -468,7 +528,7 @@ async fn proxy_handler(
     let Some(route) = state.route_for(req.uri().path()) else {
         respond!(
             None,
-            simple_response(StatusCode::NOT_FOUND, "no matching route")
+            proxy_simple_response(StatusCode::NOT_FOUND, "no matching route")
         );
     };
     route_ref = Some(route.route_ref.as_str());
@@ -477,7 +537,7 @@ async fn proxy_handler(
     let Some(upstream_base) = route.upstream.as_ref() else {
         respond!(
             None,
-            simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
+            proxy_simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
         );
     };
 
@@ -487,24 +547,89 @@ async fn proxy_handler(
             tracing::debug!("failed to build upstream uri: {err}");
             respond!(
                 None,
-                simple_response(StatusCode::BAD_GATEWAY, "failed to build upstream request",)
+                proxy_simple_response(StatusCode::BAD_GATEWAY, "failed to build upstream request",)
             );
         }
     };
 
+    let request_content_length = parse_content_length(req.headers());
+    let request_known_oversize = request_content_length
+        .map(|len| len > bytes_limit_u64(state.max_body_bytes))
+        .unwrap_or(false);
+    let bypass_request_buffering = request_known_oversize
+        && route.body_oversize == BodyOversizePolicy::BypassCache
+        && route.mode != RouteMode::Replay;
+    if request_known_oversize && !bypass_request_buffering {
+        respond!(
+            None,
+            proxy_simple_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds configured proxy.max_body_bytes",
+            )
+        );
+    }
+
     let (mut parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
+    strip_hop_by_hop_headers(&mut parts.headers);
+
+    if bypass_request_buffering {
+        tracing::debug!(
+            limit_bytes = state.max_body_bytes,
+            content_length = request_content_length.unwrap_or_default(),
+            "bypassing cache for oversized request body"
+        );
+
+        parts.uri = upstream_uri.clone();
+        set_host_header(&mut parts.headers, &upstream_uri);
+        let upstream_req = Request::from_parts(parts, boxed_incoming(body));
+
+        state
+            .status
+            .upstream_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+        let upstream_started_at = Instant::now();
+        let upstream_res = match state.client.request(upstream_req).await {
+            Ok(res) => res,
+            Err(err) => {
+                let upstream_latency = upstream_started_at.elapsed();
+                tracing::debug!("upstream request failed: {err}");
+                respond!(
+                    Some(upstream_latency),
+                    proxy_simple_response(StatusCode::BAD_GATEWAY, "upstream request failed",)
+                );
+            }
+        };
+        let upstream_latency = upstream_started_at.elapsed();
+
+        let (mut upstream_parts, upstream_body) = upstream_res.into_parts();
+        strip_hop_by_hop_headers(&mut upstream_parts.headers);
+        respond!(
+            Some(upstream_latency),
+            Response::from_parts(upstream_parts, boxed_incoming(upstream_body))
+        );
+    }
+
+    let body_bytes = match collect_body_with_limit(body, state.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(BodyReadError::TooLarge { limit_bytes }) => {
+            tracing::debug!("request body exceeded configured limit of {limit_bytes} bytes");
+            respond!(
+                None,
+                proxy_simple_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds configured proxy.max_body_bytes",
+                )
+            );
+        }
+        Err(BodyReadError::Read(err)) => {
             tracing::debug!("failed to read request body: {err}");
             respond!(
                 None,
-                simple_response(StatusCode::BAD_REQUEST, "failed to read request body",)
+                proxy_simple_response(StatusCode::BAD_REQUEST, "failed to read request body",)
             );
         }
     };
 
-    strip_hop_by_hop_headers(&mut parts.headers);
     let match_key = if state.storage.is_some() {
         match matching::compute_match_key(
             route.match_config.as_ref(),
@@ -527,7 +652,7 @@ async fn proxy_handler(
                         "invalid route JSONPath matching configuration",
                     ),
                 };
-                respond!(None, simple_response(status, message));
+                respond!(None, proxy_simple_response(status, message));
             }
         }
     } else {
@@ -543,7 +668,10 @@ async fn proxy_handler(
             let Some(storage) = state.storage.as_ref() else {
                 respond!(
                     None,
-                    simple_response(StatusCode::INTERNAL_SERVER_ERROR, "storage not configured",)
+                    proxy_simple_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "storage not configured",
+                    )
                 );
             };
             let match_key = match_key.as_deref().unwrap_or_default();
@@ -580,7 +708,7 @@ async fn proxy_handler(
                     tracing::debug!("failed to lookup recording: {err}");
                     respond!(
                         None,
-                        simple_response(
+                        proxy_simple_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "failed to lookup recording",
                         )
@@ -633,7 +761,7 @@ async fn proxy_handler(
     parts.uri = upstream_uri.clone();
     set_host_header(&mut parts.headers, &upstream_uri);
 
-    let upstream_req = Request::from_parts(parts, Full::new(body_bytes));
+    let upstream_req = Request::from_parts(parts, boxed_full(body_bytes));
 
     state
         .status
@@ -647,7 +775,7 @@ async fn proxy_handler(
             tracing::debug!("upstream request failed: {err}");
             respond!(
                 Some(upstream_latency),
-                simple_response(StatusCode::BAD_GATEWAY, "upstream request failed",)
+                proxy_simple_response(StatusCode::BAD_GATEWAY, "upstream request failed",)
             );
         }
     };
@@ -657,13 +785,55 @@ async fn proxy_handler(
     strip_hop_by_hop_headers(&mut parts.headers);
     let record_response_status = should_record.then(|| parts.status.as_u16());
     let record_response_headers = should_record.then(|| header_map_to_vec(&parts.headers));
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
+    if !should_record {
+        respond!(
+            Some(upstream_latency),
+            Response::from_parts(parts, boxed_incoming(body))
+        );
+    }
+
+    let response_known_oversize = parse_content_length(&parts.headers)
+        .map(|len| len > bytes_limit_u64(state.max_body_bytes))
+        .unwrap_or(false);
+    if response_known_oversize {
+        if route.body_oversize == BodyOversizePolicy::BypassCache {
+            tracing::debug!(
+                limit_bytes = state.max_body_bytes,
+                "bypassing cache for oversized upstream response body"
+            );
+            respond!(
+                Some(upstream_latency),
+                Response::from_parts(parts, boxed_incoming(body))
+            );
+        }
+        respond!(
+            Some(upstream_latency),
+            proxy_simple_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream response body exceeds configured proxy.max_body_bytes",
+            )
+        );
+    }
+
+    let body_bytes = match collect_body_with_limit(body, state.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(BodyReadError::TooLarge { limit_bytes }) => {
+            tracing::debug!(
+                "upstream response body exceeded configured limit of {limit_bytes} bytes"
+            );
+            respond!(
+                Some(upstream_latency),
+                proxy_simple_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream response body exceeds configured proxy.max_body_bytes",
+                )
+            );
+        }
+        Err(BodyReadError::Read(err)) => {
             tracing::debug!("failed to read upstream body: {err}");
             respond!(
                 Some(upstream_latency),
-                simple_response(
+                proxy_simple_response(
                     StatusCode::BAD_GATEWAY,
                     "failed to read upstream response body",
                 )
@@ -698,7 +868,7 @@ async fn proxy_handler(
                 tracing::debug!("failed to compute recording timestamp: {err}");
                 respond!(
                     Some(upstream_latency),
-                    simple_response(
+                    proxy_simple_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "failed to persist recording",
                     )
@@ -725,19 +895,19 @@ async fn proxy_handler(
 
     respond!(
         Some(upstream_latency),
-        Response::from_parts(parts, Full::new(body_bytes))
+        Response::from_parts(parts, boxed_full(body_bytes))
     );
 }
 
-fn response_with_request_log(
+fn response_with_request_log<B>(
     method: &str,
     url: &str,
     route_ref: Option<&str>,
     mode: Option<RouteMode>,
     cache_outcome: CacheLogOutcome,
     upstream_latency: Option<Duration>,
-    response: Response<Full<Bytes>>,
-) -> Response<Full<Bytes>> {
+    response: Response<B>,
+) -> Response<B> {
     let status = response.status();
     emit_proxy_request_log(
         method,
@@ -785,8 +955,8 @@ fn mode_log_label(mode: Option<RouteMode>) -> &'static str {
     }
 }
 
-fn response_from_recording(recording: Recording) -> Response<Full<Bytes>> {
-    let body = Full::new(Bytes::from(recording.response_body));
+fn response_from_recording(recording: Recording) -> Response<ProxyBody> {
+    let body = boxed_full(Bytes::from(recording.response_body));
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::from_u16(recording.response_status)
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -890,11 +1060,17 @@ fn simple_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     response
 }
 
+fn proxy_simple_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
+    let mut response = Response::new(boxed_full(Bytes::from(message.to_owned())));
+    *response.status_mut() = status;
+    response
+}
+
 fn replay_miss_response(
     route: &ProxyRoute,
     active_session: &str,
     match_key: &str,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let payload = ReplayMissResponse {
         error: "Gateway Not Recorded",
         route: route.route_ref.clone(),
@@ -904,7 +1080,7 @@ fn replay_miss_response(
 
     match serde_json::to_vec(&payload) {
         Ok(body) => {
-            let mut response = Response::new(Full::new(Bytes::from(body)));
+            let mut response = Response::new(boxed_full(Bytes::from(body)));
             *response.status_mut() = StatusCode::BAD_GATEWAY;
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -914,7 +1090,7 @@ fn replay_miss_response(
         }
         Err(err) => {
             tracing::debug!("failed to serialize replay miss response: {err}");
-            simple_response(StatusCode::BAD_GATEWAY, "Gateway Not Recorded")
+            proxy_simple_response(StatusCode::BAD_GATEWAY, "Gateway Not Recorded")
         }
     }
 }
@@ -1170,7 +1346,7 @@ mod tests {
         CacheLogOutcome, ProxyRoute, emit_proxy_request_log, format_route_ref, mode_log_label,
         sanitize_match_key, select_route,
     };
-    use crate::config::{CacheMissPolicy, Config, RouteConfig, RouteMode};
+    use crate::config::{BodyOversizePolicy, CacheMissPolicy, Config, RouteConfig, RouteMode};
     use serde_json::Value;
     use tracing_subscriber::{filter::LevelFilter, fmt::MakeWriter};
 
@@ -1187,6 +1363,7 @@ mod tests {
             upstream: None,
             mode: RouteMode::Record,
             cache_miss: CacheMissPolicy::Forward,
+            body_oversize: BodyOversizePolicy::Error,
             match_config: None,
         }
     }
@@ -1373,6 +1550,7 @@ upstream = "http://127.0.0.1:1"
             path_regex: None,
             upstream: None,
             mode: None,
+            body_oversize: None,
             cache_miss: None,
             match_: None,
             redact: None,
@@ -1391,6 +1569,7 @@ upstream = "http://127.0.0.1:1"
             path_regex: None,
             upstream: None,
             mode: None,
+            body_oversize: None,
             cache_miss: None,
             match_: None,
             redact: None,

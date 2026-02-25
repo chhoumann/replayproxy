@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -15,7 +15,7 @@ use hyper_util::{
 };
 use rusqlite::Connection;
 use serde_json::Value;
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{net::TcpListener, sync::mpsc, time::timeout};
 
 const BINARY_HEADER_VALUE: &[u8] = b"\x80\xffok";
 
@@ -83,6 +83,236 @@ upstream = "http://{upstream_addr}"
     assert!(captured.headers.get("x-hop").is_none());
     assert!(captured.headers.get(header::CONNECTION).is_none());
     assert_eq!(&captured.body[..], b"");
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_request_body_returns_413_without_hitting_upstream() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::from_static(b"body-too-large")))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body_bytes[..],
+        b"request body exceeds configured proxy.max_body_bytes"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), upstream_rx.recv())
+            .await
+            .is_err(),
+        "upstream should not receive oversized requests"
+    );
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[tokio::test]
+async fn oversized_request_body_can_bypass_cache_per_route() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::from_static(b"request-body-is-too-large")))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(&captured.body[..], b"request-body-is-too-large");
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_response_body_returns_502_without_recording() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 4
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body_bytes[..],
+        b"upstream response body exceeds configured proxy.max_body_bytes"
+    );
+
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_response_body_can_bypass_cache_per_route() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 4
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;

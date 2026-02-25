@@ -39,7 +39,9 @@ use crate::{
         RouteMatchConfig, RouteMode,
     },
     matching,
-    storage::{Recording, SessionManager, SessionManagerError, Storage},
+    storage::{
+        Recording, RecordingSearch, RecordingSummary, SessionManager, SessionManagerError, Storage,
+    },
 };
 
 type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
@@ -47,6 +49,7 @@ type HttpClient = Client<HttpConnector, ProxyBody>;
 const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 const REDACTION_PLACEHOLDER_BYTES: &[u8] = b"[REDACTED]";
 const SUBSET_QUERY_CANDIDATE_LIMIT: usize = 4096;
+const ADMIN_RECORDINGS_DEFAULT_LIMIT: usize = 100;
 const DURATION_HISTOGRAM_BUCKETS: [(&str, u64); 12] = [
     ("0.001", 1_000),
     ("0.005", 5_000),
@@ -355,6 +358,101 @@ struct SessionResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminRecordingsResponse {
+    session: String,
+    offset: usize,
+    limit: usize,
+    recordings: Vec<AdminRecordingSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminRecordingSummary {
+    id: i64,
+    match_key: String,
+    request_method: String,
+    request_uri: String,
+    response_status: u16,
+    created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminRecordingResponse {
+    id: i64,
+    match_key: String,
+    created_at_unix_ms: i64,
+    request: AdminRequestDetails,
+    response: AdminResponseDetails,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminRequestDetails {
+    method: String,
+    uri: String,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminResponseDetails {
+    status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdminRecordingsQuery {
+    offset: usize,
+    limit: usize,
+    method: Option<String>,
+    url_contains: Option<String>,
+}
+
+impl Default for AdminRecordingsQuery {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: ADMIN_RECORDINGS_DEFAULT_LIMIT,
+            method: None,
+            url_contains: None,
+        }
+    }
+}
+
+impl From<RecordingSummary> for AdminRecordingSummary {
+    fn from(summary: RecordingSummary) -> Self {
+        Self {
+            id: summary.id,
+            match_key: summary.match_key,
+            request_method: summary.request_method,
+            request_uri: summary.request_uri,
+            response_status: summary.response_status,
+            created_at_unix_ms: summary.created_at_unix_ms,
+        }
+    }
+}
+
+impl AdminRecordingResponse {
+    fn from_recording(id: i64, recording: Recording) -> Self {
+        Self {
+            id,
+            match_key: recording.match_key,
+            created_at_unix_ms: recording.created_at_unix_ms,
+            request: AdminRequestDetails {
+                method: recording.request_method,
+                uri: recording.request_uri,
+                headers: recording.request_headers,
+                body: recording.request_body,
+            },
+            response: AdminResponseDetails {
+                status: recording.response_status,
+                headers: recording.response_headers,
+                body: recording.response_body,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct AdminErrorResponse {
     error: String,
 }
@@ -564,6 +662,14 @@ impl RuntimeStatus {
     fn increment_active_session_recordings_total(&self) {
         self.active_session_recordings_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_active_session_recordings_total(&self) {
+        let _ = self.active_session_recordings_total.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| value.checked_sub(1),
+        );
     }
 
     fn active_session_recordings_total(&self) -> u64 {
@@ -1923,6 +2029,80 @@ fn status_for_session_error(err: &SessionManagerError) -> StatusCode {
     }
 }
 
+fn parse_admin_recordings_collection_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/_admin/sessions/")?;
+    let (session_name, recordings_suffix) = rest.split_once("/recordings")?;
+    if session_name.is_empty() || session_name.contains('/') {
+        return None;
+    }
+    if recordings_suffix.is_empty() || recordings_suffix == "/" {
+        return Some(session_name);
+    }
+    None
+}
+
+fn parse_admin_recording_item_path(path: &str) -> Option<(&str, i64)> {
+    let rest = path.strip_prefix("/_admin/sessions/")?;
+    let (session_name, recording_id) = rest.split_once("/recordings/")?;
+    if session_name.is_empty()
+        || session_name.contains('/')
+        || recording_id.is_empty()
+        || recording_id.contains('/')
+    {
+        return None;
+    }
+    let recording_id = recording_id.parse::<i64>().ok()?;
+    Some((session_name, recording_id))
+}
+
+fn parse_admin_recordings_query(uri: &Uri) -> Result<AdminRecordingsQuery, String> {
+    let mut query = AdminRecordingsQuery::default();
+    let Some(raw_query) = uri.query() else {
+        return Ok(query);
+    };
+
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "offset" => {
+                query.offset = parse_admin_recordings_pagination(value, "offset")?;
+            }
+            "limit" => {
+                query.limit = parse_admin_recordings_pagination(value, "limit")?;
+            }
+            "method" => {
+                let value = value.trim();
+                query.method = (!value.is_empty()).then_some(value.to_owned());
+            }
+            "url_contains" => {
+                let value = value.trim();
+                query.url_contains = (!value.is_empty()).then_some(value.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(query)
+}
+
+fn parse_admin_recordings_pagination(value: &str, field_name: &str) -> Result<usize, String> {
+    if value.is_empty() {
+        return Err(format!("query parameter `{field_name}` must not be empty"));
+    }
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("query parameter `{field_name}` must be a non-negative integer"))?;
+    if i64::try_from(parsed).is_err() {
+        return Err(format!(
+            "query parameter `{field_name}` exceeds supported sqlite range"
+        ));
+    }
+    Ok(parsed)
+}
+
 async fn admin_handler(
     req: Request<Incoming>,
     state: Arc<AdminState>,
@@ -2020,6 +2200,145 @@ async fn admin_handler(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method not allowed",
             )),
+        };
+    }
+
+    if let Some((session_name, recording_id)) = parse_admin_recording_item_path(&path) {
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        let storage = match session_manager.open_session_storage(session_name).await {
+            Ok(storage) => storage,
+            Err(err) => {
+                return Ok(admin_error_response(
+                    status_for_session_error(&err),
+                    err.to_string(),
+                ));
+            }
+        };
+
+        return match method {
+            hyper::Method::GET => match storage.get_recording_by_id(recording_id).await {
+                Ok(Some(recording)) => Ok(admin_json_response(
+                    StatusCode::OK,
+                    &AdminRecordingResponse::from_recording(recording_id, recording),
+                )),
+                Ok(None) => Ok(admin_error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("recording `{recording_id}` was not found"),
+                )),
+                Err(err) => {
+                    tracing::debug!(
+                        "failed to fetch recording `{recording_id}` from session `{session_name}`: {err}"
+                    );
+                    Ok(admin_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to fetch recording",
+                    ))
+                }
+            },
+            hyper::Method::DELETE => match storage.delete_recording(recording_id).await {
+                Ok(true) => {
+                    if state.status.active_session() == session_name {
+                        state.status.decrement_active_session_recordings_total();
+                    }
+                    let mut response = Response::new(Full::new(Bytes::new()));
+                    *response.status_mut() = StatusCode::NO_CONTENT;
+                    Ok(response)
+                }
+                Ok(false) => Ok(admin_error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("recording `{recording_id}` was not found"),
+                )),
+                Err(err) => {
+                    tracing::debug!(
+                        "failed to delete recording `{recording_id}` from session `{session_name}`: {err}"
+                    );
+                    Ok(admin_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to delete recording",
+                    ))
+                }
+            },
+            _ => Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            )),
+        };
+    }
+
+    if let Some(session_name) = parse_admin_recordings_collection_path(&path) {
+        if method != hyper::Method::GET {
+            return Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+
+        let query = match parse_admin_recordings_query(req.uri()) {
+            Ok(query) => query,
+            Err(message) => return Ok(admin_error_response(StatusCode::BAD_REQUEST, message)),
+        };
+
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        let storage = match session_manager.open_session_storage(session_name).await {
+            Ok(storage) => storage,
+            Err(err) => {
+                return Ok(admin_error_response(
+                    status_for_session_error(&err),
+                    err.to_string(),
+                ));
+            }
+        };
+
+        let recordings_result = if query.method.is_some() || query.url_contains.is_some() {
+            storage
+                .search_recordings(
+                    RecordingSearch {
+                        method: query.method.clone(),
+                        url_contains: query.url_contains.clone(),
+                    },
+                    query.offset,
+                    query.limit,
+                )
+                .await
+        } else {
+            storage.list_recordings(query.offset, query.limit).await
+        };
+
+        return match recordings_result {
+            Ok(recordings) => {
+                let response = AdminRecordingsResponse {
+                    session: session_name.to_owned(),
+                    offset: query.offset,
+                    limit: query.limit,
+                    recordings: recordings
+                        .into_iter()
+                        .map(AdminRecordingSummary::from)
+                        .collect(),
+                };
+                Ok(admin_json_response(StatusCode::OK, &response))
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "failed to list recordings for session `{session_name}` with query {:?}: {err}",
+                    query
+                );
+                Ok(admin_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to list recordings",
+                ))
+            }
         };
     }
 

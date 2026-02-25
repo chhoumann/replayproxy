@@ -175,6 +175,16 @@ impl Storage {
         .context("join get_recordings_by_match_key task")?
     }
 
+    pub async fn get_recording_by_id(
+        &self,
+        recording_id: i64,
+    ) -> anyhow::Result<Option<Recording>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || get_recording_by_id_blocking(&db_path, recording_id))
+            .await
+            .context("join get_recording_by_id task")?
+    }
+
     pub async fn get_latest_recording_by_match_key_and_query_subset(
         &self,
         match_key: &str,
@@ -739,6 +749,14 @@ fn get_recording_by_match_key_blocking(
     };
 
     Ok(Some(deserialize_recording_at(row, 0)?))
+}
+
+fn get_recording_by_id_blocking(
+    path: &Path,
+    recording_id: i64,
+) -> anyhow::Result<Option<Recording>> {
+    let conn = open_connection(path)?;
+    get_recording_by_id_from_conn(&conn, recording_id)
 }
 
 fn get_recording_by_id_from_conn(

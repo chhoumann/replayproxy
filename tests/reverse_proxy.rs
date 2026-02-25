@@ -21,6 +21,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnectionBuilder,
 };
+use replayproxy::storage::{Recording, Storage};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::{net::TcpListener, sync::mpsc, time::timeout};
@@ -1256,6 +1257,266 @@ admin_port = 0
 }
 
 #[tokio::test]
+async fn admin_recordings_endpoints_list_get_and_delete_recordings() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session_name = "staging";
+    let session_db_path =
+        replayproxy::session::resolve_session_db_path(storage_dir.path(), session_name).unwrap();
+    let storage = Storage::open(session_db_path).unwrap();
+
+    let first_id = storage
+        .insert_recording(Recording {
+            match_key: "first-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/api/ping".to_owned(),
+            request_headers: vec![("accept".to_owned(), b"application/json".to_vec())],
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: vec![("content-type".to_owned(), b"application/json".to_vec())],
+            response_body: br#"{"ok":true}"#.to_vec(),
+            created_at_unix_ms: 10,
+        })
+        .await
+        .unwrap();
+    let second_id = storage
+        .insert_recording(Recording {
+            match_key: "second-key".to_owned(),
+            request_method: "POST".to_owned(),
+            request_uri: "/api/chat".to_owned(),
+            request_headers: vec![("authorization".to_owned(), b"[REDACTED]".to_vec())],
+            request_body: br#"{"token":"[REDACTED]"}"#.to_vec(),
+            response_status: 201,
+            response_headers: vec![("x-secret".to_owned(), b"[REDACTED]".to_vec())],
+            response_body: br#"{"secret":"[REDACTED]"}"#.to_vec(),
+            created_at_unix_ms: 20,
+        })
+        .await
+        .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "{session_name}"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let list_uri: Uri = format!(
+        "http://{admin_addr}/_admin/sessions/{session_name}/recordings?limit=1&offset=0&method=POST&url_contains=/api/chat"
+    )
+    .parse()
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(list_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["session"].as_str(), Some(session_name));
+    assert_eq!(body["offset"].as_u64(), Some(0));
+    assert_eq!(body["limit"].as_u64(), Some(1));
+    let recordings = body["recordings"].as_array().unwrap();
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(recordings[0]["id"].as_i64(), Some(second_id));
+    assert_eq!(recordings[0]["request_method"].as_str(), Some("POST"));
+
+    let get_uri: Uri =
+        format!("http://{admin_addr}/_admin/sessions/{session_name}/recordings/{second_id}")
+            .parse()
+            .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(get_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["id"].as_i64(), Some(second_id));
+    assert_eq!(body["match_key"].as_str(), Some("second-key"));
+    assert_eq!(body["request"]["method"].as_str(), Some("POST"));
+    assert_eq!(body["request"]["uri"].as_str(), Some("/api/chat"));
+    assert_eq!(body["response"]["status"].as_u64(), Some(201));
+    assert_eq!(
+        json_bytes(&body["request"]["body"]),
+        br#"{"token":"[REDACTED]"}"#.to_vec()
+    );
+    assert_eq!(
+        json_bytes(&body["response"]["body"]),
+        br#"{"secret":"[REDACTED]"}"#.to_vec()
+    );
+
+    let delete_uri: Uri =
+        format!("http://{admin_addr}/_admin/sessions/{session_name}/recordings/{second_id}")
+            .parse()
+            .unwrap();
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(delete_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(get_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("recording `"));
+
+    let list_uri: Uri =
+        format!("http://{admin_addr}/_admin/sessions/{session_name}/recordings?limit=10&offset=0")
+            .parse()
+            .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(list_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    let recordings = body["recordings"].as_array().unwrap();
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(recordings[0]["id"].as_i64(), Some(first_id));
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(
+        body["stats"]["active_session_recordings_total"].as_u64(),
+        Some(1)
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_recordings_endpoints_return_informative_errors() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "default"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let missing_session_uri: Uri =
+        format!("http://{admin_addr}/_admin/sessions/missing/recordings")
+            .parse()
+            .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(missing_session_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("was not found"));
+
+    let invalid_limit_uri: Uri =
+        format!("http://{admin_addr}/_admin/sessions/default/recordings?limit=abc")
+            .parse()
+            .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(invalid_limit_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("query parameter `limit`")
+    );
+
+    let missing_recording_uri: Uri =
+        format!("http://{admin_addr}/_admin/sessions/default/recordings/9999")
+            .parse()
+            .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(missing_recording_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("recording `9999` was not found")
+    );
+
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(missing_recording_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("recording `9999` was not found")
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn record_mode_persists_recording() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
@@ -2058,4 +2319,13 @@ async fn spawn_upstream_with_response_chunks(
 async fn response_json(response: Response<Incoming>) -> Value {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&body_bytes).unwrap()
+}
+
+fn json_bytes(value: &Value) -> Vec<u8> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| u8::try_from(item.as_u64().unwrap()).unwrap())
+        .collect()
 }

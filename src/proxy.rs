@@ -25,6 +25,8 @@ use hyper_util::{
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use serde_json_path::JsonPath;
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
@@ -916,6 +918,9 @@ async fn proxy_handler(
     ) {
         let request_headers = redact_recording_headers(request_headers, route.redact.as_ref());
         let response_headers = redact_recording_headers(response_headers, route.redact.as_ref());
+        let request_body =
+            redact_recording_body_json(request_body.as_slice(), route.redact.as_ref());
+        let response_body = redact_recording_body_json(body_bytes.as_ref(), route.redact.as_ref());
         let created_at_unix_ms = match Recording::now_unix_ms() {
             Ok(ts) => ts,
             Err(err) => {
@@ -938,7 +943,7 @@ async fn proxy_handler(
             request_body,
             response_status,
             response_headers,
-            response_body: body_bytes.to_vec(),
+            response_body,
             created_at_unix_ms,
         };
 
@@ -1460,6 +1465,64 @@ fn redact_recording_headers(
         .collect()
 }
 
+fn redact_recording_body_json(body: &[u8], redact: Option<&RedactConfig>) -> Vec<u8> {
+    let Some(redact) = redact else {
+        return body.to_vec();
+    };
+
+    if redact.body_json.is_empty() {
+        return body.to_vec();
+    }
+
+    let mut json: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::debug!("recording body is not valid JSON; skipping body redaction: {err}");
+            return body.to_vec();
+        }
+    };
+
+    let mut pointers = Vec::new();
+    for expression in &redact.body_json {
+        let path = match JsonPath::parse(expression) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::debug!(
+                    "failed to parse redaction JSONPath expression `{expression}` at runtime: {err}"
+                );
+                continue;
+            }
+        };
+        pointers.extend(
+            path.query_located(&json)
+                .locations()
+                .map(|location| location.to_json_pointer()),
+        );
+    }
+
+    if pointers.is_empty() {
+        return body.to_vec();
+    }
+
+    pointers.sort_unstable();
+    pointers.dedup();
+
+    let placeholder = Value::String(REDACTION_PLACEHOLDER.to_owned());
+    for pointer in pointers {
+        if let Some(node) = json.pointer_mut(pointer.as_str()) {
+            *node = placeholder.clone();
+        }
+    }
+
+    match serde_json::to_vec(&json) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::debug!("failed to serialize redacted recording body: {err}");
+            body.to_vec()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1468,8 +1531,9 @@ mod tests {
     };
 
     use super::{
-        CacheLogOutcome, ProxyRoute, emit_proxy_request_log, format_route_ref, mode_log_label,
-        redact_recording_headers, sanitize_match_key, select_route,
+        CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, emit_proxy_request_log,
+        format_route_ref, mode_log_label, redact_recording_body_json, redact_recording_headers,
+        sanitize_match_key, select_route,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMode,
@@ -1602,6 +1666,55 @@ upstream = "http://127.0.0.1:1"
         assert_eq!(authorization, Some(b"[REDACTED]".as_slice()));
         assert_eq!(api_key, Some(b"[REDACTED]".as_slice()));
         assert_eq!(trace_id, Some(b"trace-1".as_slice()));
+    }
+
+    #[test]
+    fn redact_recording_body_json_masks_nested_object_and_array_fields() {
+        let redact = RedactConfig {
+            headers: Vec::new(),
+            body_json: vec![
+                "$.auth.token".to_owned(),
+                "$.messages[*].content".to_owned(),
+            ],
+        };
+        let body = br#"{"auth":{"token":"super-secret","keep":"ok"},"messages":[{"content":"first"},{"content":"second"}]}"#;
+
+        let redacted = redact_recording_body_json(body, Some(&redact));
+        let parsed: Value = serde_json::from_slice(&redacted).unwrap();
+
+        assert_eq!(
+            parsed.pointer("/auth/token").and_then(Value::as_str),
+            Some(REDACTION_PLACEHOLDER)
+        );
+        assert_eq!(
+            parsed.pointer("/auth/keep").and_then(Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(
+            parsed
+                .pointer("/messages/0/content")
+                .and_then(Value::as_str),
+            Some(REDACTION_PLACEHOLDER)
+        );
+        assert_eq!(
+            parsed
+                .pointer("/messages/1/content")
+                .and_then(Value::as_str),
+            Some(REDACTION_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn redact_recording_body_json_leaves_non_json_payload_unchanged() {
+        let redact = RedactConfig {
+            headers: Vec::new(),
+            body_json: vec!["$.secret".to_owned()],
+        };
+        let body = b"plain-text-body";
+
+        let redacted = redact_recording_body_json(body, Some(&redact));
+
+        assert_eq!(redacted, body);
     }
 
     #[test]

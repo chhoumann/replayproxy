@@ -916,7 +916,7 @@ mode = "record"
 }
 
 #[tokio::test]
-async fn record_mode_redacts_configured_headers_before_storage() {
+async fn record_mode_redacts_configured_headers_and_json_body_before_storage() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
     let storage_dir = tempfile::tempdir().unwrap();
@@ -937,9 +937,11 @@ mode = "record"
 
 [routes.match]
 headers = ["Authorization"]
+body_json = ["$.auth.token"]
 
 [routes.redact]
 headers = ["Authorization", "X-Resp-End"]
+body_json = ["$.auth.token", "$.messages[*].content"]
 "#,
         storage_dir.path().display()
     );
@@ -951,6 +953,8 @@ headers = ["Authorization", "X-Resp-End"]
     let client: Client<HttpConnector, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(connector);
 
+    let request_body =
+        br#"{"auth":{"token":"client-secret"},"messages":[{"content":"first"},{"content":"second"}]}"#;
     let proxy_uri: Uri = format!("http://{}/api/hello?x=1", proxy.listen_addr)
         .parse()
         .unwrap();
@@ -958,7 +962,7 @@ headers = ["Authorization", "X-Resp-End"]
         .method(Method::POST)
         .uri(proxy_uri)
         .header(header::AUTHORIZATION, "Bearer top-secret")
-        .body(Full::new(Bytes::from_static(b"client-body")))
+        .body(Full::new(Bytes::from_static(request_body)))
         .unwrap();
 
     let res = client.request(req).await.unwrap();
@@ -971,14 +975,20 @@ headers = ["Authorization", "X-Resp-End"]
         captured.headers.get(header::AUTHORIZATION).unwrap(),
         &HeaderValue::from_static("Bearer top-secret")
     );
+    assert_eq!(captured.body.as_ref(), request_body);
 
     let db_path = storage_dir.path().join(session).join("recordings.db");
     let conn = Connection::open(db_path).unwrap();
-    let (stored_match_key, request_headers_json, response_headers_json): (String, String, String) =
-        conn.query_row(
-            "SELECT match_key, request_headers_json, response_headers_json FROM recordings LIMIT 1;",
+    let (stored_match_key, request_headers_json, response_headers_json, stored_request_body): (
+        String,
+        String,
+        String,
+        Vec<u8>,
+    ) = conn
+        .query_row(
+            "SELECT match_key, request_headers_json, response_headers_json, request_body FROM recordings LIMIT 1;",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
 
@@ -986,6 +996,7 @@ headers = ["Authorization", "X-Resp-End"]
         serde_json::from_str(&request_headers_json).unwrap();
     let response_headers: Vec<(String, Vec<u8>)> =
         serde_json::from_str(&response_headers_json).unwrap();
+    let stored_request_body: Value = serde_json::from_slice(&stored_request_body).unwrap();
     assert_eq!(
         request_headers
             .iter()
@@ -999,6 +1010,24 @@ headers = ["Authorization", "X-Resp-End"]
             .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-end"))
             .map(|(_, value)| value.as_slice()),
         Some(b"[REDACTED]".as_slice())
+    );
+    assert_eq!(
+        stored_request_body
+            .pointer("/auth/token")
+            .and_then(Value::as_str),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        stored_request_body
+            .pointer("/messages/0/content")
+            .and_then(Value::as_str),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        stored_request_body
+            .pointer("/messages/1/content")
+            .and_then(Value::as_str),
+        Some("[REDACTED]")
     );
 
     let expected_match_key = replayproxy::matching::compute_match_key(
@@ -1022,8 +1051,19 @@ headers = ["Authorization", "X-Resp-End"]
         &captured.body,
     )
     .unwrap();
+    let redacted_match_body =
+        br#"{"auth":{"token":"[REDACTED]"},"messages":[{"content":"first"},{"content":"second"}]}"#;
+    let redacted_body_match_key = replayproxy::matching::compute_match_key(
+        config.routes[0].match_.as_ref(),
+        &Method::POST,
+        &captured.uri,
+        &captured.headers,
+        redacted_match_body,
+    )
+    .unwrap();
     assert_eq!(stored_match_key, expected_match_key);
     assert_ne!(expected_match_key, redacted_match_key);
+    assert_ne!(expected_match_key, redacted_body_match_key);
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;

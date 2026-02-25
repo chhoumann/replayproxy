@@ -503,6 +503,41 @@ headers_ignore = ["Date", "X-Request-Id"]
     }
 
     #[test]
+    fn match_key_empty_body_is_stable() {
+        let method = hyper::Method::POST;
+        let uri: hyper::Uri = "http://example.com/api/hello".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+        let body = b"";
+
+        let first = key(None, &method, &uri, &headers, body);
+        let second = key(None, &method, &uri, &headers, body);
+
+        assert_eq!(first, second, "empty body should hash deterministically");
+    }
+
+    #[test]
+    fn match_key_large_body_detects_byte_changes() {
+        let method = hyper::Method::POST;
+        let uri: hyper::Uri = "http://example.com/api/large".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+
+        let base_body = vec![0xff_u8; 1_000_000];
+        let mut variant_body = base_body.clone();
+        variant_body[base_body.len() / 2] ^= 0x01;
+
+        assert_eq!(
+            key(None, &method, &uri, &headers, &base_body),
+            key(None, &method, &uri, &headers, &base_body),
+            "re-hashing the same large body should remain stable"
+        );
+        assert_ne!(
+            key(None, &method, &uri, &headers, &base_body),
+            key(None, &method, &uri, &headers, &variant_body),
+            "single-byte change in large body must change the key"
+        );
+    }
+
+    #[test]
     fn match_key_changes_when_query_changes_in_exact_mode() {
         let method = hyper::Method::GET;
         let headers = hyper::HeaderMap::new();

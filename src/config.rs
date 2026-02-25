@@ -763,6 +763,14 @@ recording_mode = "server-only"
         );
         assert_eq!(openai.match_.as_ref().unwrap().headers_ignore, vec!["Date"]);
         assert_eq!(openai.match_.as_ref().unwrap().body_json.len(), 3);
+        assert_eq!(
+            openai.redact.as_ref().unwrap().headers,
+            vec!["Authorization"]
+        );
+        assert_eq!(
+            openai.redact.as_ref().unwrap().body_json,
+            vec!["$.api_key"]
+        );
         assert!(openai.streaming.as_ref().unwrap().preserve_timing);
         assert_eq!(openai.rate_limit.as_ref().unwrap().requests_per_second, 10);
 

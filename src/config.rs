@@ -1,7 +1,9 @@
 use std::{
-    fs,
+    env,
+    ffi::OsStr,
+    fs, io,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     str::FromStr,
 };
 
@@ -25,11 +27,55 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn load(config_override: Option<&Path>) -> anyhow::Result<Self> {
+        let mut attempted_paths = Vec::new();
+
+        for raw_path in config_candidate_paths(config_override) {
+            let resolved_path = match expand_tilde(&raw_path) {
+                Ok(path) => path,
+                Err(err) => {
+                    attempted_paths.push(raw_path.display().to_string());
+                    return Err(anyhow::anyhow!(
+                        "{err}\n{}",
+                        format_attempted_paths(&attempted_paths)
+                    ));
+                }
+            };
+            attempted_paths.push(resolved_path.display().to_string());
+
+            let toml = match fs::read_to_string(&resolved_path) {
+                Ok(toml) => toml,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "read config {}: {err}\n{}",
+                        resolved_path.display(),
+                        format_attempted_paths(&attempted_paths)
+                    ));
+                }
+            };
+
+            return Self::from_toml_str(&toml).map_err(|err| {
+                anyhow::anyhow!(
+                    "parse config {}: {err}\n{}",
+                    resolved_path.display(),
+                    format_attempted_paths(&attempted_paths)
+                )
+            });
+        }
+
+        bail!(
+            "unable to find a config file\n{}",
+            format_attempted_paths(&attempted_paths)
+        )
+    }
+
     pub fn from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        let toml = fs::read_to_string(path)
+        let path = expand_tilde(path.as_ref())?;
+        let toml = fs::read_to_string(&path)
             .map_err(|err| anyhow::anyhow!("read config {}: {err}", path.display()))?;
         Self::from_toml_str(&toml)
+            .map_err(|err| anyhow::anyhow!("parse config {}: {err}", path.display()))
     }
 
     pub fn from_toml_str(toml: &str) -> anyhow::Result<Self> {
@@ -42,6 +88,47 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn config_candidate_paths(config_override: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(path) = config_override {
+        return vec![path.to_path_buf()];
+    }
+
+    vec![
+        PathBuf::from("./replayproxy.toml"),
+        PathBuf::from("~/.replayproxy/config.toml"),
+    ]
+}
+
+fn expand_tilde(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(component)) if component == OsStr::new("~") => {
+            let home = env::var_os("HOME").ok_or_else(|| {
+                anyhow::anyhow!("cannot expand `~` in {}: HOME is not set", path.display())
+            })?;
+            let mut expanded = PathBuf::from(home);
+            for component in components {
+                expanded.push(component.as_os_str());
+            }
+            Ok(expanded)
+        }
+        _ => Ok(path.to_path_buf()),
+    }
+}
+
+fn format_attempted_paths(attempted_paths: &[String]) -> String {
+    if attempted_paths.is_empty() {
+        return "attempted paths: (none)".to_string();
+    }
+
+    let mut message = String::from("attempted paths:");
+    for path in attempted_paths {
+        message.push_str("\n- ");
+        message.push_str(path);
+    }
+    message
 }
 
 impl FromStr for Config {
@@ -292,6 +379,12 @@ pub enum WebSocketRecordingMode {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        env,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::{Config, LogFormat, RouteMode, WebSocketRecordingMode};
 
     #[test]
@@ -440,6 +533,56 @@ upstream = "http://127.0.0.1:1234"
         assert!(
             err.to_string()
                 .contains("one of `path_prefix`, `path_exact`, or `path_regex` is required")
+        );
+    }
+
+    #[test]
+    fn default_search_paths_follow_expected_order() {
+        let paths = super::config_candidate_paths(None);
+        assert_eq!(paths[0], PathBuf::from("./replayproxy.toml"));
+        assert_eq!(paths[1], PathBuf::from("~/.replayproxy/config.toml"));
+    }
+
+    #[test]
+    fn override_path_replaces_default_search_paths() {
+        let override_path = Path::new("/tmp/custom-config.toml");
+        let paths = super::config_candidate_paths(Some(override_path));
+        assert_eq!(paths, vec![override_path.to_path_buf()]);
+    }
+
+    #[test]
+    fn from_path_expands_tilde() {
+        let home = env::var_os("HOME").expect("HOME should be set in test environment");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let missing_relative = format!(".replayproxy/replayproxy-missing-{unique}.toml");
+        let tilde_path = format!("~/{missing_relative}");
+        let expected_path = PathBuf::from(home).join(missing_relative);
+
+        let err = Config::from_path(Path::new(&tilde_path)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&expected_path.display().to_string()),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn load_errors_include_attempted_paths() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let missing_path = PathBuf::from(format!("/tmp/replayproxy-missing-{unique}.toml"));
+
+        let err = Config::load(Some(missing_path.as_path())).unwrap_err();
+        assert!(err.to_string().contains("attempted paths:"), "err: {err}");
+        assert!(
+            err.to_string()
+                .contains(&missing_path.display().to_string()),
+            "err: {err}"
         );
     }
 }

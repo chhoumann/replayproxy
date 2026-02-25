@@ -232,6 +232,13 @@ impl Storage {
             .context("join delete_recording task")?
     }
 
+    pub async fn count_recordings(&self) -> anyhow::Result<u64> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || count_recordings_blocking(&db_path))
+            .await
+            .context("join count_recordings task")?
+    }
+
     fn init(&self) -> anyhow::Result<()> {
         let mut conn = open_connection(&self.db_path)?;
         migrate(&mut conn)?;
@@ -921,6 +928,14 @@ fn delete_recording_blocking(path: &Path, id: i64) -> anyhow::Result<bool> {
     Ok(deleted == 1)
 }
 
+fn count_recordings_blocking(path: &Path) -> anyhow::Result<u64> {
+    let conn = open_connection(path)?;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings", [], |row| row.get(0))
+        .context("count recordings")?;
+    u64::try_from(count).context("recording count cannot be negative")
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::params;
@@ -1208,6 +1223,31 @@ active_session = "default"
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, second_id);
         assert_eq!(remaining[0].request_uri, "/second");
+    }
+
+    #[tokio::test]
+    async fn count_recordings_returns_total_rows() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        assert_eq!(storage.count_recordings().await.unwrap(), 0);
+
+        let recording = Recording {
+            match_key: "count-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/first".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"body".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+
+        storage.insert_recording(recording.clone()).await.unwrap();
+        storage.insert_recording(recording).await.unwrap();
+
+        assert_eq!(storage.count_recordings().await.unwrap(), 2);
     }
 
     #[tokio::test]

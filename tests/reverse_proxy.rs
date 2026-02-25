@@ -450,7 +450,9 @@ mode = "passthrough-cache"
 
 #[tokio::test]
 async fn metrics_endpoint_returns_prometheus_text_when_enabled() {
-    let config = replayproxy::config::Config::from_toml_str(
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
         r#"
 [proxy]
 listen = "127.0.0.1:0"
@@ -458,9 +460,19 @@ admin_port = 0
 
 [metrics]
 enabled = true
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
 "#,
-    )
-    .unwrap();
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
     let proxy = replayproxy::proxy::serve(&config).await.unwrap();
     let admin_addr = proxy
         .admin_listen_addr
@@ -470,6 +482,20 @@ enabled = true
     connector.enforce_http(false);
     let client: Client<HttpConnector, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/metrics", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .header(header::CONNECTION, "close")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    let _captured = upstream_rx.recv().await.unwrap();
 
     let metrics_uri: Uri = format!("http://{admin_addr}/metrics").parse().unwrap();
     let req = Request::builder()
@@ -489,8 +515,90 @@ enabled = true
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     let body = String::from_utf8(body_bytes.to_vec()).unwrap();
     assert!(body.contains("# HELP replayproxy_uptime_seconds"));
-    assert!(body.contains("# TYPE replayproxy_proxy_requests_total counter"));
+    assert!(body.contains("# TYPE replayproxy_requests_total counter"));
+    assert!(
+        body.contains(
+            "replayproxy_requests_total{mode=\"record\",method=\"GET\",status=\"201\"} 1"
+        )
+    );
+    assert!(body.contains("# TYPE replayproxy_upstream_duration_seconds histogram"));
+    assert!(body.contains("replayproxy_upstream_duration_seconds_count 1"));
+    assert!(body.contains("# TYPE replayproxy_replay_duration_seconds histogram"));
+    assert!(body.contains("replayproxy_replay_duration_seconds_count 0"));
+    assert!(body.contains("# TYPE replayproxy_active_connections gauge"));
+    assert!(body.contains("# TYPE replayproxy_recordings_total gauge"));
+    assert!(body.contains("replayproxy_recordings_total{session=\"default\"} 1"));
     assert!(body.contains("replayproxy_admin_requests_total 1"));
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reports_replay_duration_for_replay_lookup_miss() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[metrics]
+enabled = true
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/miss", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let metrics_uri: Uri = format!("http://{admin_addr}/metrics").parse().unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(metrics_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        body.contains(
+            "replayproxy_requests_total{mode=\"replay\",method=\"GET\",status=\"502\"} 1"
+        )
+    );
+    assert!(body.contains("replayproxy_replay_duration_seconds_count 1"));
+    assert!(body.contains("replayproxy_upstream_duration_seconds_count 0"));
+    assert!(body.contains("replayproxy_cache_misses_total 1"));
 
     proxy.shutdown().await;
 }

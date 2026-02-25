@@ -1,10 +1,12 @@
 use std::{
     cmp::Reverse,
+    collections::BTreeMap,
     convert::Infallible,
     error::Error as StdError,
+    fmt::Write as _,
     net::SocketAddr,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -42,6 +44,20 @@ type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
 type HttpClient = Client<HttpConnector, ProxyBody>;
 const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 const REDACTION_PLACEHOLDER_BYTES: &[u8] = b"[REDACTED]";
+const DURATION_HISTOGRAM_BUCKETS: [(&str, u64); 12] = [
+    ("0.001", 1_000),
+    ("0.005", 5_000),
+    ("0.01", 10_000),
+    ("0.025", 25_000),
+    ("0.05", 50_000),
+    ("0.1", 100_000),
+    ("0.25", 250_000),
+    ("0.5", 500_000),
+    ("1", 1_000_000),
+    ("2.5", 2_500_000),
+    ("5", 5_000_000),
+    ("10", 10_000_000),
+];
 
 #[derive(Debug)]
 pub struct ProxyHandle {
@@ -92,11 +108,13 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         None => None,
     };
     let session_runtime = Arc::new(RwLock::new(ActiveSessionRuntime::from_config(config)?));
+    let initial_recordings_total = active_session_recordings_total(&session_runtime).await;
     let runtime_status = Arc::new(RuntimeStatus::new(
         config,
         listen_addr,
         admin_listen_addr,
         Arc::clone(&session_runtime),
+        initial_recordings_total,
     ));
     let metrics_enabled = config
         .metrics
@@ -124,7 +142,9 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
                     let Ok((stream, _peer)) = accept else { continue };
                     let io = TokioIo::new(stream);
                     let state = Arc::clone(&state);
+                    let status = Arc::clone(&state.status);
                     tokio::spawn(async move {
+                        let _connection_guard = ActiveConnectionGuard::new(status);
                         let service = service_fn(move |req| proxy_handler(req, Arc::clone(&state)));
                         let builder = ConnectionBuilder::new(TokioExecutor::new());
                         if let Err(err) = builder.serve_connection(io, service).await {
@@ -178,6 +198,29 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         admin_shutdown_tx,
         admin_join,
     })
+}
+
+async fn active_session_recordings_total(
+    session_runtime: &Arc<RwLock<ActiveSessionRuntime>>,
+) -> u64 {
+    let active_storage = {
+        session_runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .storage
+            .clone()
+    };
+    let Some(storage) = active_storage else {
+        return 0;
+    };
+
+    match storage.count_recordings().await {
+        Ok(total) => total,
+        Err(err) => {
+            tracing::debug!("failed to count recordings for active session: {err}");
+            0
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -258,6 +301,9 @@ struct RuntimeStatus {
     cache_hits_total: AtomicU64,
     cache_misses_total: AtomicU64,
     upstream_requests_total: AtomicU64,
+    active_connections: AtomicU64,
+    active_session_recordings_total: AtomicU64,
+    metrics_state: Mutex<RuntimeMetricsState>,
 }
 
 #[derive(Debug)]
@@ -285,6 +331,8 @@ struct AdminStatusStats {
     cache_hits_total: u64,
     cache_misses_total: u64,
     upstream_requests_total: u64,
+    active_connections: u64,
+    active_session_recordings_total: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -316,12 +364,131 @@ struct ReplayMissResponse {
     match_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RequestCounterLabels {
+    mode: String,
+    method: String,
+    status: u16,
+}
+
+#[derive(Debug, Clone)]
+struct DurationHistogramSnapshot {
+    bucket_counts: Vec<u64>,
+    observations_total: u64,
+    sum_seconds: f64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeMetricsSnapshot {
+    requests_total: Vec<(RequestCounterLabels, u64)>,
+    upstream_duration: DurationHistogramSnapshot,
+    replay_duration: DurationHistogramSnapshot,
+}
+
+#[derive(Debug)]
+struct DurationHistogram {
+    bucket_counts: Vec<u64>,
+    observations_total: u64,
+    sum_micros: u64,
+}
+
+impl DurationHistogram {
+    fn new() -> Self {
+        Self {
+            bucket_counts: vec![0; DURATION_HISTOGRAM_BUCKETS.len()],
+            observations_total: 0,
+            sum_micros: 0,
+        }
+    }
+
+    fn observe(&mut self, latency: Duration) {
+        let latency_micros = duration_to_micros(latency);
+        self.observations_total = self.observations_total.saturating_add(1);
+        self.sum_micros = self.sum_micros.saturating_add(latency_micros);
+
+        for (idx, (_, upper_bound_micros)) in DURATION_HISTOGRAM_BUCKETS.iter().enumerate() {
+            if latency_micros <= *upper_bound_micros {
+                self.bucket_counts[idx] = self.bucket_counts[idx].saturating_add(1);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> DurationHistogramSnapshot {
+        DurationHistogramSnapshot {
+            bucket_counts: self.bucket_counts.clone(),
+            observations_total: self.observations_total,
+            sum_seconds: self.sum_micros as f64 / 1_000_000.0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeMetricsState {
+    requests_total: BTreeMap<RequestCounterLabels, u64>,
+    upstream_duration: DurationHistogram,
+    replay_duration: DurationHistogram,
+}
+
+impl RuntimeMetricsState {
+    fn new() -> Self {
+        Self {
+            requests_total: BTreeMap::new(),
+            upstream_duration: DurationHistogram::new(),
+            replay_duration: DurationHistogram::new(),
+        }
+    }
+
+    fn observe_request(&mut self, labels: RequestCounterLabels) {
+        let counter = self.requests_total.entry(labels).or_insert(0);
+        *counter = counter.saturating_add(1);
+    }
+
+    fn observe_upstream_duration(&mut self, latency: Duration) {
+        self.upstream_duration.observe(latency);
+    }
+
+    fn observe_replay_duration(&mut self, latency: Duration) {
+        self.replay_duration.observe(latency);
+    }
+
+    fn snapshot(&self) -> RuntimeMetricsSnapshot {
+        RuntimeMetricsSnapshot {
+            requests_total: self
+                .requests_total
+                .iter()
+                .map(|(labels, count)| (labels.clone(), *count))
+                .collect(),
+            upstream_duration: self.upstream_duration.snapshot(),
+            replay_duration: self.replay_duration.snapshot(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveConnectionGuard {
+    status: Arc<RuntimeStatus>,
+}
+
+impl ActiveConnectionGuard {
+    fn new(status: Arc<RuntimeStatus>) -> Self {
+        status.increment_active_connections();
+        Self { status }
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.status.decrement_active_connections();
+    }
+}
+
 impl RuntimeStatus {
     fn new(
         config: &Config,
         proxy_listen_addr: SocketAddr,
         admin_listen_addr: Option<SocketAddr>,
         session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
+        initial_recordings_total: u64,
     ) -> Self {
         Self {
             started_at: Instant::now(),
@@ -334,6 +501,9 @@ impl RuntimeStatus {
             cache_hits_total: AtomicU64::new(0),
             cache_misses_total: AtomicU64::new(0),
             upstream_requests_total: AtomicU64::new(0),
+            active_connections: AtomicU64::new(0),
+            active_session_recordings_total: AtomicU64::new(initial_recordings_total),
+            metrics_state: Mutex::new(RuntimeMetricsState::new()),
         }
     }
 
@@ -355,6 +525,10 @@ impl RuntimeStatus {
                 cache_hits_total: self.cache_hits_total.load(Ordering::Relaxed),
                 cache_misses_total: self.cache_misses_total.load(Ordering::Relaxed),
                 upstream_requests_total: self.upstream_requests_total.load(Ordering::Relaxed),
+                active_connections: self.active_connections.load(Ordering::Relaxed),
+                active_session_recordings_total: self
+                    .active_session_recordings_total
+                    .load(Ordering::Relaxed),
             },
         }
     }
@@ -365,6 +539,67 @@ impl RuntimeStatus {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active_session
             .clone()
+    }
+
+    fn increment_active_connections(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_active_connections(&self) {
+        let _ =
+            self.active_connections
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_sub(1)
+                });
+    }
+
+    fn set_active_session_recordings_total(&self, total: u64) {
+        self.active_session_recordings_total
+            .store(total, Ordering::Relaxed);
+    }
+
+    fn increment_active_session_recordings_total(&self) {
+        self.active_session_recordings_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn active_session_recordings_total(&self) -> u64 {
+        self.active_session_recordings_total.load(Ordering::Relaxed)
+    }
+
+    fn observe_proxy_request(&self, mode: Option<RouteMode>, method: &str, status: StatusCode) {
+        let mut metrics_state = self
+            .metrics_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics_state.observe_request(RequestCounterLabels {
+            mode: mode_log_label(mode).to_owned(),
+            method: method.to_owned(),
+            status: status.as_u16(),
+        });
+    }
+
+    fn observe_upstream_duration(&self, latency: Duration) {
+        let mut metrics_state = self
+            .metrics_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics_state.observe_upstream_duration(latency);
+    }
+
+    fn observe_replay_duration(&self, latency: Duration) {
+        let mut metrics_state = self
+            .metrics_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics_state.observe_replay_duration(latency);
+    }
+
+    fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
+        self.metrics_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot()
     }
 }
 
@@ -564,16 +799,22 @@ async fn proxy_handler(
     let mut route_ref: Option<&str> = None;
     let mut mode: Option<RouteMode> = None;
     let mut cache_outcome = CacheLogOutcome::Bypass;
+    let mut replay_latency: Option<Duration> = None;
 
     macro_rules! respond {
         ($upstream_latency:expr, $response:expr) => {{
-            return Ok(response_with_request_log(
-                &request_method,
-                &request_url,
+            let observation = RequestObservation {
+                method: &request_method,
+                url: &request_url,
                 route_ref,
                 mode,
                 cache_outcome,
-                $upstream_latency,
+                replay_latency,
+                upstream_latency: $upstream_latency,
+            };
+            return Ok(response_with_observability(
+                state.status.as_ref(),
+                observation,
                 $response,
             ));
         }};
@@ -734,14 +975,16 @@ async fn proxy_handler(
                 );
             };
             let match_key = match_key.as_deref().unwrap_or_default();
-            match lookup_recording_for_request(
+            let replay_started_at = Instant::now();
+            let lookup_result = lookup_recording_for_request(
                 storage,
                 route.match_config.as_ref(),
                 &parts.uri,
                 match_key,
             )
-            .await
-            {
+            .await;
+            replay_latency = Some(replay_started_at.elapsed());
+            match lookup_result {
                 Ok(Some(recording)) => {
                     cache_outcome = CacheLogOutcome::Hit;
                     state
@@ -779,14 +1022,16 @@ async fn proxy_handler(
             if let (Some(storage), Some(match_key)) =
                 (active_storage.as_ref(), match_key.as_deref())
             {
-                match lookup_recording_for_request(
+                let replay_started_at = Instant::now();
+                let lookup_result = lookup_recording_for_request(
                     storage,
                     route.match_config.as_ref(),
                     &parts.uri,
                     match_key,
                 )
-                .await
-                {
+                .await;
+                replay_latency = Some(replay_started_at.elapsed());
+                match lookup_result {
                     Ok(Some(recording)) => {
                         cache_outcome = CacheLogOutcome::Hit;
                         state
@@ -953,8 +1198,9 @@ async fn proxy_handler(
             created_at_unix_ms,
         };
 
-        if let Err(err) = storage.insert_recording(recording).await {
-            tracing::debug!("failed to persist recording: {err}");
+        match storage.insert_recording(recording).await {
+            Ok(_) => state.status.increment_active_session_recordings_total(),
+            Err(err) => tracing::debug!("failed to persist recording: {err}"),
         }
     }
 
@@ -964,24 +1210,38 @@ async fn proxy_handler(
     );
 }
 
-fn response_with_request_log<B>(
-    method: &str,
-    url: &str,
-    route_ref: Option<&str>,
+#[derive(Debug, Clone, Copy)]
+struct RequestObservation<'a> {
+    method: &'a str,
+    url: &'a str,
+    route_ref: Option<&'a str>,
     mode: Option<RouteMode>,
     cache_outcome: CacheLogOutcome,
+    replay_latency: Option<Duration>,
     upstream_latency: Option<Duration>,
+}
+
+fn response_with_observability<B>(
+    status: &RuntimeStatus,
+    observation: RequestObservation<'_>,
     response: Response<B>,
 ) -> Response<B> {
-    let status = response.status();
+    let response_status = response.status();
+    status.observe_proxy_request(observation.mode, observation.method, response_status);
+    if let Some(latency) = observation.replay_latency {
+        status.observe_replay_duration(latency);
+    }
+    if let Some(latency) = observation.upstream_latency {
+        status.observe_upstream_duration(latency);
+    }
     emit_proxy_request_log(
-        method,
-        url,
-        route_ref,
-        mode,
-        cache_outcome,
-        upstream_latency,
-        status,
+        observation.method,
+        observation.url,
+        observation.route_ref,
+        observation.mode,
+        observation.cache_outcome,
+        observation.upstream_latency,
+        response_status,
     );
     response
 }
@@ -1204,40 +1464,224 @@ fn admin_status_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
     }
 }
 
-fn admin_metrics_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
-    let snapshot = status.snapshot();
-    let body = format!(
-        concat!(
-            "# HELP replayproxy_uptime_seconds Proxy uptime in seconds.\n",
-            "# TYPE replayproxy_uptime_seconds gauge\n",
-            "replayproxy_uptime_seconds {:.3}\n",
-            "# HELP replayproxy_routes_configured Number of configured routes.\n",
-            "# TYPE replayproxy_routes_configured gauge\n",
-            "replayproxy_routes_configured {}\n",
-            "# HELP replayproxy_proxy_requests_total Total requests handled by the proxy listener.\n",
-            "# TYPE replayproxy_proxy_requests_total counter\n",
-            "replayproxy_proxy_requests_total {}\n",
-            "# HELP replayproxy_admin_requests_total Total requests handled by the admin listener.\n",
-            "# TYPE replayproxy_admin_requests_total counter\n",
-            "replayproxy_admin_requests_total {}\n",
-            "# HELP replayproxy_cache_hits_total Total cache hits served from recordings.\n",
-            "# TYPE replayproxy_cache_hits_total counter\n",
-            "replayproxy_cache_hits_total {}\n",
-            "# HELP replayproxy_cache_misses_total Total cache misses that required fallback handling.\n",
-            "# TYPE replayproxy_cache_misses_total counter\n",
-            "replayproxy_cache_misses_total {}\n",
-            "# HELP replayproxy_upstream_requests_total Total requests forwarded upstream.\n",
-            "# TYPE replayproxy_upstream_requests_total counter\n",
-            "replayproxy_upstream_requests_total {}\n",
-        ),
-        snapshot.uptime_ms as f64 / 1_000.0,
-        snapshot.routes_configured,
-        snapshot.stats.proxy_requests_total,
-        snapshot.stats.admin_requests_total,
-        snapshot.stats.cache_hits_total,
-        snapshot.stats.cache_misses_total,
-        snapshot.stats.upstream_requests_total,
+fn duration_to_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn prometheus_escape_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn append_prometheus_histogram(
+    body: &mut String,
+    metric_name: &str,
+    help: &str,
+    snapshot: &DurationHistogramSnapshot,
+) {
+    let _ = writeln!(body, "# HELP {metric_name} {help}");
+    let _ = writeln!(body, "# TYPE {metric_name} histogram");
+    for ((bound_label, _), count) in DURATION_HISTOGRAM_BUCKETS
+        .iter()
+        .zip(&snapshot.bucket_counts)
+    {
+        let _ = writeln!(body, "{metric_name}_bucket{{le=\"{bound_label}\"}} {count}");
+    }
+    let _ = writeln!(
+        body,
+        "{metric_name}_bucket{{le=\"+Inf\"}} {}",
+        snapshot.observations_total
     );
+    let _ = writeln!(body, "{metric_name}_sum {:.6}", snapshot.sum_seconds);
+    let _ = writeln!(body, "{metric_name}_count {}", snapshot.observations_total);
+}
+
+async fn recordings_totals_by_session(
+    session_manager: Option<&SessionManager>,
+    status: &RuntimeStatus,
+) -> Vec<(String, u64)> {
+    let fallback = || {
+        vec![(
+            status.active_session(),
+            status.active_session_recordings_total(),
+        )]
+    };
+    let Some(session_manager) = session_manager else {
+        return fallback();
+    };
+
+    let mut sessions = match session_manager.list_sessions().await {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::debug!("failed to list sessions for metrics output: {err}");
+            return fallback();
+        }
+    };
+    sessions.sort_unstable();
+
+    let mut totals = Vec::with_capacity(sessions.len());
+    for session_name in sessions {
+        let total = match session_manager.open_session_storage(&session_name).await {
+            Ok(storage) => match storage.count_recordings().await {
+                Ok(total) => total,
+                Err(err) => {
+                    tracing::debug!(
+                        "failed to count recordings for session `{session_name}`: {err}"
+                    );
+                    0
+                }
+            },
+            Err(err) => {
+                tracing::debug!("failed to open session `{session_name}` for metrics: {err}");
+                0
+            }
+        };
+        totals.push((session_name, total));
+    }
+    if totals.is_empty() {
+        fallback()
+    } else {
+        totals
+    }
+}
+
+fn admin_metrics_response(
+    status: &RuntimeStatus,
+    recordings_totals: &[(String, u64)],
+) -> Response<Full<Bytes>> {
+    let snapshot = status.snapshot();
+    let metrics_snapshot = status.metrics_snapshot();
+    let mut body = String::new();
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_uptime_seconds Proxy uptime in seconds."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_uptime_seconds gauge");
+    let _ = writeln!(
+        body,
+        "replayproxy_uptime_seconds {:.3}",
+        snapshot.uptime_ms as f64 / 1_000.0
+    );
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_routes_configured Number of configured routes."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_routes_configured gauge");
+    let _ = writeln!(
+        body,
+        "replayproxy_routes_configured {}",
+        snapshot.routes_configured
+    );
+
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_proxy_requests_total Total requests handled by the proxy listener."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_proxy_requests_total counter");
+    let _ = writeln!(
+        body,
+        "replayproxy_proxy_requests_total {}",
+        snapshot.stats.proxy_requests_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_admin_requests_total Total requests handled by the admin listener."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_admin_requests_total counter");
+    let _ = writeln!(
+        body,
+        "replayproxy_admin_requests_total {}",
+        snapshot.stats.admin_requests_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_requests_total Total requests handled by the proxy grouped by mode/method/status."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_requests_total counter");
+    for (labels, count) in &metrics_snapshot.requests_total {
+        let _ = writeln!(
+            body,
+            "replayproxy_requests_total{{mode=\"{}\",method=\"{}\",status=\"{}\"}} {}",
+            prometheus_escape_label_value(&labels.mode),
+            prometheus_escape_label_value(&labels.method),
+            labels.status,
+            count
+        );
+    }
+
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_cache_hits_total Total cache hits served from recordings."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_cache_hits_total counter");
+    let _ = writeln!(
+        body,
+        "replayproxy_cache_hits_total {}",
+        snapshot.stats.cache_hits_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_cache_misses_total Total cache misses that required fallback handling."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_cache_misses_total counter");
+    let _ = writeln!(
+        body,
+        "replayproxy_cache_misses_total {}",
+        snapshot.stats.cache_misses_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_upstream_requests_total Total requests forwarded upstream."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_upstream_requests_total counter");
+    let _ = writeln!(
+        body,
+        "replayproxy_upstream_requests_total {}",
+        snapshot.stats.upstream_requests_total
+    );
+    append_prometheus_histogram(
+        &mut body,
+        "replayproxy_upstream_duration_seconds",
+        "Histogram of upstream response times.",
+        &metrics_snapshot.upstream_duration,
+    );
+    append_prometheus_histogram(
+        &mut body,
+        "replayproxy_replay_duration_seconds",
+        "Histogram of replay lookup response times.",
+        &metrics_snapshot.replay_duration,
+    );
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_active_connections Current number of active client connections."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_active_connections gauge");
+    let _ = writeln!(
+        body,
+        "replayproxy_active_connections {}",
+        snapshot.stats.active_connections
+    );
+    let _ = writeln!(
+        body,
+        "# HELP replayproxy_recordings_total Number of stored recordings for a session."
+    );
+    let _ = writeln!(body, "# TYPE replayproxy_recordings_total gauge");
+    for (session_name, total) in recordings_totals {
+        let _ = writeln!(
+            body,
+            "replayproxy_recordings_total{{session=\"{}\"}} {}",
+            prometheus_escape_label_value(session_name),
+            total
+        );
+    }
 
     let mut response = Response::new(Full::new(Bytes::from(body)));
     *response.status_mut() = StatusCode::OK;
@@ -1325,7 +1769,9 @@ async fn admin_handler(
                 "method not allowed",
             ));
         }
-        return Ok(admin_metrics_response(&state.status));
+        let recordings_totals =
+            recordings_totals_by_session(state.session_manager.as_ref(), &state.status).await;
+        return Ok(admin_metrics_response(&state.status, &recordings_totals));
     }
 
     if path == "/_admin/status" {
@@ -1426,12 +1872,24 @@ async fn admin_handler(
 
         return match session_manager.open_session_storage(session_name).await {
             Ok(storage) => {
+                let recordings_total = match storage.count_recordings().await {
+                    Ok(total) => total,
+                    Err(err) => {
+                        tracing::debug!(
+                            "failed to count recordings while activating session `{session_name}`: {err}"
+                        );
+                        0
+                    }
+                };
                 let mut session_runtime = state
                     .session_runtime
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 session_runtime.active_session = session_name.to_owned();
                 session_runtime.storage = Some(storage);
+                state
+                    .status
+                    .set_active_session_recordings_total(recordings_total);
                 let response = SessionResponse {
                     name: session_name.to_owned(),
                 };

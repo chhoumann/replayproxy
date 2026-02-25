@@ -1,4 +1,13 @@
-use std::{cmp::Reverse, convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{
+    cmp::Reverse,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -14,6 +23,7 @@ use hyper_util::{
     server::conn::auto::Builder as ConnectionBuilder,
 };
 use regex::Regex;
+use serde::Serialize;
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
@@ -72,12 +82,17 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         ),
         None => None,
     };
+    let runtime_status = Arc::new(RuntimeStatus::new(config, listen_addr, admin_listen_addr));
 
     let mut connector = HttpConnector::new();
     connector.enforce_http(false);
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(connector);
 
-    let state = Arc::new(ProxyState::new(config, client)?);
+    let state = Arc::new(ProxyState::new(
+        config,
+        client,
+        Arc::clone(&runtime_status),
+    )?);
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
@@ -102,6 +117,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
 
     let (admin_shutdown_tx, admin_join) = if let Some(admin_listener) = admin_listener {
         let (admin_shutdown_tx, mut admin_shutdown_rx) = oneshot::channel::<()>();
+        let runtime_status = Arc::clone(&runtime_status);
         let admin_join = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -109,8 +125,11 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
                     accept = admin_listener.accept() => {
                         let Ok((stream, _peer)) = accept else { continue };
                         let io = TokioIo::new(stream);
+                        let runtime_status = Arc::clone(&runtime_status);
                         tokio::spawn(async move {
-                            let service = service_fn(admin_handler);
+                            let service = service_fn(move |req| {
+                                admin_handler(req, Arc::clone(&runtime_status))
+                            });
                             let builder = ConnectionBuilder::new(TokioExecutor::new());
                             if let Err(err) = builder.serve_connection(io, service).await {
                                 tracing::debug!("admin connection error: {err}");
@@ -160,14 +179,98 @@ struct PathMatchScore {
 }
 
 #[derive(Debug)]
+struct RuntimeStatus {
+    started_at: Instant,
+    active_session: String,
+    routes_configured: usize,
+    proxy_listen_addr: String,
+    admin_listen_addr: Option<String>,
+    proxy_requests_total: AtomicU64,
+    admin_requests_total: AtomicU64,
+    cache_hits_total: AtomicU64,
+    cache_misses_total: AtomicU64,
+    upstream_requests_total: AtomicU64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminStatusResponse {
+    uptime_ms: u64,
+    active_session: String,
+    proxy_listen_addr: String,
+    admin_listen_addr: Option<String>,
+    routes_configured: usize,
+    stats: AdminStatusStats,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminStatusStats {
+    proxy_requests_total: u64,
+    admin_requests_total: u64,
+    cache_hits_total: u64,
+    cache_misses_total: u64,
+    upstream_requests_total: u64,
+}
+
+impl RuntimeStatus {
+    fn new(
+        config: &Config,
+        proxy_listen_addr: SocketAddr,
+        admin_listen_addr: Option<SocketAddr>,
+    ) -> Self {
+        let active_session = config
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.active_session.as_deref())
+            .unwrap_or("default")
+            .to_owned();
+
+        Self {
+            started_at: Instant::now(),
+            active_session,
+            routes_configured: config.routes.len(),
+            proxy_listen_addr: proxy_listen_addr.to_string(),
+            admin_listen_addr: admin_listen_addr.map(|addr| addr.to_string()),
+            proxy_requests_total: AtomicU64::new(0),
+            admin_requests_total: AtomicU64::new(0),
+            cache_hits_total: AtomicU64::new(0),
+            cache_misses_total: AtomicU64::new(0),
+            upstream_requests_total: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> AdminStatusResponse {
+        let uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        AdminStatusResponse {
+            uptime_ms,
+            active_session: self.active_session.clone(),
+            proxy_listen_addr: self.proxy_listen_addr.clone(),
+            admin_listen_addr: self.admin_listen_addr.clone(),
+            routes_configured: self.routes_configured,
+            stats: AdminStatusStats {
+                proxy_requests_total: self.proxy_requests_total.load(Ordering::Relaxed),
+                admin_requests_total: self.admin_requests_total.load(Ordering::Relaxed),
+                cache_hits_total: self.cache_hits_total.load(Ordering::Relaxed),
+                cache_misses_total: self.cache_misses_total.load(Ordering::Relaxed),
+                upstream_requests_total: self.upstream_requests_total.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
 struct ProxyState {
     routes: Vec<ProxyRoute>,
     client: HttpClient,
     storage: Option<Storage>,
+    status: Arc<RuntimeStatus>,
 }
 
 impl ProxyState {
-    fn new(config: &Config, client: HttpClient) -> anyhow::Result<Self> {
+    fn new(
+        config: &Config,
+        client: HttpClient,
+        status: Arc<RuntimeStatus>,
+    ) -> anyhow::Result<Self> {
         let mut parsed_routes = Vec::with_capacity(config.routes.len());
         for route in &config.routes {
             let path_regex =
@@ -208,6 +311,7 @@ impl ProxyState {
             routes: parsed_routes,
             client,
             storage: Storage::from_config(config)?,
+            status,
         })
     }
 
@@ -267,6 +371,11 @@ async fn proxy_handler(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    state
+        .status
+        .proxy_requests_total
+        .fetch_add(1, Ordering::Relaxed);
+
     let Some(route) = state.route_for(req.uri().path()) else {
         return Ok(simple_response(StatusCode::NOT_FOUND, "no matching route"));
     };
@@ -352,8 +461,18 @@ async fn proxy_handler(
             )
             .await
             {
-                Ok(Some(recording)) => return Ok(response_from_recording(recording)),
+                Ok(Some(recording)) => {
+                    state
+                        .status
+                        .cache_hits_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(response_from_recording(recording));
+                }
                 Ok(None) => {
+                    state
+                        .status
+                        .cache_misses_total
+                        .fetch_add(1, Ordering::Relaxed);
                     if route.cache_miss == CacheMissPolicy::Error {
                         return Ok(simple_response(
                             StatusCode::BAD_GATEWAY,
@@ -381,8 +500,20 @@ async fn proxy_handler(
                 )
                 .await
                 {
-                    Ok(Some(recording)) => return Ok(response_from_recording(recording)),
-                    Ok(None) => should_record = true,
+                    Ok(Some(recording)) => {
+                        state
+                            .status
+                            .cache_hits_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(response_from_recording(recording));
+                    }
+                    Ok(None) => {
+                        state
+                            .status
+                            .cache_misses_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        should_record = true;
+                    }
                     Err(err) => {
                         tracing::debug!("failed to lookup recording: {err}");
                         should_record = true;
@@ -403,6 +534,10 @@ async fn proxy_handler(
 
     let upstream_req = Request::from_parts(parts, Full::new(body_bytes));
 
+    state
+        .status
+        .upstream_requests_total
+        .fetch_add(1, Ordering::Relaxed);
     let upstream_res = match state.client.request(upstream_req).await {
         Ok(res) => res,
         Err(err) => {
@@ -586,9 +721,40 @@ fn simple_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     response
 }
 
-async fn admin_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+fn admin_status_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
+    match serde_json::to_vec(&status.snapshot()) {
+        Ok(body) => {
+            let mut response = Response::new(Full::new(Bytes::from(body)));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        }
+        Err(err) => {
+            tracing::debug!("failed to serialize admin status response: {err}");
+            simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize admin status",
+            )
+        }
+    }
+}
+
+async fn admin_handler(
+    req: Request<Incoming>,
+    status: Arc<RuntimeStatus>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    status.admin_requests_total.fetch_add(1, Ordering::Relaxed);
     if req.uri().path() == "/_admin/status" {
-        return Ok(simple_response(StatusCode::OK, "ok"));
+        if req.method() != hyper::Method::GET {
+            return Ok(simple_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+        return Ok(admin_status_response(&status));
     }
     Ok(simple_response(StatusCode::NOT_FOUND, "not found"))
 }
@@ -608,7 +774,9 @@ fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyRoute, ProxyState, select_route};
+    use std::sync::Arc;
+
+    use super::{ProxyRoute, ProxyState, RuntimeStatus, select_route};
     use crate::config::{CacheMissPolicy, Config, RouteMode};
 
     fn test_route(
@@ -632,6 +800,14 @@ mod tests {
         connector.enforce_http(false);
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build(connector)
+    }
+
+    fn test_runtime_status(config: &Config) -> Arc<RuntimeStatus> {
+        Arc::new(RuntimeStatus::new(
+            config,
+            "127.0.0.1:0".parse().unwrap(),
+            Some("127.0.0.1:0".parse().unwrap()),
+        ))
     }
 
     #[test]
@@ -700,7 +876,8 @@ upstream = "http://127.0.0.1:1"
         )
         .unwrap();
 
-        let err = ProxyState::new(&config, test_client()).unwrap_err();
+        let err =
+            ProxyState::new(&config, test_client(), test_runtime_status(&config)).unwrap_err();
         assert!(err.to_string().contains("parse route.path_regex"));
     }
 }

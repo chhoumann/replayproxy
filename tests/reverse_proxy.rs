@@ -14,6 +14,7 @@ use hyper_util::{
     server::conn::auto::Builder as ConnectionBuilder,
 };
 use rusqlite::Connection;
+use serde_json::Value;
 use tokio::{net::TcpListener, sync::mpsc};
 
 const BINARY_HEADER_VALUE: &[u8] = b"\x80\xffok";
@@ -118,10 +119,103 @@ admin_port = 0
 
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(&body_bytes[..], b"ok");
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(
+        body.get("uptime_ms")
+            .and_then(|value| value.as_u64())
+            .is_some()
+    );
+    assert_eq!(body["active_session"].as_str(), Some("default"));
+    assert_eq!(body["routes_configured"].as_u64(), Some(0));
+    assert_eq!(body["stats"]["admin_requests_total"].as_u64(), Some(1));
+    assert_eq!(body["stats"]["proxy_requests_total"].as_u64(), Some(0));
 
     proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_status_reports_proxy_request_counters() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "status-session";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello?x=1", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["active_session"].as_str(), Some(session));
+    assert_eq!(body["routes_configured"].as_u64(), Some(1));
+    assert_eq!(body["stats"]["proxy_requests_total"].as_u64(), Some(1));
+    assert_eq!(body["stats"]["admin_requests_total"].as_u64(), Some(1));
+    assert_eq!(body["stats"]["cache_hits_total"].as_u64(), Some(0));
+    assert_eq!(body["stats"]["cache_misses_total"].as_u64(), Some(1));
+    assert_eq!(body["stats"]["upstream_requests_total"].as_u64(), Some(1));
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
 }
 
 #[tokio::test]

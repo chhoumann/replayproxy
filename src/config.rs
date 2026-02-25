@@ -204,17 +204,39 @@ pub enum CacheMissPolicy {
     Error,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueryMatchMode {
+    Exact,
+    Subset,
+    Ignore,
+}
+
+impl Default for QueryMatchMode {
+    fn default() -> Self {
+        Self::Exact
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatchConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub method: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub path: bool,
+    #[serde(default)]
+    pub query: QueryMatchMode,
     #[serde(default)]
     pub headers: Vec<String>,
     #[serde(default)]
+    pub headers_ignore: Vec<String>,
+    #[serde(default)]
     pub body_json: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]

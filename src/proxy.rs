@@ -16,7 +16,7 @@ use hyper_util::{
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
-    config::{Config, RouteMode},
+    config::{Config, RouteMatchConfig, RouteMode},
     matching,
     storage::{Recording, Storage},
 };
@@ -86,6 +86,7 @@ struct ProxyRoute {
     path_regex: Option<String>,
     upstream: Option<Uri>,
     mode: RouteMode,
+    match_config: Option<RouteMatchConfig>,
 }
 
 #[derive(Debug)]
@@ -117,6 +118,7 @@ impl ProxyState {
                 path_regex: route.path_regex.clone(),
                 upstream,
                 mode,
+                match_config: route.match_.clone(),
             });
         }
 
@@ -191,8 +193,15 @@ async fn proxy_handler(
     let record_request_headers = should_record.then(|| header_map_to_vec(&parts.headers));
     let record_request_uri = should_record.then(|| request_uri_for_recording(&parts.uri));
     let record_request_method = should_record.then(|| parts.method.to_string());
-    let record_match_key = should_record
-        .then(|| matching::compute_match_key(&parts.method, &parts.uri, body_bytes.as_ref()));
+    let record_match_key = should_record.then(|| {
+        matching::compute_match_key(
+            route.match_config.as_ref(),
+            &parts.method,
+            &parts.uri,
+            &parts.headers,
+            body_bytes.as_ref(),
+        )
+    });
     let record_request_body = should_record.then(|| body_bytes.to_vec());
 
     parts.uri = upstream_uri.clone();

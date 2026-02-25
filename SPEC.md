@@ -64,6 +64,17 @@ Each route can match on any combination of:
 
 The selected dimensions are normalized and hashed to produce a deterministic cache key. The config specifies which dimensions participate per route.
 
+#### Normalization (match key v1)
+
+To ensure deterministic matching, request components are normalized before hashing:
+
+- **Scheme/authority**: ignored for matching (only `path`/`query` participate).
+- **Method**: normalized as an ASCII-uppercase token.
+- **Path**: `URI.path` as-is (no percent-decoding).
+- **Query**: parsed as raw `name=value` pairs (no percent-decoding), sorted by name then value; repeated keys are preserved.
+- **Headers**: names are handled case-insensitively (serialized lowercased); values are treated as raw bytes. When configured, headers are selected via an allowlist and/or ignore list, then sorted by name then value.
+- **Body**: treated as raw bytes (higher-level JSON matching via JSONPath is specified separately).
+
 ### Example config
 
 ```toml

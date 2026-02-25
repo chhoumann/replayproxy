@@ -34,15 +34,9 @@ impl ProxyHandle {
 }
 
 pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
-    let listen_addr: SocketAddr = config
-        .proxy
-        .listen
-        .parse()
-        .map_err(|err| anyhow::anyhow!("parse proxy.listen {}: {err}", config.proxy.listen))?;
-
-    let listener = TcpListener::bind(listen_addr)
+    let listener = TcpListener::bind(config.proxy.listen)
         .await
-        .map_err(|err| anyhow::anyhow!("bind {}: {err}", listen_addr))?;
+        .map_err(|err| anyhow::anyhow!("bind {}: {err}", config.proxy.listen))?;
     let listen_addr = listener
         .local_addr()
         .map_err(|err| anyhow::anyhow!("get local_addr: {err}"))?;
@@ -83,8 +77,10 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
 
 #[derive(Debug)]
 struct ProxyRoute {
-    path_prefix: String,
-    upstream: Uri,
+    path_prefix: Option<String>,
+    path_exact: Option<String>,
+    path_regex: Option<String>,
+    upstream: Option<Uri>,
 }
 
 #[derive(Debug)]
@@ -97,12 +93,17 @@ impl ProxyState {
     fn new(routes: Vec<RouteConfig>, client: HttpClient) -> anyhow::Result<Self> {
         let mut parsed_routes = Vec::with_capacity(routes.len());
         for route in routes {
-            let upstream: Uri = route
-                .upstream
-                .parse()
-                .map_err(|err| anyhow::anyhow!("parse route.upstream {}: {err}", route.upstream))?;
+            let upstream =
+                match route.upstream {
+                    Some(upstream) => Some(upstream.parse().map_err(|err| {
+                        anyhow::anyhow!("parse route.upstream {upstream}: {err}")
+                    })?),
+                    None => None,
+                };
             parsed_routes.push(ProxyRoute {
                 path_prefix: route.path_prefix,
+                path_exact: route.path_exact,
+                path_regex: route.path_regex,
                 upstream,
             });
         }
@@ -114,9 +115,22 @@ impl ProxyState {
     }
 
     fn route_for(&self, path: &str) -> Option<&ProxyRoute> {
-        self.routes
-            .iter()
-            .find(|route| path.starts_with(&route.path_prefix))
+        self.routes.iter().find(|route| route.matches(path))
+    }
+}
+
+impl ProxyRoute {
+    fn matches(&self, path: &str) -> bool {
+        if let Some(exact) = self.path_exact.as_deref() {
+            return path == exact;
+        }
+        if let Some(prefix) = self.path_prefix.as_deref() {
+            return path.starts_with(prefix);
+        }
+        if self.path_regex.is_some() {
+            return false;
+        }
+        false
     }
 }
 
@@ -128,7 +142,14 @@ async fn proxy_handler(
         return Ok(simple_response(StatusCode::NOT_FOUND, "no matching route"));
     };
 
-    let upstream_uri = match build_upstream_uri(&route.upstream, req.uri()) {
+    let Some(upstream_base) = route.upstream.as_ref() else {
+        return Ok(simple_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "route has no upstream",
+        ));
+    };
+
+    let upstream_uri = match build_upstream_uri(upstream_base, req.uri()) {
         Ok(uri) => uri,
         Err(err) => {
             tracing::debug!("failed to build upstream uri: {err}");

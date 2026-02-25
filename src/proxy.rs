@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -181,6 +181,23 @@ enum PathMatchKind {
 struct PathMatchScore {
     kind: PathMatchKind,
     specificity: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheLogOutcome {
+    Hit,
+    Miss,
+    Bypass,
+}
+
+impl CacheLogOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Bypass => "bypass",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -421,25 +438,57 @@ async fn proxy_handler(
         .proxy_requests_total
         .fetch_add(1, Ordering::Relaxed);
 
+    let request_method = req.method().to_string();
+    let request_url = req.uri().to_string();
+    let request_span = tracing::info_span!(
+        "proxy.request",
+        method = %request_method,
+        url = %request_url,
+    );
+    let _request_span_guard = request_span.enter();
+
+    let mut route_ref: Option<&str> = None;
+    let mut mode: Option<RouteMode> = None;
+    let mut cache_outcome = CacheLogOutcome::Bypass;
+
+    macro_rules! respond {
+        ($upstream_latency:expr, $response:expr) => {{
+            return Ok(response_with_request_log(
+                &request_method,
+                &request_url,
+                route_ref,
+                mode,
+                cache_outcome,
+                $upstream_latency,
+                $response,
+            ));
+        }};
+    }
+
     let Some(route) = state.route_for(req.uri().path()) else {
-        return Ok(simple_response(StatusCode::NOT_FOUND, "no matching route"));
+        respond!(
+            None,
+            simple_response(StatusCode::NOT_FOUND, "no matching route")
+        );
     };
+    route_ref = Some(route.route_ref.as_str());
+    mode = Some(route.mode);
 
     let Some(upstream_base) = route.upstream.as_ref() else {
-        return Ok(simple_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "route has no upstream",
-        ));
+        respond!(
+            None,
+            simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
+        );
     };
 
     let upstream_uri = match build_upstream_uri(upstream_base, req.uri()) {
         Ok(uri) => uri,
         Err(err) => {
             tracing::debug!("failed to build upstream uri: {err}");
-            return Ok(simple_response(
-                StatusCode::BAD_GATEWAY,
-                "failed to build upstream request",
-            ));
+            respond!(
+                None,
+                simple_response(StatusCode::BAD_GATEWAY, "failed to build upstream request",)
+            );
         }
     };
 
@@ -448,10 +497,10 @@ async fn proxy_handler(
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
             tracing::debug!("failed to read request body: {err}");
-            return Ok(simple_response(
-                StatusCode::BAD_REQUEST,
-                "failed to read request body",
-            ));
+            respond!(
+                None,
+                simple_response(StatusCode::BAD_REQUEST, "failed to read request body",)
+            );
         }
     };
 
@@ -478,7 +527,7 @@ async fn proxy_handler(
                         "invalid route JSONPath matching configuration",
                     ),
                 };
-                return Ok(simple_response(status, message));
+                respond!(None, simple_response(status, message));
             }
         }
     } else {
@@ -492,10 +541,10 @@ async fn proxy_handler(
         }
         RouteMode::Replay => {
             let Some(storage) = state.storage.as_ref() else {
-                return Ok(simple_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage not configured",
-                ));
+                respond!(
+                    None,
+                    simple_response(StatusCode::INTERNAL_SERVER_ERROR, "storage not configured",)
+                );
             };
             let match_key = match_key.as_deref().unwrap_or_default();
             match lookup_recording_for_request(
@@ -507,31 +556,35 @@ async fn proxy_handler(
             .await
             {
                 Ok(Some(recording)) => {
+                    cache_outcome = CacheLogOutcome::Hit;
                     state
                         .status
                         .cache_hits_total
                         .fetch_add(1, Ordering::Relaxed);
-                    return Ok(response_from_recording(recording));
+                    respond!(None, response_from_recording(recording));
                 }
                 Ok(None) => {
+                    cache_outcome = CacheLogOutcome::Miss;
                     state
                         .status
                         .cache_misses_total
                         .fetch_add(1, Ordering::Relaxed);
                     if route.cache_miss == CacheMissPolicy::Error {
-                        return Ok(replay_miss_response(
-                            route,
-                            state.status.active_session(),
-                            match_key,
-                        ));
+                        respond!(
+                            None,
+                            replay_miss_response(route, state.status.active_session(), match_key,)
+                        );
                     }
                 }
                 Err(err) => {
                     tracing::debug!("failed to lookup recording: {err}");
-                    return Ok(simple_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to lookup recording",
-                    ));
+                    respond!(
+                        None,
+                        simple_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to lookup recording",
+                        )
+                    );
                 }
             }
         }
@@ -547,13 +600,15 @@ async fn proxy_handler(
                 .await
                 {
                     Ok(Some(recording)) => {
+                        cache_outcome = CacheLogOutcome::Hit;
                         state
                             .status
                             .cache_hits_total
                             .fetch_add(1, Ordering::Relaxed);
-                        return Ok(response_from_recording(recording));
+                        respond!(None, response_from_recording(recording));
                     }
                     Ok(None) => {
+                        cache_outcome = CacheLogOutcome::Miss;
                         state
                             .status
                             .cache_misses_total
@@ -584,16 +639,19 @@ async fn proxy_handler(
         .status
         .upstream_requests_total
         .fetch_add(1, Ordering::Relaxed);
+    let upstream_started_at = Instant::now();
     let upstream_res = match state.client.request(upstream_req).await {
         Ok(res) => res,
         Err(err) => {
+            let upstream_latency = upstream_started_at.elapsed();
             tracing::debug!("upstream request failed: {err}");
-            return Ok(simple_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream request failed",
-            ));
+            respond!(
+                Some(upstream_latency),
+                simple_response(StatusCode::BAD_GATEWAY, "upstream request failed",)
+            );
         }
     };
+    let upstream_latency = upstream_started_at.elapsed();
 
     let (mut parts, body) = upstream_res.into_parts();
     strip_hop_by_hop_headers(&mut parts.headers);
@@ -603,10 +661,13 @@ async fn proxy_handler(
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
             tracing::debug!("failed to read upstream body: {err}");
-            return Ok(simple_response(
-                StatusCode::BAD_GATEWAY,
-                "failed to read upstream response body",
-            ));
+            respond!(
+                Some(upstream_latency),
+                simple_response(
+                    StatusCode::BAD_GATEWAY,
+                    "failed to read upstream response body",
+                )
+            );
         }
     };
 
@@ -635,10 +696,13 @@ async fn proxy_handler(
             Ok(ts) => ts,
             Err(err) => {
                 tracing::debug!("failed to compute recording timestamp: {err}");
-                return Ok(simple_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to persist recording",
-                ));
+                respond!(
+                    Some(upstream_latency),
+                    simple_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to persist recording",
+                    )
+                );
             }
         };
 
@@ -659,7 +723,66 @@ async fn proxy_handler(
         }
     }
 
-    Ok(Response::from_parts(parts, Full::new(body_bytes)))
+    respond!(
+        Some(upstream_latency),
+        Response::from_parts(parts, Full::new(body_bytes))
+    );
+}
+
+fn response_with_request_log(
+    method: &str,
+    url: &str,
+    route_ref: Option<&str>,
+    mode: Option<RouteMode>,
+    cache_outcome: CacheLogOutcome,
+    upstream_latency: Option<Duration>,
+    response: Response<Full<Bytes>>,
+) -> Response<Full<Bytes>> {
+    let status = response.status();
+    emit_proxy_request_log(
+        method,
+        url,
+        route_ref,
+        mode,
+        cache_outcome,
+        upstream_latency,
+        status,
+    );
+    response
+}
+
+fn emit_proxy_request_log(
+    method: &str,
+    url: &str,
+    route_ref: Option<&str>,
+    mode: Option<RouteMode>,
+    cache_outcome: CacheLogOutcome,
+    upstream_latency: Option<Duration>,
+    status: StatusCode,
+) {
+    let upstream_latency_ms = upstream_latency
+        .map(|latency| u64::try_from(latency.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+
+    tracing::info!(
+        method = method,
+        url = url,
+        route = route_ref.unwrap_or("unmatched"),
+        mode = mode_log_label(mode),
+        cache = cache_outcome.as_str(),
+        upstream_latency_ms,
+        status = status.as_u16(),
+        "proxy request completed",
+    );
+}
+
+fn mode_log_label(mode: Option<RouteMode>) -> &'static str {
+    match mode {
+        Some(RouteMode::Record) => "record",
+        Some(RouteMode::Replay) => "replay",
+        Some(RouteMode::PassthroughCache) => "passthrough-cache",
+        None => "none",
+    }
 }
 
 fn response_from_recording(recording: Recording) -> Response<Full<Bytes>> {
@@ -1038,8 +1161,18 @@ fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyRoute, format_route_ref, sanitize_match_key, select_route};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use super::{
+        CacheLogOutcome, ProxyRoute, emit_proxy_request_log, format_route_ref, mode_log_label,
+        sanitize_match_key, select_route,
+    };
     use crate::config::{CacheMissPolicy, Config, RouteConfig, RouteMode};
+    use serde_json::Value;
+    use tracing_subscriber::{filter::LevelFilter, fmt::MakeWriter};
 
     fn test_route(
         path_exact: Option<&str>,
@@ -1136,6 +1269,102 @@ upstream = "http://127.0.0.1:1"
     }
 
     #[test]
+    fn cache_log_outcome_labels_are_stable() {
+        assert_eq!(CacheLogOutcome::Hit.as_str(), "hit");
+        assert_eq!(CacheLogOutcome::Miss.as_str(), "miss");
+        assert_eq!(CacheLogOutcome::Bypass.as_str(), "bypass");
+    }
+
+    #[test]
+    fn mode_log_label_covers_all_modes() {
+        assert_eq!(mode_log_label(Some(RouteMode::Record)), "record");
+        assert_eq!(mode_log_label(Some(RouteMode::Replay)), "replay");
+        assert_eq!(
+            mode_log_label(Some(RouteMode::PassthroughCache)),
+            "passthrough-cache"
+        );
+        assert_eq!(mode_log_label(None), "none");
+    }
+
+    #[test]
+    fn emit_proxy_request_log_includes_required_fields_and_no_headers() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(LevelFilter::INFO)
+            .with_target(true)
+            .json()
+            .with_writer(writer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "proxy.request",
+                method = "GET",
+                url = "http://proxy.local/api/hello?x=1"
+            );
+            let _span_guard = span.enter();
+            emit_proxy_request_log(
+                "GET",
+                "http://proxy.local/api/hello?x=1",
+                Some("routes[0] (hello)"),
+                Some(RouteMode::PassthroughCache),
+                CacheLogOutcome::Miss,
+                Some(Duration::from_millis(17)),
+                hyper::StatusCode::OK,
+            );
+        });
+
+        let output = writer.as_string();
+        let line = output.lines().next().expect("expected one log line");
+        let log: Value = serde_json::from_str(line).expect("log line should be valid JSON");
+
+        assert_eq!(
+            log.pointer("/fields/method").and_then(Value::as_str),
+            Some("GET"),
+            "log: {log}"
+        );
+        assert_eq!(
+            log.pointer("/fields/url").and_then(Value::as_str),
+            Some("http://proxy.local/api/hello?x=1"),
+            "log: {log}"
+        );
+        assert_eq!(
+            log.pointer("/fields/route").and_then(Value::as_str),
+            Some("routes[0] (hello)"),
+            "log: {log}"
+        );
+        assert_eq!(
+            log.pointer("/fields/mode").and_then(Value::as_str),
+            Some("passthrough-cache"),
+            "log: {log}"
+        );
+        assert_eq!(
+            log.pointer("/fields/cache").and_then(Value::as_str),
+            Some("miss"),
+            "log: {log}"
+        );
+        assert_eq!(
+            log.pointer("/fields/upstream_latency_ms")
+                .and_then(Value::as_u64),
+            Some(17),
+            "log: {log}"
+        );
+        assert_eq!(
+            log.pointer("/fields/status").and_then(Value::as_u64),
+            Some(200),
+            "log: {log}"
+        );
+        assert!(
+            log.pointer("/fields/headers").is_none(),
+            "request headers should not be logged: {log}"
+        );
+        assert!(
+            log.pointer("/fields/authorization").is_none(),
+            "sensitive headers should not be logged: {log}"
+        );
+    }
+
+    #[test]
     fn format_route_ref_prefers_name_then_matcher() {
         let route = RouteConfig {
             name: Some("payments".to_owned()),
@@ -1172,5 +1401,45 @@ upstream = "http://127.0.0.1:1"
             transform: None,
         };
         assert_eq!(format_route_ref(&unnamed, 4), "routes[4] path_prefix=/api");
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn as_string(&self) -> String {
+            let bytes = self.buffer.lock().expect("buffer lock poisoned").clone();
+            String::from_utf8(bytes).expect("log output should be UTF-8")
+        }
+    }
+
+    struct LockedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> MakeWriter<'a> for SharedWriter {
+        type Writer = LockedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LockedWriter {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
+
+    impl std::io::Write for LockedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("buffer lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

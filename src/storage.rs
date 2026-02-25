@@ -8,7 +8,7 @@ use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::Config, matching};
+use crate::{config::Config, matching, session};
 
 const SCHEMA_VERSION: i32 = 2;
 const SQLITE_MAX_BIND_PARAMS: usize = 999;
@@ -115,12 +115,12 @@ impl Storage {
         let Some(storage) = config.storage.as_ref() else {
             return Ok(None);
         };
-        let session = storage
+        let session_name = storage
             .active_session
             .as_deref()
-            .unwrap_or("default")
-            .to_owned();
-        let db_path = storage.path.join(session).join("recordings.db");
+            .unwrap_or(session::DEFAULT_SESSION_NAME);
+        let db_path = session::resolve_session_db_path(&storage.path, session_name)
+            .map_err(|err| anyhow::anyhow!("resolve storage session `{session_name}`: {err}"))?;
         Ok(Some(Self::open(db_path)?))
     }
 
@@ -370,29 +370,8 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_session_name(name: &str) -> Result<(), SessionManagerError> {
-    if name.trim().is_empty() {
-        return Err(SessionManagerError::InvalidName(
-            "session name cannot be empty".to_owned(),
-        ));
-    }
-    if name != name.trim() {
-        return Err(SessionManagerError::InvalidName(
-            "session name cannot have leading or trailing whitespace".to_owned(),
-        ));
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err(SessionManagerError::InvalidName(
-            "session name cannot contain path separators".to_owned(),
-        ));
-    }
-    if name == "." || name == ".." {
-        return Err(SessionManagerError::InvalidName(
-            "session name cannot be `.` or `..`".to_owned(),
-        ));
-    }
-
-    Ok(())
+fn invalid_session_name(err: session::SessionNameError) -> SessionManagerError {
+    SessionManagerError::InvalidName(err.to_string())
 }
 
 fn list_sessions_blocking(base_path: &Path) -> Result<Vec<String>, SessionManagerError> {
@@ -424,13 +403,16 @@ fn list_sessions_blocking(base_path: &Path) -> Result<Vec<String>, SessionManage
             continue;
         }
 
-        let session_dir = entry.path();
-        let db_path = session_dir.join("recordings.db");
-        if !db_path.exists() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if session::validate_session_name(&name).is_err() {
             continue;
         }
 
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let db_path =
+            session::resolve_session_db_path(base_path, &name).map_err(invalid_session_name)?;
+        if !db_path.exists() {
+            continue;
+        }
         sessions.push(name);
     }
 
@@ -439,7 +421,10 @@ fn list_sessions_blocking(base_path: &Path) -> Result<Vec<String>, SessionManage
 }
 
 fn create_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionManagerError> {
-    validate_session_name(name)?;
+    let session_dir =
+        session::resolve_session_dir(base_path, name).map_err(invalid_session_name)?;
+    let db_path =
+        session::resolve_session_db_path(base_path, name).map_err(invalid_session_name)?;
 
     fs::create_dir_all(base_path).map_err(|err| {
         SessionManagerError::Io(format!(
@@ -448,7 +433,6 @@ fn create_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionMa
         ))
     })?;
 
-    let session_dir = base_path.join(name);
     match fs::create_dir(&session_dir) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -462,7 +446,6 @@ fn create_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionMa
         }
     }
 
-    let db_path = session_dir.join("recordings.db");
     Storage::open(db_path).map_err(|err| {
         SessionManagerError::Internal(format!("initialize session `{name}`: {err}"))
     })?;
@@ -470,9 +453,8 @@ fn create_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionMa
 }
 
 fn delete_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionManagerError> {
-    validate_session_name(name)?;
-
-    let session_dir = base_path.join(name);
+    let session_dir =
+        session::resolve_session_dir(base_path, name).map_err(invalid_session_name)?;
     if !session_dir.exists() {
         return Err(SessionManagerError::NotFound(name.to_owned()));
     }
@@ -915,7 +897,53 @@ mod tests {
     use rusqlite::params;
 
     use super::{Recording, RecordingSearch, SessionManager, SessionManagerError, Storage};
-    use crate::matching;
+    use crate::{config::Config, matching, session};
+
+    #[test]
+    fn from_config_resolves_default_session_db_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+"#,
+            temp_dir.path().display()
+        ))
+        .unwrap();
+
+        let storage = Storage::from_config(&config).unwrap().unwrap();
+        let expected_path = temp_dir
+            .path()
+            .join(session::DEFAULT_SESSION_NAME)
+            .join(session::RECORDINGS_DB_FILENAME);
+        assert_eq!(storage.db_path(), expected_path.as_path());
+    }
+
+    #[test]
+    fn from_config_rejects_unsafe_active_session_name() {
+        let mut config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+active_session = "default"
+"#,
+        )
+        .unwrap();
+        config.storage.as_mut().unwrap().active_session = Some("../prod".to_owned());
+
+        let err = Storage::from_config(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("session name cannot contain path separators"),
+            "err: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn insert_and_fetch_round_trips_binary_headers_and_bodies() {

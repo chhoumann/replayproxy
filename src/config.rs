@@ -13,6 +13,8 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json_path::JsonPath;
 
+use crate::session;
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -85,15 +87,21 @@ impl Config {
         toml.parse()
     }
 
-    pub fn apply_active_session_override(&mut self, active_session_override: Option<&str>) {
+    pub fn apply_active_session_override(
+        &mut self,
+        active_session_override: Option<&str>,
+    ) -> anyhow::Result<()> {
         let Some(active_session_override) = active_session_override else {
-            return;
+            return Ok(());
         };
         let Some(storage) = self.storage.as_mut() else {
-            return;
+            return Ok(());
         };
 
+        session::validate_session_name(active_session_override)
+            .map_err(|err| anyhow::anyhow!("invalid `--active-session`: {err}"))?;
         storage.active_session = Some(active_session_override.to_owned());
+        Ok(())
     }
 
     fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
@@ -252,10 +260,9 @@ impl StorageConfig {
     fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
         self.path = expand_tilde(&self.path)?;
 
-        if let Some(active_session) = self.active_session.as_ref()
-            && active_session.trim().is_empty()
-        {
-            bail!("`storage.active_session` cannot be empty");
+        if let Some(active_session) = self.active_session.as_ref() {
+            session::validate_session_name(active_session)
+                .map_err(|err| anyhow::anyhow!("invalid `storage.active_session`: {err}"))?;
         }
 
         Ok(())
@@ -767,10 +774,7 @@ recording_mode = "server-only"
             openai.redact.as_ref().unwrap().headers,
             vec!["Authorization"]
         );
-        assert_eq!(
-            openai.redact.as_ref().unwrap().body_json,
-            vec!["$.api_key"]
-        );
+        assert_eq!(openai.redact.as_ref().unwrap().body_json, vec!["$.api_key"]);
         assert!(openai.streaming.as_ref().unwrap().preserve_timing);
         assert_eq!(openai.rate_limit.as_ref().unwrap().requests_per_second, 10);
 
@@ -1036,7 +1040,9 @@ active_session = "from-config"
         )
         .unwrap();
 
-        config.apply_active_session_override(Some("from-cli"));
+        config
+            .apply_active_session_override(Some("from-cli"))
+            .unwrap();
 
         let storage = config.storage.as_ref().expect("storage should exist");
         assert_eq!(storage.active_session.as_deref(), Some("from-cli"));
@@ -1052,7 +1058,56 @@ listen = "127.0.0.1:0"
         )
         .unwrap();
 
-        config.apply_active_session_override(Some("from-cli"));
+        config
+            .apply_active_session_override(Some("from-cli"))
+            .unwrap();
         assert!(config.storage.is_none());
+    }
+
+    #[test]
+    fn rejects_storage_active_session_with_path_separator() {
+        let err = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+active_session = "../prod"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "invalid `storage.active_session`: session name cannot contain path separators"
+            ),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_active_session_override_rejects_invalid_name() {
+        let mut config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+active_session = "default"
+"#,
+        )
+        .unwrap();
+
+        let err = config
+            .apply_active_session_override(Some("../prod"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "invalid `--active-session`: session name cannot contain path separators"
+            ),
+            "err: {err}"
+        );
     }
 }

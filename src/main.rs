@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
             log_level,
         } => {
             let mut config = Config::load(config.as_deref())?;
-            config.apply_active_session_override(active_session.as_deref());
+            config.apply_active_session_override(active_session.as_deref())?;
             logging::init(&config, log_level.as_deref())?;
             let proxy = replayproxy::proxy::serve(&config).await?;
             eprintln!(

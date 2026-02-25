@@ -1736,6 +1736,108 @@ body_json = ["$.auth.token", "$.messages[*].content"]
 }
 
 #[tokio::test]
+async fn record_mode_redacts_configured_response_json_body_before_storage() {
+    let upstream_response_body = br#"{"id":"resp-123","usage":{"prompt_tokens":7,"completion_tokens":11},"choices":[{"message":{"role":"assistant","content":"top-secret-1"}},{"message":{"role":"assistant","content":"top-secret-2"}}],"metadata":{"trace_id":"trace-abc"}}"#;
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_with_response_chunks(vec![Bytes::from_static(upstream_response_body)]).await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.redact]
+body_json = ["$.usage.prompt_tokens", "$.choices[*].message.content"]
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/response-redaction", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], upstream_response_body);
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/response-redaction");
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let stored_response_body: Vec<u8> = conn
+        .query_row("SELECT response_body FROM recordings LIMIT 1;", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let stored_response_json: Value = serde_json::from_slice(&stored_response_body).unwrap();
+
+    assert_eq!(
+        stored_response_json
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_str),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        stored_response_json
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        stored_response_json
+            .pointer("/choices/1/message/content")
+            .and_then(Value::as_str),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        stored_response_json
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_i64),
+        Some(11)
+    );
+    assert_eq!(
+        stored_response_json
+            .pointer("/choices/0/message/role")
+            .and_then(Value::as_str),
+        Some("assistant")
+    );
+    assert_eq!(
+        stored_response_json
+            .pointer("/metadata/trace_id")
+            .and_then(Value::as_str),
+        Some("trace-abc")
+    );
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn passthrough_cache_serves_cached_response_on_second_request() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 

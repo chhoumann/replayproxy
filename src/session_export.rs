@@ -13,16 +13,11 @@ use crate::{
 
 const EXPORT_LIST_PAGE_SIZE: usize = 256;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionExportFormat {
+    #[default]
     Json,
-}
-
-impl Default for SessionExportFormat {
-    fn default() -> Self {
-        Self::Json
-    }
 }
 
 #[derive(Debug, Clone)]

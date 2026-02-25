@@ -25,7 +25,11 @@ use hyper_util::{
 use replayproxy::storage::{Recording, Storage};
 use rusqlite::Connection;
 use serde_json::Value;
-use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc,
+    time::{sleep, timeout},
+};
 
 const BINARY_HEADER_VALUE: &[u8] = b"\x80\xffok";
 const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
@@ -987,6 +991,177 @@ listen = "127.0.0.1:0"
     assert_eq!(res.status(), StatusCode::CREATED);
     let _ = res.into_body().collect().await.unwrap().to_bytes();
     let _captured = upstream_rx.recv().await.unwrap();
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn config_watcher_applies_config_updates_from_active_source_path() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("replayproxy.toml");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/v1"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let config = replayproxy::config::Config::from_path(&config_path).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/v2"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let new_route_uri: Uri = format!("http://{}/v2/watched", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    wait_for_proxy_status(
+        &client,
+        new_route_uri,
+        StatusCode::CREATED,
+        Duration::from_secs(4),
+    )
+    .await;
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/v2/watched");
+
+    let stale_route_uri: Uri = format!("http://{}/v1/stale", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(stale_route_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn config_watcher_debounces_rapid_file_changes() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("replayproxy.toml");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/v1"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let config = replayproxy::config::Config::from_path(&config_path).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/v2"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+    sleep(Duration::from_millis(20)).await;
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/v3"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let first_update_uri: Uri = format!(
+        "http://{}/v2/should-not-apply-immediately",
+        proxy.listen_addr
+    )
+    .parse()
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(first_update_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        timeout(Duration::from_millis(150), upstream_rx.recv())
+            .await
+            .is_err()
+    );
+
+    let second_update_uri: Uri = format!("http://{}/v3/debounced", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    wait_for_proxy_status(
+        &client,
+        second_update_uri,
+        StatusCode::CREATED,
+        Duration::from_secs(4),
+    )
+    .await;
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/v3/debounced");
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
@@ -3226,6 +3401,36 @@ async fn spawn_upstream_with_response_chunks(
 async fn response_json(response: Response<Incoming>) -> Value {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn wait_for_proxy_status(
+    client: &Client<HttpConnector, Full<Bytes>>,
+    uri: Uri,
+    expected_status: StatusCode,
+    timeout_window: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout_window;
+    loop {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri.clone())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let res = client.request(req).await.unwrap();
+        let status = res.status();
+        let _ = res.into_body().collect().await.unwrap().to_bytes();
+        if status == expected_status {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "timed out waiting for status {}; last status was {} for {}",
+            expected_status,
+            status,
+            uri
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn json_bytes(value: &Value) -> Vec<u8> {

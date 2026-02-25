@@ -803,18 +803,13 @@ pub enum CacheMissPolicy {
     Error,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum QueryMatchMode {
+    #[default]
     Exact,
     Subset,
     Ignore,
-}
-
-impl Default for QueryMatchMode {
-    fn default() -> Self {
-        Self::Exact
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

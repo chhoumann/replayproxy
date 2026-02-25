@@ -32,6 +32,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json_path::JsonPath;
+#[cfg(feature = "watch")]
+use tokio::sync::mpsc;
 use tokio::{
     net::TcpListener,
     sync::{Mutex as AsyncMutex, oneshot},
@@ -56,6 +58,7 @@ const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 const SUBSET_QUERY_CANDIDATE_LIMIT: usize = 4096;
 const ADMIN_RECORDINGS_DEFAULT_LIMIT: usize = 100;
 const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
+const CONFIG_WATCH_DEBOUNCE_WINDOW: Duration = Duration::from_millis(250);
 const DURATION_HISTOGRAM_BUCKETS: [(&str, u64); 12] = [
     ("0.001", 1_000),
     ("0.005", 5_000),
@@ -79,6 +82,8 @@ pub struct ProxyHandle {
     join: tokio::task::JoinHandle<()>,
     admin_shutdown_tx: Option<oneshot::Sender<()>>,
     admin_join: Option<tokio::task::JoinHandle<()>>,
+    config_watcher_shutdown_tx: Option<oneshot::Sender<()>>,
+    config_watcher_join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProxyHandle {
@@ -87,9 +92,15 @@ impl ProxyHandle {
         if let Some(admin_shutdown_tx) = self.admin_shutdown_tx {
             let _ = admin_shutdown_tx.send(());
         }
+        if let Some(config_watcher_shutdown_tx) = self.config_watcher_shutdown_tx {
+            let _ = config_watcher_shutdown_tx.send(());
+        }
         let _ = self.join.await;
         if let Some(admin_join) = self.admin_join {
             let _ = admin_join.await;
+        }
+        if let Some(config_watcher_join) = self.config_watcher_join {
+            let _ = config_watcher_join.await;
         }
     }
 }
@@ -157,6 +168,16 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
             reload_lock: AsyncMutex::new(()),
         })
     });
+    #[cfg(feature = "watch")]
+    let (config_watcher_shutdown_tx, config_watcher_join) =
+        if let Some(config_reloader) = config_reloader.as_ref() {
+            let (shutdown_tx, join) = spawn_config_watcher(Arc::clone(config_reloader))?;
+            (Some(shutdown_tx), Some(join))
+        } else {
+            (None, None)
+        };
+    #[cfg(not(feature = "watch"))]
+    let (config_watcher_shutdown_tx, config_watcher_join) = (None, None);
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
@@ -224,6 +245,8 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         join,
         admin_shutdown_tx,
         admin_join,
+        config_watcher_shutdown_tx,
+        config_watcher_join,
     })
 }
 
@@ -863,6 +886,191 @@ impl ConfigReloader {
             changed: routes_before != routes_after || max_body_bytes_before != max_body_bytes_after,
         })
     }
+}
+
+#[cfg(feature = "watch")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigWatchEventAction {
+    Continue,
+    ScheduleReload,
+    Stop,
+}
+
+#[cfg(feature = "watch")]
+fn spawn_config_watcher(
+    config_reloader: Arc<ConfigReloader>,
+) -> anyhow::Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
+    use notify::{RecursiveMode, Watcher};
+
+    let source_path = config_reloader.source_path.clone();
+    let watch_root = source_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let watched_source_path = absolute_watch_path(&source_path);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = event_tx.send(event);
+    })
+    .map_err(|err| anyhow::anyhow!("create config watcher for {}: {err}", source_path.display()))?;
+    watcher
+        .watch(&watch_root, RecursiveMode::NonRecursive)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "watch config directory {} for {}: {err}",
+                watch_root.display(),
+                source_path.display()
+            )
+        })?;
+
+    tracing::info!(
+        source = %source_path.display(),
+        watch_root = %watch_root.display(),
+        debounce_ms = CONFIG_WATCH_DEBOUNCE_WINDOW.as_millis(),
+        "config file watcher started"
+    );
+
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        let _watcher = watcher;
+        let mut debounce_deadline: Option<tokio::time::Instant> = None;
+
+        loop {
+            match debounce_deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            debounce_deadline = None;
+                            match config_reloader.reload().await {
+                                Ok(summary) => {
+                                    tracing::info!(
+                                        source = %summary.source,
+                                        routes_before = summary.routes_before,
+                                        routes_after = summary.routes_after,
+                                        max_body_bytes_before = summary.max_body_bytes_before,
+                                        max_body_bytes_after = summary.max_body_bytes_after,
+                                        changed = summary.changed,
+                                        "reloaded config after filesystem change"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        source = %config_reloader.source_path.display(),
+                                        "failed to reload config after filesystem change: {err}"
+                                    );
+                                }
+                            }
+                        }
+                        maybe_event = event_rx.recv() => {
+                            match classify_config_watch_event(maybe_event, &watched_source_path) {
+                                ConfigWatchEventAction::Continue => {}
+                                ConfigWatchEventAction::ScheduleReload => {
+                                    debounce_deadline = Some(
+                                        tokio::time::Instant::now() + CONFIG_WATCH_DEBOUNCE_WINDOW,
+                                    );
+                                }
+                                ConfigWatchEventAction::Stop => break,
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        maybe_event = event_rx.recv() => {
+                            match classify_config_watch_event(maybe_event, &watched_source_path) {
+                                ConfigWatchEventAction::Continue => {}
+                                ConfigWatchEventAction::ScheduleReload => {
+                                    debounce_deadline = Some(
+                                        tokio::time::Instant::now() + CONFIG_WATCH_DEBOUNCE_WINDOW,
+                                    );
+                                }
+                                ConfigWatchEventAction::Stop => break,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            source = %config_reloader.source_path.display(),
+            "config file watcher stopped"
+        );
+    });
+
+    Ok((shutdown_tx, join))
+}
+
+#[cfg(feature = "watch")]
+fn classify_config_watch_event(
+    maybe_event: Option<notify::Result<notify::Event>>,
+    watched_source_path: &std::path::Path,
+) -> ConfigWatchEventAction {
+    let Some(event_result) = maybe_event else {
+        return ConfigWatchEventAction::Stop;
+    };
+    let event = match event_result {
+        Ok(event) => event,
+        Err(err) => {
+            tracing::warn!(
+                source = %watched_source_path.display(),
+                "config watcher reported an error: {err}"
+            );
+            return ConfigWatchEventAction::Continue;
+        }
+    };
+
+    if !config_watch_event_kind_triggers_reload(&event.kind)
+        || !watch_event_targets_source_path(&event, watched_source_path)
+    {
+        return ConfigWatchEventAction::Continue;
+    }
+
+    tracing::debug!(
+        source = %watched_source_path.display(),
+        kind = ?event.kind,
+        paths = ?event.paths,
+        "detected relevant config filesystem change"
+    );
+
+    ConfigWatchEventAction::ScheduleReload
+}
+
+#[cfg(feature = "watch")]
+fn config_watch_event_kind_triggers_reload(kind: &notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Any
+            | notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Remove(_)
+            | notify::EventKind::Other
+    )
+}
+
+#[cfg(feature = "watch")]
+fn watch_event_targets_source_path(
+    event: &notify::Event,
+    watched_source_path: &std::path::Path,
+) -> bool {
+    event
+        .paths
+        .iter()
+        .any(|path| absolute_watch_path(path) == watched_source_path)
+}
+
+#[cfg(feature = "watch")]
+fn absolute_watch_path(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[derive(Debug)]

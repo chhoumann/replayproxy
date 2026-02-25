@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -73,6 +73,19 @@ impl Storage {
         tokio::task::spawn_blocking(move || insert_recording_blocking(&db_path, recording))
             .await
             .context("join insert_recording task")?
+    }
+
+    pub async fn get_recording_by_match_key(
+        &self,
+        match_key: &str,
+    ) -> anyhow::Result<Option<Recording>> {
+        let db_path = self.db_path.clone();
+        let match_key = match_key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            get_recording_by_match_key_blocking(&db_path, &match_key)
+        })
+        .await
+        .context("join get_recording_by_match_key task")?
     }
 
     fn init(&self) -> anyhow::Result<()> {
@@ -178,4 +191,81 @@ fn insert_recording_blocking(path: &Path, recording: Recording) -> anyhow::Resul
     .context("insert recording")?;
 
     Ok(conn.last_insert_rowid())
+}
+
+fn get_recording_by_match_key_blocking(
+    path: &Path,
+    match_key: &str,
+) -> anyhow::Result<Option<Recording>> {
+    let conn = open_connection(path)?;
+
+    let row = conn
+        .query_row(
+            r#"
+            SELECT
+              match_key,
+              request_method,
+              request_uri,
+              request_headers_json,
+              request_body,
+              response_status,
+              response_headers_json,
+              response_body,
+              created_at_unix_ms
+            FROM recordings
+            WHERE match_key = ?1
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+            params![match_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .context("select recording by match_key")?;
+
+    let Some((
+        match_key,
+        request_method,
+        request_uri,
+        request_headers_json,
+        request_body,
+        response_status,
+        response_headers_json,
+        response_body,
+        created_at_unix_ms,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let request_headers: Vec<(String, String)> =
+        serde_json::from_str(&request_headers_json).context("deserialize request headers")?;
+    let response_headers: Vec<(String, String)> =
+        serde_json::from_str(&response_headers_json).context("deserialize response headers")?;
+
+    let response_status = u16::try_from(response_status).context("deserialize response_status")?;
+
+    Ok(Some(Recording {
+        match_key,
+        request_method,
+        request_uri,
+        request_headers,
+        request_body,
+        response_status,
+        response_headers,
+        response_body,
+        created_at_unix_ms,
+    }))
 }

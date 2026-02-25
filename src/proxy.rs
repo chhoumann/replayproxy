@@ -16,7 +16,7 @@ use hyper_util::{
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
-    config::{Config, RouteMatchConfig, RouteMode},
+    config::{CacheMissPolicy, Config, RouteMatchConfig, RouteMode},
     matching,
     storage::{Recording, Storage},
 };
@@ -86,6 +86,7 @@ struct ProxyRoute {
     path_regex: Option<String>,
     upstream: Option<Uri>,
     mode: RouteMode,
+    cache_miss: CacheMissPolicy,
     match_config: Option<RouteMatchConfig>,
 }
 
@@ -112,12 +113,17 @@ impl ProxyState {
                 .mode
                 .or(config.proxy.mode)
                 .unwrap_or(RouteMode::PassthroughCache);
+            let cache_miss = route.cache_miss.unwrap_or(match mode {
+                RouteMode::Replay => CacheMissPolicy::Error,
+                RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
+            });
             parsed_routes.push(ProxyRoute {
                 path_prefix: route.path_prefix.clone(),
                 path_exact: route.path_exact.clone(),
                 path_regex: route.path_regex.clone(),
                 upstream,
                 mode,
+                cache_miss,
                 match_config: route.match_.clone(),
             });
         }
@@ -175,8 +181,6 @@ async fn proxy_handler(
         }
     };
 
-    let should_record = route.mode == RouteMode::Record && state.storage.is_some();
-
     let (mut parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -190,10 +194,7 @@ async fn proxy_handler(
     };
 
     strip_hop_by_hop_headers(&mut parts.headers);
-    let record_request_headers = should_record.then(|| header_map_to_vec(&parts.headers));
-    let record_request_uri = should_record.then(|| request_uri_for_recording(&parts.uri));
-    let record_request_method = should_record.then(|| parts.method.to_string());
-    let record_match_key = should_record.then(|| {
+    let match_key = state.storage.as_ref().map(|_| {
         matching::compute_match_key(
             route.match_config.as_ref(),
             &parts.method,
@@ -202,6 +203,58 @@ async fn proxy_handler(
             body_bytes.as_ref(),
         )
     });
+
+    let mut should_record = false;
+    match route.mode {
+        RouteMode::Record => {
+            should_record = state.storage.is_some();
+        }
+        RouteMode::Replay => {
+            let Some(storage) = state.storage.as_ref() else {
+                return Ok(simple_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage not configured",
+                ));
+            };
+            let match_key = match_key.as_deref().unwrap_or_default();
+            match storage.get_recording_by_match_key(match_key).await {
+                Ok(Some(recording)) => return Ok(response_from_recording(recording)),
+                Ok(None) => {
+                    if route.cache_miss == CacheMissPolicy::Error {
+                        return Ok(simple_response(
+                            StatusCode::BAD_GATEWAY,
+                            "Gateway Not Recorded",
+                        ));
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!("failed to lookup recording: {err}");
+                    return Ok(simple_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to lookup recording",
+                    ));
+                }
+            }
+        }
+        RouteMode::PassthroughCache => {
+            if let (Some(storage), Some(match_key)) = (state.storage.as_ref(), match_key.as_deref())
+            {
+                match storage.get_recording_by_match_key(match_key).await {
+                    Ok(Some(recording)) => return Ok(response_from_recording(recording)),
+                    Ok(None) => should_record = true,
+                    Err(err) => {
+                        tracing::debug!("failed to lookup recording: {err}");
+                        should_record = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let record_request_headers = should_record.then(|| header_map_to_vec(&parts.headers));
+    let record_request_uri = should_record.then(|| request_uri_for_recording(&parts.uri));
+    let record_request_method = should_record.then(|| parts.method.to_string());
+    let record_match_key = should_record.then(|| match_key.unwrap_or_default());
     let record_request_body = should_record.then(|| body_bytes.to_vec());
 
     parts.uri = upstream_uri.clone();
@@ -235,56 +288,81 @@ async fn proxy_handler(
         }
     };
 
-    if should_record {
-        if let (
-            Some(storage),
-            Some(match_key),
-            Some(request_method),
-            Some(request_uri),
-            Some(request_headers),
-            Some(request_body),
-            Some(response_status),
-            Some(response_headers),
-        ) = (
-            state.storage.as_ref(),
-            record_match_key,
-            record_request_method,
-            record_request_uri,
-            record_request_headers,
-            record_request_body,
-            record_response_status,
-            record_response_headers,
-        ) {
-            let created_at_unix_ms = match Recording::now_unix_ms() {
-                Ok(ts) => ts,
-                Err(err) => {
-                    tracing::debug!("failed to compute recording timestamp: {err}");
-                    return Ok(simple_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to persist recording",
-                    ));
-                }
-            };
-
-            let recording = Recording {
-                match_key,
-                request_method,
-                request_uri,
-                request_headers,
-                request_body,
-                response_status,
-                response_headers,
-                response_body: body_bytes.to_vec(),
-                created_at_unix_ms,
-            };
-
-            if let Err(err) = storage.insert_recording(recording).await {
-                tracing::debug!("failed to persist recording: {err}");
+    if let (
+        true,
+        Some(storage),
+        Some(match_key),
+        Some(request_method),
+        Some(request_uri),
+        Some(request_headers),
+        Some(request_body),
+        Some(response_status),
+        Some(response_headers),
+    ) = (
+        should_record,
+        state.storage.as_ref(),
+        record_match_key,
+        record_request_method,
+        record_request_uri,
+        record_request_headers,
+        record_request_body,
+        record_response_status,
+        record_response_headers,
+    ) {
+        let created_at_unix_ms = match Recording::now_unix_ms() {
+            Ok(ts) => ts,
+            Err(err) => {
+                tracing::debug!("failed to compute recording timestamp: {err}");
+                return Ok(simple_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to persist recording",
+                ));
             }
+        };
+
+        let recording = Recording {
+            match_key,
+            request_method,
+            request_uri,
+            request_headers,
+            request_body,
+            response_status,
+            response_headers,
+            response_body: body_bytes.to_vec(),
+            created_at_unix_ms,
+        };
+
+        if let Err(err) = storage.insert_recording(recording).await {
+            tracing::debug!("failed to persist recording: {err}");
         }
     }
 
     Ok(Response::from_parts(parts, Full::new(body_bytes)))
+}
+
+fn response_from_recording(recording: Recording) -> Response<Full<Bytes>> {
+    let body = Full::new(Bytes::from(recording.response_body));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::from_u16(recording.response_status)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    for (name, value) in recording.response_headers {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            tracing::debug!("invalid header name in recording");
+            continue;
+        };
+        let Ok(header_value) = HeaderValue::from_str(&value) else {
+            tracing::debug!(
+                "invalid header value in recording for {}",
+                header_name.as_str()
+            );
+            continue;
+        };
+        response.headers_mut().append(header_name, header_value);
+    }
+    strip_hop_by_hop_headers(response.headers_mut());
+
+    response
 }
 
 fn build_upstream_uri(upstream_base: &Uri, original: &Uri) -> anyhow::Result<Uri> {

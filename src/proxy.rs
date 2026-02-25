@@ -29,7 +29,8 @@ use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
     config::{
-        BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RouteMatchConfig, RouteMode,
+        BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RedactConfig,
+        RouteMatchConfig, RouteMode,
     },
     matching,
     storage::{Recording, SessionManager, SessionManagerError, Storage},
@@ -173,6 +174,9 @@ struct ProxyRoute {
     cache_miss: CacheMissPolicy,
     body_oversize: BodyOversizePolicy,
     match_config: Option<RouteMatchConfig>,
+    // Consumed by upcoming redaction storage steps.
+    #[allow(dead_code)]
+    redact: Option<RedactConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -373,6 +377,7 @@ impl ProxyState {
                 cache_miss,
                 body_oversize: route.body_oversize.unwrap_or(BodyOversizePolicy::Error),
                 match_config: route.match_.clone(),
+                redact: route.redact.clone(),
             });
         }
 
@@ -1365,6 +1370,7 @@ mod tests {
             cache_miss: CacheMissPolicy::Forward,
             body_oversize: BodyOversizePolicy::Error,
             match_config: None,
+            redact: None,
         }
     }
 

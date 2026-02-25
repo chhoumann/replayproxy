@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::bail;
-use hyper::Uri;
+use hyper::{Uri, header::HeaderName};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json_path::JsonPath;
@@ -111,8 +111,21 @@ impl Config {
             storage.normalize_and_validate()?;
         }
 
+        if let Some(defaults) = self.defaults.as_mut()
+            && let Some(redact) = defaults.redact.as_mut()
+        {
+            redact.normalize_and_validate(None, "defaults.redact")?;
+        }
+
+        let defaults_redact = self
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.redact.as_ref())
+            .cloned();
+
         for (idx, route) in self.routes.iter_mut().enumerate() {
             route.normalize_and_validate(idx)?;
+            route.redact = RedactConfig::merge(defaults_redact.as_ref(), route.redact.as_ref());
         }
         Ok(())
     }
@@ -308,6 +321,46 @@ pub struct RedactConfig {
     pub body_json: Vec<String>,
 }
 
+impl RedactConfig {
+    fn normalize_and_validate(
+        &mut self,
+        route_name: Option<&str>,
+        config_path: &str,
+    ) -> anyhow::Result<()> {
+        normalize_redact_headers(
+            &mut self.headers,
+            route_name,
+            &format!("{config_path}.headers"),
+        )?;
+        normalize_redact_body_json(
+            &mut self.body_json,
+            route_name,
+            &format!("{config_path}.body_json"),
+        )?;
+        Ok(())
+    }
+
+    fn merge(defaults: Option<&Self>, route: Option<&Self>) -> Option<Self> {
+        let mut headers = Vec::new();
+        let mut body_json = Vec::new();
+
+        if let Some(defaults) = defaults {
+            append_unique_header_names(&mut headers, &defaults.headers);
+            append_unique_strings(&mut body_json, &defaults.body_json);
+        }
+        if let Some(route) = route {
+            append_unique_header_names(&mut headers, &route.headers);
+            append_unique_strings(&mut body_json, &route.body_json);
+        }
+
+        if headers.is_empty() && body_json.is_empty() {
+            None
+        } else {
+            Some(Self { headers, body_json })
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
@@ -428,6 +481,10 @@ impl RouteConfig {
             }
         }
 
+        if let Some(redact) = self.redact.as_mut() {
+            redact.normalize_and_validate(Some(route_name.as_str()), "routes.redact")?;
+        }
+
         Ok(())
     }
 
@@ -504,6 +561,91 @@ fn overlapping_header_name(headers: &[String], headers_ignore: &[String]) -> Opt
             .find(|ignored| ignored.eq_ignore_ascii_case(header))
             .map(|_| header.to_ascii_lowercase())
     })
+}
+
+fn normalize_redact_headers(
+    headers: &mut Vec<String>,
+    route_name: Option<&str>,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    let mut normalized = Vec::new();
+    for header in headers.drain(..) {
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            return Err(redact_error(
+                route_name,
+                format!("`{config_path}` entries must not be empty"),
+            ));
+        }
+
+        HeaderName::from_bytes(trimmed.as_bytes()).map_err(|err| {
+            redact_error(
+                route_name,
+                format!("invalid `{config_path}` header `{trimmed}`: {err}"),
+            )
+        })?;
+
+        let canonical = trimmed.to_ascii_lowercase();
+        if !normalized.iter().any(|existing| existing == &canonical) {
+            normalized.push(canonical);
+        }
+    }
+    *headers = normalized;
+    Ok(())
+}
+
+fn normalize_redact_body_json(
+    body_json: &mut Vec<String>,
+    route_name: Option<&str>,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    let mut normalized = Vec::new();
+    for expression in body_json.drain(..) {
+        let trimmed = expression.trim();
+        if trimmed.is_empty() {
+            return Err(redact_error(
+                route_name,
+                format!("`{config_path}` entries must not be empty"),
+            ));
+        }
+
+        JsonPath::parse(trimmed).map_err(|err| {
+            redact_error(
+                route_name,
+                format!("invalid `{config_path}` expression `{trimmed}`: {err}"),
+            )
+        })?;
+
+        if !normalized.iter().any(|existing| existing == trimmed) {
+            normalized.push(trimmed.to_owned());
+        }
+    }
+    *body_json = normalized;
+    Ok(())
+}
+
+fn append_unique_header_names(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !target.iter().any(|existing| existing == value) {
+            target.push(value.clone());
+        }
+    }
+}
+
+fn append_unique_strings(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !target.iter().any(|existing| existing == value) {
+            target.push(value.clone());
+        }
+    }
+}
+
+fn redact_error(route_name: Option<&str>, message: String) -> anyhow::Error {
+    if let Some(route_name) = route_name {
+        anyhow::anyhow!("{route_name}: {message}")
+    } else {
+        anyhow::anyhow!("{message}")
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -772,13 +914,18 @@ recording_mode = "server-only"
         assert_eq!(openai.match_.as_ref().unwrap().body_json.len(), 3);
         assert_eq!(
             openai.redact.as_ref().unwrap().headers,
-            vec!["Authorization"]
+            vec!["authorization", "x-api-key", "cookie"]
         );
         assert_eq!(openai.redact.as_ref().unwrap().body_json, vec!["$.api_key"]);
         assert!(openai.streaming.as_ref().unwrap().preserve_timing);
         assert_eq!(openai.rate_limit.as_ref().unwrap().requests_per_second, 10);
 
         let anthropic = &config.routes[1];
+        assert_eq!(
+            anthropic.redact.as_ref().unwrap().headers,
+            vec!["authorization", "x-api-key", "cookie"]
+        );
+        assert!(anthropic.redact.as_ref().unwrap().body_json.is_empty());
         assert_eq!(
             anthropic.transform.as_ref().unwrap().on_request.as_deref(),
             Some("scripts/anthropic_auth.lua")
@@ -843,6 +990,72 @@ body_json = ["$["]
                 .contains("invalid `routes.match.body_json` expression"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn invalid_defaults_redact_body_json_path_fails_fast() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[defaults.redact]
+body_json = ["$["]
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid `defaults.redact.body_json` expression"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn merges_default_redaction_with_route_overrides() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[defaults.redact]
+headers = ["Authorization", "X-Api-Key"]
+body_json = ["$.api_key"]
+
+[[routes]]
+path_prefix = "/inherited"
+upstream = "https://api.example.com"
+
+[[routes]]
+path_prefix = "/override"
+upstream = "https://api.example.com"
+
+[routes.redact]
+headers = ["Cookie", "authorization"]
+body_json = ["$.token", "$.api_key"]
+"#,
+        )
+        .unwrap();
+
+        let inherited = config.routes[0]
+            .redact
+            .as_ref()
+            .expect("inherited route redaction should be present");
+        assert_eq!(inherited.headers, vec!["authorization", "x-api-key"]);
+        assert_eq!(inherited.body_json, vec!["$.api_key"]);
+
+        let override_route = config.routes[1]
+            .redact
+            .as_ref()
+            .expect("override route redaction should be present");
+        assert_eq!(
+            override_route.headers,
+            vec!["authorization", "x-api-key", "cookie"]
+        );
+        assert_eq!(override_route.body_json, vec!["$.api_key", "$.token"]);
     }
 
     #[test]

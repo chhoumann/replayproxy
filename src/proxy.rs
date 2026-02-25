@@ -55,6 +55,7 @@ const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 const REDACTION_PLACEHOLDER_BYTES: &[u8] = b"[REDACTED]";
 const SUBSET_QUERY_CANDIDATE_LIMIT: usize = 4096;
 const ADMIN_RECORDINGS_DEFAULT_LIMIT: usize = 100;
+const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
 const DURATION_HISTOGRAM_BUCKETS: [(&str, u64); 12] = [
     ("0.001", 1_000),
     ("0.005", 5_000),
@@ -101,7 +102,11 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         .local_addr()
         .map_err(|err| anyhow::anyhow!("get local_addr: {err}"))?;
     let admin_listener = if let Some(admin_port) = config.proxy.admin_port {
-        let admin_bind_addr = SocketAddr::new(config.proxy.listen.ip(), admin_port);
+        let admin_bind_ip = config
+            .proxy
+            .admin_bind_ip()
+            .expect("admin bind IP should exist when admin_port is configured");
+        let admin_bind_addr = SocketAddr::new(admin_bind_ip, admin_port);
         Some(
             TcpListener::bind(admin_bind_addr)
                 .await
@@ -184,6 +189,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
             session_runtime,
             metrics_enabled,
             config_reloader,
+            admin_api_token: config.proxy.admin_api_token.clone(),
         });
         let admin_join = tokio::spawn(async move {
             loop {
@@ -388,6 +394,7 @@ struct AdminState {
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     metrics_enabled: bool,
     config_reloader: Option<Arc<ConfigReloader>>,
+    admin_api_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2252,6 +2259,17 @@ fn parse_admin_recordings_pagination(value: &str, field_name: &str) -> Result<us
     Ok(parsed)
 }
 
+fn admin_request_authorized(req: &Request<Incoming>, expected_token: Option<&str>) -> bool {
+    let Some(expected_token) = expected_token else {
+        return true;
+    };
+
+    req.headers()
+        .get(ADMIN_API_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|provided_token| provided_token == expected_token)
+}
+
 async fn admin_handler(
     req: Request<Incoming>,
     state: Arc<AdminState>,
@@ -2262,6 +2280,12 @@ async fn admin_handler(
         .fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    if !admin_request_authorized(&req, state.admin_api_token.as_deref()) {
+        return Ok(admin_error_response(
+            StatusCode::UNAUTHORIZED,
+            format!("missing or invalid `{ADMIN_API_TOKEN_HEADER}` header for admin API access"),
+        ));
+    }
 
     if path == "/metrics" {
         if !state.metrics_enabled {

@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::OsStr,
     fs, io,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     str::FromStr,
 };
@@ -234,6 +234,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub admin_port: Option<u16>,
     #[serde(default)]
+    pub admin_bind: Option<IpAddr>,
+    #[serde(default)]
+    pub admin_api_token: Option<String>,
+    #[serde(default)]
     pub mode: Option<RouteMode>,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
@@ -245,6 +249,25 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
 fn default_max_body_bytes() -> usize {
     DEFAULT_MAX_BODY_BYTES
+}
+
+fn loopback_for_addr_family(addr: SocketAddr) -> IpAddr {
+    if addr.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    }
+}
+
+fn normalize_unspecified_to_loopback(ip: IpAddr) -> IpAddr {
+    if !ip.is_unspecified() {
+        return ip;
+    }
+
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -259,7 +282,27 @@ pub struct TlsConfig {
 }
 
 impl ProxyConfig {
+    pub fn admin_bind_ip(&self) -> Option<IpAddr> {
+        self.admin_port.map(|_| {
+            self.admin_bind
+                .unwrap_or_else(|| loopback_for_addr_family(self.listen))
+        })
+    }
+
+    pub fn admin_connect_ip(&self) -> Option<IpAddr> {
+        self.admin_bind_ip().map(normalize_unspecified_to_loopback)
+    }
+
     fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
+        if self.admin_port.is_none() {
+            if self.admin_bind.is_some() {
+                bail!("`proxy.admin_bind` requires `proxy.admin_port`");
+            }
+            if self.admin_api_token.is_some() {
+                bail!("`proxy.admin_api_token` requires `proxy.admin_port`");
+            }
+        }
+
         if let Some(admin_port) = self.admin_port
             && admin_port != 0
             && self.listen.port() != 0
@@ -273,6 +316,12 @@ impl ProxyConfig {
 
         if self.max_body_bytes == 0 {
             bail!("`proxy.max_body_bytes` must be greater than 0");
+        }
+
+        if let Some(token) = self.admin_api_token.as_ref()
+            && token.trim().is_empty()
+        {
+            bail!("`proxy.admin_api_token` must not be empty");
         }
 
         if let Some(tls) = self.tls.as_mut() {
@@ -808,6 +857,7 @@ pub enum WebSocketRecordingMode {
 mod tests {
     use std::{
         env, fs,
+        net::{IpAddr, Ipv4Addr},
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1196,6 +1246,98 @@ admin_port = 8080
         assert!(
             err.to_string()
                 .contains("`proxy.admin_port` (8080) must differ from `proxy.listen` port (8080)"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn admin_bind_defaults_to_loopback_when_admin_port_set() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "0.0.0.0:8080"
+admin_port = 8081
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.proxy.admin_bind_ip(),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            config.proxy.admin_connect_ip(),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+    }
+
+    #[test]
+    fn admin_connect_ip_uses_loopback_when_admin_bind_is_unspecified() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+admin_bind = "0.0.0.0"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.proxy.admin_bind_ip(),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(
+            config.proxy.admin_connect_ip(),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+    }
+
+    #[test]
+    fn admin_bind_requires_admin_port() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:8080"
+admin_bind = "127.0.0.1"
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`proxy.admin_bind` requires `proxy.admin_port`"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn admin_api_token_requires_admin_port() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:8080"
+admin_api_token = "secret"
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`proxy.admin_api_token` requires `proxy.admin_port`"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn admin_api_token_must_not_be_empty() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+admin_api_token = "   "
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`proxy.admin_api_token` must not be empty"),
             "err: {err}"
         );
     }

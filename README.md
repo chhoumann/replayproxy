@@ -44,6 +44,33 @@ Config discovery (if `--config` is omitted):
 - `./replayproxy.toml`
 - `~/.replayproxy/config.toml`
 
+## Admin API safety
+
+If `proxy.admin_port` is configured, the admin listener binds to loopback by default
+(`127.0.0.1` for IPv4 configs, `::1` for IPv6 configs), so admin endpoints are local-only.
+
+To expose the admin listener intentionally, set `proxy.admin_bind`:
+
+```toml
+[proxy]
+listen = "0.0.0.0:8080"
+admin_port = 8081
+admin_bind = "0.0.0.0"
+```
+
+You can also require a shared secret header on all admin endpoints:
+
+```toml
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+admin_api_token = "replace-with-strong-secret"
+```
+
+When `admin_api_token` is set, clients must send:
+- Header: `x-replayproxy-admin-token`
+- Value: exact token string from config
+
 ## Quickstart: record then replay
 
 1. Start the proxy in record mode:

@@ -17,6 +17,7 @@ use replayproxy::{
 };
 
 const DEFAULT_RECORDING_PAGE_LIMIT: usize = 100;
+const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
 
 #[derive(Debug, Parser)]
 #[command(name = "replayproxy")]
@@ -187,7 +188,11 @@ fn resolve_admin_addr_for_switch(
         );
     }
 
-    Ok(SocketAddr::new(config.proxy.listen.ip(), admin_port))
+    let admin_ip = config
+        .proxy
+        .admin_connect_ip()
+        .expect("admin connect IP should exist when admin_port is configured");
+    Ok(SocketAddr::new(admin_ip, admin_port))
 }
 
 fn encode_uri_path_segment(value: &str) -> String {
@@ -213,6 +218,7 @@ fn extract_admin_error_message(response_body: &[u8]) -> Option<String> {
 async fn switch_session_via_admin(
     admin_addr: SocketAddr,
     session_name: &str,
+    admin_api_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let uri: Uri = format!(
         "http://{admin_addr}/_admin/sessions/{}/activate",
@@ -226,9 +232,11 @@ async fn switch_session_via_admin(
     let client: Client<HttpConnector, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(connector);
 
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
+    let mut request_builder = Request::builder().method(Method::POST).uri(uri);
+    if let Some(admin_api_token) = admin_api_token {
+        request_builder = request_builder.header(ADMIN_API_TOKEN_HEADER, admin_api_token);
+    }
+    let request = request_builder
         .body(Full::new(Bytes::new()))
         .map_err(|err| anyhow::anyhow!("build admin activation request: {err}"))?;
 
@@ -295,7 +303,8 @@ async fn run_session_command(
                 .await
                 .map_err(|err| anyhow::anyhow!("{err}"))?;
             let admin_addr = resolve_admin_addr_for_switch(config, admin_addr)?;
-            switch_session_via_admin(admin_addr, &name).await?;
+            switch_session_via_admin(admin_addr, &name, config.proxy.admin_api_token.as_deref())
+                .await?;
             Ok(SessionCommandOutcome::Switched { name, admin_addr })
         }
         SessionCommand::Export { name, out } => {
@@ -607,8 +616,8 @@ mod tests {
     use super::{
         Cli, Command, RecordingCommand, RecordingCommandOutcome, SessionCommand,
         SessionCommandOutcome, encode_uri_path_segment, parse_recording_search_query,
-        redact_active_session, redact_if_present, run_recording_command, run_session_command,
-        startup_summary,
+        redact_active_session, redact_if_present, resolve_admin_addr_for_switch,
+        run_recording_command, run_session_command, startup_summary,
     };
     use clap::Parser;
     use replayproxy::{
@@ -651,6 +660,23 @@ listen = "127.0.0.1:8080"
 [proxy]
 listen = "127.0.0.1:0"
 admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "{active_session}"
+"#,
+            base_path.display()
+        ))
+        .expect("config should parse")
+    }
+
+    fn config_with_ephemeral_admin_token(base_path: &Path, active_session: &str) -> Config {
+        Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+admin_api_token = "super-secret"
 
 [storage]
 path = "{}"
@@ -847,6 +873,40 @@ active_session = "{active_session}"
                 admin_addr: Some("127.0.0.1:9090".parse().unwrap())
             }
         );
+    }
+
+    #[test]
+    fn session_switch_infers_loopback_for_unspecified_admin_bind() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "0.0.0.0:8080"
+admin_port = 9090
+admin_bind = "0.0.0.0"
+"#,
+        )
+        .expect("config should parse");
+
+        let inferred =
+            resolve_admin_addr_for_switch(&config, None).expect("admin addr should infer");
+        assert_eq!(inferred, "127.0.0.1:9090".parse().unwrap());
+    }
+
+    #[test]
+    fn session_switch_infers_explicit_admin_bind_ip() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "0.0.0.0:8080"
+admin_port = 9090
+admin_bind = "127.0.0.2"
+"#,
+        )
+        .expect("config should parse");
+
+        let inferred =
+            resolve_admin_addr_for_switch(&config, None).expect("admin addr should infer");
+        assert_eq!(inferred, "127.0.0.2:9090".parse().unwrap());
     }
 
     #[test]
@@ -1062,6 +1122,54 @@ active_session = "{active_session}"
     async fn session_switch_activates_session_via_admin_endpoint() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let config = config_with_ephemeral_admin(temp_dir.path(), "default");
+        run_session_command(
+            &config,
+            SessionCommand::Create {
+                name: "default".to_owned(),
+            },
+        )
+        .await
+        .expect("session create should succeed");
+        run_session_command(
+            &config,
+            SessionCommand::Create {
+                name: "staging".to_owned(),
+            },
+        )
+        .await
+        .expect("session create should succeed");
+
+        let proxy = replayproxy::proxy::serve(&config)
+            .await
+            .expect("proxy should start");
+        let admin_addr = proxy
+            .admin_listen_addr
+            .expect("admin listener should be running");
+
+        let switched = run_session_command(
+            &config,
+            SessionCommand::Switch {
+                name: "staging".to_owned(),
+                admin_addr: Some(admin_addr),
+            },
+        )
+        .await
+        .expect("session switch should succeed");
+        assert_eq!(
+            switched,
+            SessionCommandOutcome::Switched {
+                name: "staging".to_owned(),
+                admin_addr,
+            }
+        );
+
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_switch_uses_admin_api_token_from_config() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_ephemeral_admin_token(temp_dir.path(), "default");
         run_session_command(
             &config,
             SessionCommand::Create {

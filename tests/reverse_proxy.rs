@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     convert::Infallible,
     fs,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokio::{net::TcpListener, sync::mpsc, time::timeout};
 
 const BINARY_HEADER_VALUE: &[u8] = b"\x80\xffok";
+const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
 
 #[derive(Debug)]
 struct CapturedRequest {
@@ -586,6 +587,116 @@ admin_port = 0
     assert_eq!(body["routes_configured"].as_u64(), Some(0));
     assert_eq!(body["stats"]["admin_requests_total"].as_u64(), Some(1));
     assert_eq!(body["stats"]["proxy_requests_total"].as_u64(), Some(0));
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn serve_binds_admin_listener_to_loopback_by_default() {
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "0.0.0.0:0"
+admin_port = 0
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+    assert_eq!(admin_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn serve_uses_explicit_admin_bind_when_configured() {
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+admin_bind = "0.0.0.0"
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+    assert!(admin_addr.ip().is_unspecified());
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_token_requires_matching_header() {
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+admin_api_token = "super-secret"
+
+[metrics]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+
+    let unauth_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let unauth_res = client.request(unauth_req).await.unwrap();
+    assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+    let unauth_body = response_json(unauth_res).await;
+    assert!(
+        unauth_body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(ADMIN_API_TOKEN_HEADER))
+    );
+
+    let wrong_token_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .header(ADMIN_API_TOKEN_HEADER, "wrong")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let wrong_token_res = client.request(wrong_token_req).await.unwrap();
+    assert_eq!(wrong_token_res.status(), StatusCode::UNAUTHORIZED);
+
+    let ok_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let ok_res = client.request(ok_req).await.unwrap();
+    assert_eq!(ok_res.status(), StatusCode::OK);
+
+    let metrics_uri: Uri = format!("http://{admin_addr}/metrics").parse().unwrap();
+    let metrics_req = Request::builder()
+        .method(Method::GET)
+        .uri(metrics_uri)
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let metrics_res = client.request(metrics_req).await.unwrap();
+    assert_eq!(metrics_res.status(), StatusCode::OK);
 
     proxy.shutdown().await;
 }

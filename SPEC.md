@@ -284,7 +284,7 @@ A companion CLI (`replayproxy`) with subcommands:
 
 ## Admin HTTP API
 
-Exposed on a configurable admin port (default: proxy port + 1) under the `/_admin` path prefix:
+Exposed on a configurable admin port under the `/_admin` path prefix:
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -298,6 +298,11 @@ Exposed on a configurable admin port (default: proxy port + 1) under the `/_admi
 | `/_admin/sessions/:name/export` | POST | Export session to files |
 | `/_admin/config/reload` | POST | Trigger config reload |
 | `/_admin/status` | GET | Proxy status, uptime, active session |
+
+Security expectations:
+- When `proxy.admin_port` is configured, the admin listener binds to loopback by default.
+- Use `proxy.admin_bind` to override bind IP explicitly (for example `0.0.0.0` when intentional).
+- Use `proxy.admin_api_token` to require header `x-replayproxy-admin-token` on admin requests.
 
 ---
 
@@ -338,6 +343,8 @@ Located at `./replayproxy.toml` or `~/.replayproxy/config.toml` (with CLI `--con
 [proxy]
 listen = "127.0.0.1:8080"
 admin_port = 8081
+# admin_bind = "127.0.0.1"
+# admin_api_token = "replace-with-strong-secret"
 mode = "passthrough-cache"           # default mode for unmatched routes
 
 [proxy.tls]

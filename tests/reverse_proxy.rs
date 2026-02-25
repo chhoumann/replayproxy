@@ -449,6 +449,85 @@ mode = "passthrough-cache"
 }
 
 #[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text_when_enabled() {
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[metrics]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let metrics_uri: Uri = format!("http://{admin_addr}/metrics").parse().unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(metrics_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(body.contains("# HELP replayproxy_uptime_seconds"));
+    assert!(body.contains("# TYPE replayproxy_proxy_requests_total counter"));
+    assert!(body.contains("replayproxy_admin_requests_total 1"));
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn metrics_endpoint_returns_not_found_when_disabled() {
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let metrics_uri: Uri = format!("http://{admin_addr}/metrics").parse().unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(metrics_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_sessions_crud_endpoints_manage_sessions() {
     let storage_dir = tempfile::tempdir().unwrap();
     let config_toml = format!(

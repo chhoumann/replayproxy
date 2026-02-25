@@ -98,6 +98,10 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         admin_listen_addr,
         Arc::clone(&session_runtime),
     ));
+    let metrics_enabled = config
+        .metrics
+        .as_ref()
+        .is_some_and(|metrics| metrics.enabled);
     let session_manager = SessionManager::from_config(config)?;
 
     let mut connector = HttpConnector::new();
@@ -138,6 +142,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
             status: Arc::clone(&runtime_status),
             session_manager,
             session_runtime,
+            metrics_enabled,
         });
         let admin_join = tokio::spawn(async move {
             loop {
@@ -260,6 +265,7 @@ struct AdminState {
     status: Arc<RuntimeStatus>,
     session_manager: Option<SessionManager>,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
+    metrics_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1198,6 +1204,50 @@ fn admin_status_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
     }
 }
 
+fn admin_metrics_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
+    let snapshot = status.snapshot();
+    let body = format!(
+        concat!(
+            "# HELP replayproxy_uptime_seconds Proxy uptime in seconds.\n",
+            "# TYPE replayproxy_uptime_seconds gauge\n",
+            "replayproxy_uptime_seconds {:.3}\n",
+            "# HELP replayproxy_routes_configured Number of configured routes.\n",
+            "# TYPE replayproxy_routes_configured gauge\n",
+            "replayproxy_routes_configured {}\n",
+            "# HELP replayproxy_proxy_requests_total Total requests handled by the proxy listener.\n",
+            "# TYPE replayproxy_proxy_requests_total counter\n",
+            "replayproxy_proxy_requests_total {}\n",
+            "# HELP replayproxy_admin_requests_total Total requests handled by the admin listener.\n",
+            "# TYPE replayproxy_admin_requests_total counter\n",
+            "replayproxy_admin_requests_total {}\n",
+            "# HELP replayproxy_cache_hits_total Total cache hits served from recordings.\n",
+            "# TYPE replayproxy_cache_hits_total counter\n",
+            "replayproxy_cache_hits_total {}\n",
+            "# HELP replayproxy_cache_misses_total Total cache misses that required fallback handling.\n",
+            "# TYPE replayproxy_cache_misses_total counter\n",
+            "replayproxy_cache_misses_total {}\n",
+            "# HELP replayproxy_upstream_requests_total Total requests forwarded upstream.\n",
+            "# TYPE replayproxy_upstream_requests_total counter\n",
+            "replayproxy_upstream_requests_total {}\n",
+        ),
+        snapshot.uptime_ms as f64 / 1_000.0,
+        snapshot.routes_configured,
+        snapshot.stats.proxy_requests_total,
+        snapshot.stats.admin_requests_total,
+        snapshot.stats.cache_hits_total,
+        snapshot.stats.cache_misses_total,
+        snapshot.stats.upstream_requests_total,
+    );
+
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response
+}
+
 fn admin_error_response(status: StatusCode, message: impl Into<String>) -> Response<Full<Bytes>> {
     let payload = AdminErrorResponse {
         error: message.into(),
@@ -1264,6 +1314,19 @@ async fn admin_handler(
         .fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+
+    if path == "/metrics" {
+        if !state.metrics_enabled {
+            return Ok(simple_response(StatusCode::NOT_FOUND, "not found"));
+        }
+        if method != hyper::Method::GET {
+            return Ok(simple_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+        return Ok(admin_metrics_response(&state.status));
+    }
 
     if path == "/_admin/status" {
         if method != hyper::Method::GET {

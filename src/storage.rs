@@ -5,12 +5,14 @@ use std::{
 };
 
 use anyhow::Context as _;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::{config::Config, matching};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
+const SQLITE_MAX_BIND_PARAMS: usize = 999;
+const QUERY_SUBSET_CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMS - 1;
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -105,8 +107,13 @@ impl Storage {
         &self,
         match_key: &str,
     ) -> anyhow::Result<Option<Recording>> {
-        let recordings = self.get_recordings_by_match_key(match_key).await?;
-        Ok(recordings.into_iter().next())
+        let db_path = self.db_path.clone();
+        let match_key = match_key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            get_recording_by_match_key_blocking(&db_path, &match_key)
+        })
+        .await
+        .context("join get_recording_by_match_key task")?
     }
 
     pub async fn get_recordings_by_match_key(
@@ -122,9 +129,27 @@ impl Storage {
         .context("join get_recordings_by_match_key task")?
     }
 
+    pub async fn get_latest_recording_by_match_key_and_query_subset(
+        &self,
+        match_key: &str,
+        subset_query_normalizations: Vec<String>,
+    ) -> anyhow::Result<Option<Recording>> {
+        let db_path = self.db_path.clone();
+        let match_key = match_key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            get_latest_recording_by_match_key_and_query_subset_blocking(
+                &db_path,
+                &match_key,
+                &subset_query_normalizations,
+            )
+        })
+        .await
+        .context("join get_latest_recording_by_match_key_and_query_subset task")?
+    }
+
     fn init(&self) -> anyhow::Result<()> {
-        let conn = open_connection(&self.db_path)?;
-        migrate(&conn)?;
+        let mut conn = open_connection(&self.db_path)?;
+        migrate(&mut conn)?;
         Ok(())
     }
 }
@@ -149,48 +174,110 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
-fn migrate(conn: &Connection) -> anyhow::Result<()> {
+fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let user_version: i32 = conn
         .query_row("PRAGMA user_version;", [], |row| row.get(0))
         .context("read PRAGMA user_version")?;
 
-    if user_version == 0 {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS recordings (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              match_key TEXT NOT NULL,
-              request_method TEXT NOT NULL,
-              request_uri TEXT NOT NULL,
-              request_headers_json TEXT NOT NULL,
-              request_body BLOB NOT NULL,
-              response_status INTEGER NOT NULL,
-              response_headers_json TEXT NOT NULL,
-              response_body BLOB NOT NULL,
-              created_at_unix_ms INTEGER NOT NULL
-            );
+    match user_version {
+        0 => {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS recordings (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  match_key TEXT NOT NULL,
+                  request_method TEXT NOT NULL,
+                  request_uri TEXT NOT NULL,
+                  request_query_norm TEXT NOT NULL DEFAULT '',
+                  request_headers_json TEXT NOT NULL,
+                  request_body BLOB NOT NULL,
+                  response_status INTEGER NOT NULL,
+                  response_headers_json TEXT NOT NULL,
+                  response_body BLOB NOT NULL,
+                  created_at_unix_ms INTEGER NOT NULL
+                );
 
-            CREATE INDEX IF NOT EXISTS recordings_match_key_idx ON recordings(match_key);
+                CREATE INDEX IF NOT EXISTS recordings_match_key_idx ON recordings(match_key);
+                CREATE INDEX IF NOT EXISTS recordings_match_key_query_norm_idx
+                  ON recordings(match_key, request_query_norm, id DESC);
+                "#,
+            )
+            .context("create sqlite schema v2")?;
+
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .context("set PRAGMA user_version=2")?;
+            Ok(())
+        }
+        1 => migrate_v1_to_v2(conn),
+        SCHEMA_VERSION => Ok(()),
+        _ => anyhow::bail!(
+            "unsupported recordings.db schema version {user_version} (expected {SCHEMA_VERSION})"
+        ),
+    }
+}
+
+fn migrate_v1_to_v2(conn: &mut Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE recordings
+          ADD COLUMN request_query_norm TEXT NOT NULL DEFAULT '';
+
+        CREATE INDEX IF NOT EXISTS recordings_match_key_query_norm_idx
+          ON recordings(match_key, request_query_norm, id DESC);
+        "#,
+    )
+    .context("migrate sqlite schema v1 -> v2")?;
+
+    backfill_request_query_norm(conn)?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("set PRAGMA user_version=2")?;
+    Ok(())
+}
+
+fn backfill_request_query_norm(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, request_uri
+            FROM recordings
             "#,
         )
-        .context("create sqlite schema v1")?;
+        .context("prepare select recordings for request_query_norm backfill")?;
 
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .context("set PRAGMA user_version=1")?;
-        return Ok(());
+    let mut rows = stmt
+        .query([])
+        .context("query recordings for request_query_norm backfill")?;
+
+    let mut updates = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .context("iterate recordings for request_query_norm backfill")?
+    {
+        let id = row
+            .get::<_, i64>(0)
+            .context("deserialize id for backfill")?;
+        let request_uri = row
+            .get::<_, String>(1)
+            .context("deserialize request_uri for backfill")?;
+        updates.push((id, normalized_query_from_request_uri(&request_uri)));
     }
+    drop(rows);
+    drop(stmt);
 
-    if user_version != SCHEMA_VERSION {
-        anyhow::bail!(
-            "unsupported recordings.db schema version {user_version} (expected {SCHEMA_VERSION})"
-        );
+    for (id, query_norm) in updates {
+        conn.execute(
+            "UPDATE recordings SET request_query_norm = ?1 WHERE id = ?2",
+            params![query_norm, id],
+        )
+        .with_context(|| format!("backfill request_query_norm for recording id {id}"))?;
     }
-
     Ok(())
 }
 
 fn insert_recording_blocking(path: &Path, recording: Recording) -> anyhow::Result<i64> {
     let conn = open_connection(path)?;
+    let request_query_norm = normalized_query_from_request_uri(&recording.request_uri);
     let request_headers_json =
         serde_json::to_string(&recording.request_headers).context("serialize request headers")?;
     let response_headers_json =
@@ -202,18 +289,20 @@ fn insert_recording_blocking(path: &Path, recording: Recording) -> anyhow::Resul
           match_key,
           request_method,
           request_uri,
+          request_query_norm,
           request_headers_json,
           request_body,
           response_status,
           response_headers_json,
           response_body,
           created_at_unix_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         "#,
         params![
             recording.match_key,
             recording.request_method,
             recording.request_uri,
+            request_query_norm,
             request_headers_json,
             recording.request_body,
             i64::from(recording.response_status),
@@ -225,6 +314,180 @@ fn insert_recording_blocking(path: &Path, recording: Recording) -> anyhow::Resul
     .context("insert recording")?;
 
     Ok(conn.last_insert_rowid())
+}
+
+fn recording_query_from_uri(uri: &str) -> Option<&str> {
+    uri.split_once('?').map(|(_, query)| query)
+}
+
+fn normalized_query_from_request_uri(uri: &str) -> String {
+    matching::normalized_query(recording_query_from_uri(uri))
+}
+
+fn deserialize_recording_at(row: &rusqlite::Row<'_>, offset: usize) -> anyhow::Result<Recording> {
+    let match_key = row
+        .get::<_, String>(offset)
+        .context("deserialize match_key")?;
+    let request_method = row
+        .get::<_, String>(offset + 1)
+        .context("deserialize request_method")?;
+    let request_uri = row
+        .get::<_, String>(offset + 2)
+        .context("deserialize request_uri")?;
+    let request_headers_json = row
+        .get::<_, String>(offset + 3)
+        .context("deserialize request_headers_json")?;
+    let request_body = row
+        .get::<_, Vec<u8>>(offset + 4)
+        .context("deserialize request_body")?;
+    let response_status = row
+        .get::<_, i64>(offset + 5)
+        .context("deserialize response_status")?;
+    let response_headers_json = row
+        .get::<_, String>(offset + 6)
+        .context("deserialize response_headers_json")?;
+    let response_body = row
+        .get::<_, Vec<u8>>(offset + 7)
+        .context("deserialize response_body")?;
+    let created_at_unix_ms = row
+        .get::<_, i64>(offset + 8)
+        .context("deserialize created_at_unix_ms")?;
+
+    let request_headers = deserialize_headers(&request_headers_json, "request")?;
+    let response_headers = deserialize_headers(&response_headers_json, "response")?;
+    let response_status = u16::try_from(response_status).context("deserialize response_status")?;
+
+    Ok(Recording {
+        match_key,
+        request_method,
+        request_uri,
+        request_headers,
+        request_body,
+        response_status,
+        response_headers,
+        response_body,
+        created_at_unix_ms,
+    })
+}
+
+fn get_recording_by_match_key_blocking(
+    path: &Path,
+    match_key: &str,
+) -> anyhow::Result<Option<Recording>> {
+    let conn = open_connection(path)?;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+              match_key,
+              request_method,
+              request_uri,
+              request_headers_json,
+              request_body,
+              response_status,
+              response_headers_json,
+              response_body,
+              created_at_unix_ms
+            FROM recordings
+            WHERE match_key = ?1
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .context("prepare select latest recording by match_key")?;
+
+    let mut rows = stmt
+        .query(params![match_key])
+        .context("query latest recording by match_key")?;
+
+    let Some(row) = rows
+        .next()
+        .context("iterate latest recording by match_key")?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(deserialize_recording_at(row, 0)?))
+}
+
+fn get_latest_recording_by_match_key_and_query_subset_blocking(
+    path: &Path,
+    match_key: &str,
+    subset_query_normalizations: &[String],
+) -> anyhow::Result<Option<Recording>> {
+    if subset_query_normalizations.is_empty() {
+        return Ok(None);
+    }
+
+    let conn = open_connection(path)?;
+    let mut latest: Option<(i64, Recording)> = None;
+
+    for subset_chunk in subset_query_normalizations.chunks(QUERY_SUBSET_CHUNK_SIZE) {
+        let maybe_row = get_latest_recording_for_subset_chunk(&conn, match_key, subset_chunk)?;
+        if let Some((recording_id, recording)) = maybe_row {
+            match latest.as_ref() {
+                Some((latest_id, _)) if *latest_id >= recording_id => {}
+                _ => latest = Some((recording_id, recording)),
+            }
+        }
+    }
+
+    Ok(latest.map(|(_, recording)| recording))
+}
+
+fn get_latest_recording_for_subset_chunk(
+    conn: &Connection,
+    match_key: &str,
+    subset_chunk: &[String],
+) -> anyhow::Result<Option<(i64, Recording)>> {
+    let placeholders = (2..(subset_chunk.len() + 2))
+        .map(|idx| format!("?{idx}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let query = format!(
+        r#"
+        SELECT
+          id,
+          match_key,
+          request_method,
+          request_uri,
+          request_headers_json,
+          request_body,
+          response_status,
+          response_headers_json,
+          response_body,
+          created_at_unix_ms
+        FROM recordings
+        WHERE match_key = ?1
+          AND request_query_norm IN ({placeholders})
+        ORDER BY id DESC
+        LIMIT 1
+        "#
+    );
+
+    let mut stmt = conn
+        .prepare(&query)
+        .context("prepare select latest recording by match_key and query subset")?;
+
+    let params_iter = std::iter::once(match_key).chain(subset_chunk.iter().map(String::as_str));
+    let mut rows = stmt
+        .query(params_from_iter(params_iter))
+        .context("query latest recording by match_key and query subset")?;
+
+    let Some(row) = rows
+        .next()
+        .context("iterate latest recording by match_key and query subset")?
+    else {
+        return Ok(None);
+    };
+
+    let id = row
+        .get::<_, i64>(0)
+        .context("deserialize recording id for subset lookup")?;
+    let recording = deserialize_recording_at(row, 1)?;
+    Ok(Some((id, recording)))
 }
 
 fn get_recordings_by_match_key_blocking(
@@ -259,46 +522,7 @@ fn get_recordings_by_match_key_blocking(
 
     let mut recordings = Vec::new();
     while let Some(row) = rows.next().context("iterate recordings by match_key")? {
-        let match_key = row.get::<_, String>(0).context("deserialize match_key")?;
-        let request_method = row
-            .get::<_, String>(1)
-            .context("deserialize request_method")?;
-        let request_uri = row.get::<_, String>(2).context("deserialize request_uri")?;
-        let request_headers_json = row
-            .get::<_, String>(3)
-            .context("deserialize request_headers_json")?;
-        let request_body = row
-            .get::<_, Vec<u8>>(4)
-            .context("deserialize request_body")?;
-        let response_status = row
-            .get::<_, i64>(5)
-            .context("deserialize response_status")?;
-        let response_headers_json = row
-            .get::<_, String>(6)
-            .context("deserialize response_headers_json")?;
-        let response_body = row
-            .get::<_, Vec<u8>>(7)
-            .context("deserialize response_body")?;
-        let created_at_unix_ms = row
-            .get::<_, i64>(8)
-            .context("deserialize created_at_unix_ms")?;
-
-        let request_headers = deserialize_headers(&request_headers_json, "request")?;
-        let response_headers = deserialize_headers(&response_headers_json, "response")?;
-        let response_status =
-            u16::try_from(response_status).context("deserialize response_status")?;
-
-        recordings.push(Recording {
-            match_key,
-            request_method,
-            request_uri,
-            request_headers,
-            request_body,
-            response_status,
-            response_headers,
-            response_body,
-            created_at_unix_ms,
-        });
+        recordings.push(deserialize_recording_at(row, 0)?);
     }
 
     Ok(recordings)
@@ -309,6 +533,7 @@ mod tests {
     use rusqlite::params;
 
     use super::{Recording, Storage};
+    use crate::matching;
 
     #[tokio::test]
     async fn insert_and_fetch_round_trips_binary_headers_and_bodies() {
@@ -424,5 +649,122 @@ mod tests {
         assert_eq!(recordings.len(), 2);
         assert_eq!(recordings[0].request_uri, "/newer?a=1");
         assert_eq!(recordings[1].request_uri, "/older?a=1");
+    }
+
+    #[tokio::test]
+    async fn subset_lookup_returns_newest_matching_recording() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let mut base = Recording {
+            match_key: "same-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/api?a=1".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"older".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_uri = "/api?a=1&b=2".to_owned();
+        base.response_body = b"newer-matching".to_vec();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_uri = "/api?x=9".to_owned();
+        base.response_body = b"newest-nonmatching".to_vec();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base).await.unwrap();
+
+        let subset_query_norms =
+            matching::subset_query_candidate_normalizations(Some("a=1&b=2&c=3"));
+        let fetched = storage
+            .get_latest_recording_by_match_key_and_query_subset("same-key", subset_query_norms)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fetched.request_uri, "/api?a=1&b=2");
+        assert_eq!(&fetched.response_body[..], b"newer-matching");
+    }
+
+    #[tokio::test]
+    async fn open_migrates_v1_schema_and_backfills_query_normalization() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("recordings.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE recordings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              match_key TEXT NOT NULL,
+              request_method TEXT NOT NULL,
+              request_uri TEXT NOT NULL,
+              request_headers_json TEXT NOT NULL,
+              request_body BLOB NOT NULL,
+              response_status INTEGER NOT NULL,
+              response_headers_json TEXT NOT NULL,
+              response_body BLOB NOT NULL,
+              created_at_unix_ms INTEGER NOT NULL
+            );
+
+            CREATE INDEX recordings_match_key_idx ON recordings(match_key);
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+
+        conn.execute(
+            r#"
+            INSERT INTO recordings (
+              match_key,
+              request_method,
+              request_uri,
+              request_headers_json,
+              request_body,
+              response_status,
+              response_headers_json,
+              response_body,
+              created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                "legacy-key",
+                "GET",
+                "/api?b=2&a=1",
+                r#"[["x-request","legacy"]]"#,
+                Vec::<u8>::new(),
+                200i64,
+                r#"[["x-response","legacy"]]"#,
+                b"body".to_vec(),
+                Recording::now_unix_ms().unwrap(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = Storage::open(db_path).unwrap();
+        let conn = rusqlite::Connection::open(storage.db_path()).unwrap();
+        let query_norm: String = conn
+            .query_row(
+                "SELECT request_query_norm FROM recordings WHERE match_key = 'legacy-key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(query_norm, "a=1&b=2");
+
+        let subset_query_norms =
+            matching::subset_query_candidate_normalizations(Some("a=1&b=2&c=3"));
+        let fetched = storage
+            .get_latest_recording_by_match_key_and_query_subset("legacy-key", subset_query_norms)
+            .await
+            .unwrap();
+        assert!(fetched.is_some());
     }
 }

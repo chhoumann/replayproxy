@@ -520,19 +520,11 @@ async fn lookup_recording_for_request(
         return storage.get_recording_by_match_key(match_key).await;
     }
 
-    let request_query = request_uri.query();
-    let recordings = storage.get_recordings_by_match_key(match_key).await?;
-    Ok(recordings.into_iter().find(|recording| {
-        matching::query_params_match(
-            QueryMatchMode::Subset,
-            recording_query_from_uri(&recording.request_uri),
-            request_query,
-        )
-    }))
-}
-
-fn recording_query_from_uri(uri: &str) -> Option<&str> {
-    uri.split_once('?').map(|(_, query)| query)
+    let subset_query_normalizations =
+        matching::subset_query_candidate_normalizations(request_uri.query());
+    storage
+        .get_latest_recording_by_match_key_and_query_subset(match_key, subset_query_normalizations)
+        .await
 }
 
 fn build_upstream_uri(upstream_base: &Uri, original: &Uri) -> anyhow::Result<Uri> {

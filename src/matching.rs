@@ -194,6 +194,71 @@ fn query_params_sorted(query: Option<&str>) -> Vec<(&str, &str)> {
     out
 }
 
+fn normalized_query_from_sorted(sorted: &[(&str, &str)]) -> String {
+    let mut normalized = String::new();
+    for (idx, (name, value)) in sorted.iter().enumerate() {
+        if idx > 0 {
+            normalized.push('&');
+        }
+        normalized.push_str(name);
+        normalized.push('=');
+        normalized.push_str(value);
+    }
+    normalized
+}
+
+fn append_subset_query_candidates<'a>(
+    grouped: &[(&'a str, &'a str, usize)],
+    group_idx: usize,
+    current: &mut Vec<(&'a str, &'a str)>,
+    out: &mut Vec<String>,
+) {
+    if group_idx == grouped.len() {
+        out.push(normalized_query_from_sorted(current));
+        return;
+    }
+
+    let (name, value, count) = grouped[group_idx];
+    for selected in 0..=count {
+        for _ in 0..selected {
+            current.push((name, value));
+        }
+        append_subset_query_candidates(grouped, group_idx + 1, current, out);
+        for _ in 0..selected {
+            current.pop();
+        }
+    }
+}
+
+pub(crate) fn normalized_query(query: Option<&str>) -> String {
+    normalized_query_from_sorted(&query_params_sorted(query))
+}
+
+pub(crate) fn subset_query_candidate_normalizations(query: Option<&str>) -> Vec<String> {
+    let sorted = query_params_sorted(query);
+    if sorted.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut grouped = Vec::new();
+    for (name, value) in sorted {
+        if let Some((prev_name, prev_value, prev_count)) = grouped.last_mut()
+            && *prev_name == name
+            && *prev_value == value
+        {
+            *prev_count += 1;
+        } else {
+            grouped.push((name, value, 1usize));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    append_subset_query_candidates(&grouped, 0, &mut current, &mut out);
+    out
+}
+
+#[allow(dead_code)]
 pub(crate) fn query_params_match(
     mode: QueryMatchMode,
     recorded_query: Option<&str>,
@@ -315,7 +380,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MatchKeyError, compute_match_key, query_params_match};
+    use super::{
+        MatchKeyError, compute_match_key, normalized_query, query_params_match,
+        subset_query_candidate_normalizations,
+    };
     use crate::config::{QueryMatchMode, RouteMatchConfig};
 
     fn key(
@@ -603,6 +671,30 @@ headers_ignore = ["Date", "X-Request-Id"]
             Some("a=1&a=1"),
             Some("a=1&b=2")
         ));
+    }
+
+    #[test]
+    fn normalized_query_is_sorted_and_stable() {
+        assert_eq!(normalized_query(Some("b=2&a=1&&a")), "a=&a=1&b=2");
+        assert_eq!(normalized_query(Some("a&b=2&a=1")), "a=&a=1&b=2");
+    }
+
+    #[test]
+    fn subset_query_candidate_normalizations_cover_multiplicity() {
+        let mut actual = subset_query_candidate_normalizations(Some("b=2&a=1&a=1"));
+        actual.sort_unstable();
+
+        let mut expected = vec![
+            "".to_owned(),
+            "a=1".to_owned(),
+            "a=1&a=1".to_owned(),
+            "b=2".to_owned(),
+            "a=1&b=2".to_owned(),
+            "a=1&a=1&b=2".to_owned(),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

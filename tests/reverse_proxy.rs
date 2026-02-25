@@ -1467,6 +1467,180 @@ active_session = "{session_name}"
 }
 
 #[tokio::test]
+async fn admin_session_import_endpoint_imports_recordings_and_updates_active_stats() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session_name = "default";
+    let session_db_path =
+        replayproxy::session::resolve_session_db_path(storage_dir.path(), session_name).unwrap();
+    let storage = Storage::open(session_db_path).unwrap();
+    storage
+        .insert_recording(Recording {
+            match_key: "import-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/v1/models".to_owned(),
+            request_headers: vec![("authorization".to_owned(), b"[REDACTED]".to_vec())],
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: vec![("content-type".to_owned(), b"application/json".to_vec())],
+            response_body: br#"{"ok":true}"#.to_vec(),
+            created_at_unix_ms: 42,
+        })
+        .await
+        .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "{session_name}"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let export_dir = tempfile::tempdir().unwrap();
+    let output_dir = export_dir.path().join("session-export");
+    let export_uri: Uri = format!("http://{admin_addr}/_admin/sessions/{session_name}/export")
+        .parse()
+        .unwrap();
+    let export_payload = serde_json::json!({
+        "out_dir": output_dir.to_string_lossy(),
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(export_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&export_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let status_body = response_json(res).await;
+    assert_eq!(
+        status_body["stats"]["active_session_recordings_total"].as_u64(),
+        Some(1)
+    );
+
+    let import_uri: Uri = format!("http://{admin_addr}/_admin/sessions/{session_name}/import")
+        .parse()
+        .unwrap();
+    let import_payload = serde_json::json!({
+        "in_dir": output_dir.to_string_lossy(),
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(import_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&import_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["status"].as_str(), Some("completed"));
+    assert_eq!(body["session"].as_str(), Some(session_name));
+    assert_eq!(body["recordings_imported"].as_u64(), Some(1));
+    assert_eq!(body["format"].as_str(), Some("json"));
+    assert_eq!(
+        body["input_dir"].as_str().map(std::path::PathBuf::from),
+        Some(output_dir.clone())
+    );
+    assert_eq!(
+        body["manifest_path"].as_str().map(std::path::PathBuf::from),
+        Some(output_dir.join("index.json"))
+    );
+
+    assert_eq!(storage.count_recordings().await.unwrap(), 2);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let status_body = response_json(res).await;
+    assert_eq!(
+        status_body["stats"]["active_session_recordings_total"].as_u64(),
+        Some(2)
+    );
+
+    let missing_import_uri: Uri = format!("http://{admin_addr}/_admin/sessions/missing/import")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(missing_import_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&import_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("was not found"));
+
+    let bad_manifest_dir = export_dir.path().join("bad-manifest");
+    fs::create_dir_all(&bad_manifest_dir).unwrap();
+    fs::write(
+        bad_manifest_dir.join("index.json"),
+        br#"{"version":2,"session":"default","format":"json","exported_at_unix_ms":0,"recordings":[]}"#,
+    )
+    .unwrap();
+    let bad_import_payload = serde_json::json!({
+        "in_dir": bad_manifest_dir.to_string_lossy(),
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!(
+            "http://{admin_addr}/_admin/sessions/{session_name}/import"
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&bad_import_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported export manifest version")
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_sessions_activation_switches_active_session_and_recording_target() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 

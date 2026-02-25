@@ -13,6 +13,7 @@ use replayproxy::{
     config::Config,
     logging, session,
     session_export::{self, SessionExportFormat, SessionExportRequest, SessionExportResult},
+    session_import::{self, SessionImportRequest, SessionImportResult},
     storage::{RecordingSearch, RecordingSummary, SessionManager, Storage},
 };
 
@@ -80,6 +81,13 @@ enum SessionCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Import recordings from exported JSON files into an existing session.
+    Import {
+        name: String,
+        /// Input directory containing `index.json` and `recordings/`.
+        #[arg(long = "in")]
+        input: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -137,6 +145,9 @@ enum SessionCommandOutcome {
     },
     Exported {
         result: SessionExportResult,
+    },
+    Imported {
+        result: SessionImportResult,
     },
 }
 
@@ -320,6 +331,18 @@ async fn run_session_command(
             .map_err(|err| anyhow::anyhow!("{err}"))?;
             Ok(SessionCommandOutcome::Exported { result })
         }
+        SessionCommand::Import { name, input } => {
+            let result = session_import::import_session(
+                &session_manager,
+                SessionImportRequest {
+                    session_name: name,
+                    in_dir: input,
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+            Ok(SessionCommandOutcome::Imported { result })
+        }
     }
 }
 
@@ -473,6 +496,14 @@ fn print_session_command_outcome(outcome: SessionCommandOutcome) {
                 result.output_dir.display()
             );
         }
+        SessionCommandOutcome::Imported { result } => {
+            println!(
+                "imported session `{}`: {} recordings from {}",
+                result.session,
+                result.recordings_imported,
+                result.input_dir.display()
+            );
+        }
     }
 }
 
@@ -622,6 +653,7 @@ mod tests {
     use clap::Parser;
     use replayproxy::{
         config::Config,
+        session_export::SessionExportFormat,
         storage::{Recording, RecordingSearch, SessionManager, Storage},
     };
     use tempfile::tempdir;
@@ -932,6 +964,33 @@ admin_bind = "127.0.0.2"
             SessionCommand::Export {
                 name: "staging".to_owned(),
                 out: Some(PathBuf::from("./exports/staging")),
+            }
+        );
+    }
+
+    #[test]
+    fn session_import_parses_with_in_flag() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "session",
+            "--config",
+            "custom.toml",
+            "import",
+            "staging",
+            "--in",
+            "./exports/staging",
+        ])
+        .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Session { config, action } => (config, action),
+            other => panic!("expected session command, got {other:?}"),
+        };
+        assert_eq!(config, Some(PathBuf::from("custom.toml")));
+        assert_eq!(
+            action,
+            SessionCommand::Import {
+                name: "staging".to_owned(),
+                input: PathBuf::from("./exports/staging"),
             }
         );
     }
@@ -1335,6 +1394,92 @@ admin_bind = "127.0.0.2"
             .expect("recordings dir should exist")
             .count();
         assert_eq!(file_count, 2);
+    }
+
+    #[tokio::test]
+    async fn session_import_reads_manifest_and_inserts_recordings() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager should initialize")
+            .expect("storage should be configured");
+        manager
+            .create_session("default")
+            .await
+            .expect("default session should be created");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should be created");
+
+        let default_storage = manager
+            .open_session_storage("default")
+            .await
+            .expect("default storage should open");
+        let created_at = Recording::now_unix_ms().expect("timestamp should be available");
+        default_storage
+            .insert_recording(recording_fixture("a", "GET", "/v1/models", created_at))
+            .await
+            .expect("first insert should succeed");
+        default_storage
+            .insert_recording(recording_fixture(
+                "b",
+                "POST",
+                "/v1/chat/completions",
+                created_at + 1,
+            ))
+            .await
+            .expect("second insert should succeed");
+
+        let export_dir = temp_dir.path().join("exports").join("default");
+        run_session_command(
+            &config,
+            SessionCommand::Export {
+                name: "default".to_owned(),
+                out: Some(export_dir.clone()),
+            },
+        )
+        .await
+        .expect("session export should succeed");
+
+        let outcome = run_session_command(
+            &config,
+            SessionCommand::Import {
+                name: "staging".to_owned(),
+                input: export_dir.clone(),
+            },
+        )
+        .await
+        .expect("session import should succeed");
+        let result = match outcome {
+            SessionCommandOutcome::Imported { result } => result,
+            other => panic!("expected imported outcome, got {other:?}"),
+        };
+        assert_eq!(result.session, "staging");
+        assert_eq!(result.recordings_imported, 2);
+        assert_eq!(result.input_dir, export_dir);
+        assert_eq!(result.manifest_path, result.input_dir.join("index.json"));
+        assert_eq!(result.format, SessionExportFormat::Json);
+
+        let staging_storage = manager
+            .open_session_storage("staging")
+            .await
+            .expect("staging storage should open");
+        let summaries = staging_storage
+            .list_recordings(0, 10)
+            .await
+            .expect("imported recordings should list");
+        assert_eq!(summaries.len(), 2);
+
+        let mut imported_uris = Vec::new();
+        for summary in summaries {
+            imported_uris.push(summary.request_uri);
+        }
+        imported_uris.sort();
+        assert_eq!(
+            imported_uris,
+            vec!["/v1/chat/completions".to_owned(), "/v1/models".to_owned()]
+        );
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ use crate::{
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
+    session_import::{self, SessionImportError, SessionImportRequest},
     storage::{
         Recording, RecordingSearch, RecordingSummary, SessionManager, SessionManagerError, Storage,
     },
@@ -448,6 +449,11 @@ struct AdminSessionExportRequest {
     out_dir: Option<PathBuf>,
     #[serde(default)]
     format: Option<SessionExportFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminSessionImportRequest {
+    in_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -2158,6 +2164,16 @@ fn status_for_session_export_error(err: &SessionExportError) -> StatusCode {
     }
 }
 
+fn status_for_session_import_error(err: &SessionImportError) -> StatusCode {
+    match err {
+        SessionImportError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        SessionImportError::Session(err) => status_for_session_error(err),
+        SessionImportError::Io(_) | SessionImportError::Internal(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 fn status_for_config_reload_error(message: &str) -> StatusCode {
     if message.contains("parse config ")
         || message.contains("parse route.path_regex")
@@ -2176,6 +2192,18 @@ fn parse_admin_session_export_path(path: &str) -> Option<&str> {
         return None;
     }
     if export_suffix.is_empty() || export_suffix == "/" {
+        return Some(session_name);
+    }
+    None
+}
+
+fn parse_admin_session_import_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/_admin/sessions/")?;
+    let (session_name, import_suffix) = rest.split_once("/import")?;
+    if session_name.is_empty() || session_name.contains('/') {
+        return None;
+    }
+    if import_suffix.is_empty() || import_suffix == "/" {
         return Some(session_name);
     }
     None
@@ -2597,6 +2625,85 @@ async fn admin_handler(
             Ok(result) => Ok(admin_json_response(StatusCode::OK, &result)),
             Err(err) => Ok(admin_error_response(
                 status_for_session_export_error(&err),
+                err.to_string(),
+            )),
+        };
+    }
+
+    if let Some(session_name) = parse_admin_session_import_path(&path) {
+        if method != hyper::Method::POST {
+            return Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        let body_bytes = match req.into_body().collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(err) => {
+                return Ok(admin_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read request body: {err}"),
+                ));
+            }
+        };
+        if body_bytes.is_empty() {
+            return Ok(admin_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid JSON body: missing `in_dir`",
+            ));
+        }
+        let import_request = match serde_json::from_slice::<AdminSessionImportRequest>(&body_bytes)
+        {
+            Ok(request) => request,
+            Err(err) => {
+                return Ok(admin_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid JSON body: {err}"),
+                ));
+            }
+        };
+
+        return match session_import::import_session(
+            session_manager,
+            SessionImportRequest {
+                session_name: session_name.to_owned(),
+                in_dir: import_request.in_dir,
+            },
+        )
+        .await
+        {
+            Ok(result) => {
+                if state.status.active_session() == session_name {
+                    let active_storage = {
+                        let session_runtime = state
+                            .session_runtime
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        session_runtime.storage.clone()
+                    };
+                    if let Some(active_storage) = active_storage {
+                        match active_storage.count_recordings().await {
+                            Ok(total) => state.status.set_active_session_recordings_total(total),
+                            Err(err) => {
+                                tracing::debug!(
+                                    "failed to refresh active session recording count after import for `{session_name}`: {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(admin_json_response(StatusCode::OK, &result))
+            }
+            Err(err) => Ok(admin_error_response(
+                status_for_session_import_error(&err),
                 err.to_string(),
             )),
         };

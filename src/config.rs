@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::bail;
 use serde::Deserialize;
+use serde_json_path::JsonPath;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -252,6 +253,17 @@ impl RouteConfig {
                 "{}: one of `path_prefix`, `path_exact`, or `path_regex` is required",
                 self.display_name(idx)
             );
+        }
+
+        if let Some(route_match) = self.match_.as_ref() {
+            for expression in &route_match.body_json {
+                JsonPath::parse(expression).map_err(|err| {
+                    anyhow::anyhow!(
+                        "{}: invalid `routes.match.body_json` expression `{expression}`: {err}",
+                        self.display_name(idx)
+                    )
+                })?;
+            }
         }
 
         Ok(())
@@ -540,6 +552,27 @@ upstream = "http://127.0.0.1:1234"
         assert!(
             err.to_string()
                 .contains("one of `path_prefix`, `path_exact`, or `path_regex` is required")
+        );
+    }
+
+    #[test]
+    fn invalid_match_body_json_path_fails_fast() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+
+[routes.match]
+body_json = ["$["]
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid `routes.match.body_json` expression"),
+            "err: {err}"
         );
     }
 

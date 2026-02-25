@@ -247,15 +247,34 @@ async fn proxy_handler(
     };
 
     strip_hop_by_hop_headers(&mut parts.headers);
-    let match_key = state.storage.as_ref().map(|_| {
-        matching::compute_match_key(
+    let match_key = if state.storage.is_some() {
+        match matching::compute_match_key(
             route.match_config.as_ref(),
             &parts.method,
             &parts.uri,
             &parts.headers,
             body_bytes.as_ref(),
-        )
-    });
+        ) {
+            Ok(match_key) => Some(match_key),
+            Err(err) => {
+                tracing::debug!("failed to compute match key: {err}");
+                let (status, message) = match err {
+                    matching::MatchKeyError::InvalidJsonBody(_) => (
+                        StatusCode::BAD_REQUEST,
+                        "invalid JSON request body for matching",
+                    ),
+                    matching::MatchKeyError::InvalidJsonPath { .. }
+                    | matching::MatchKeyError::SerializeJsonNode { .. } => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "invalid route JSONPath matching configuration",
+                    ),
+                };
+                return Ok(simple_response(status, message));
+            }
+        }
+    } else {
+        None
+    };
 
     let mut should_record = false;
     match route.mode {

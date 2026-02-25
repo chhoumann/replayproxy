@@ -1,8 +1,52 @@
 use std::{borrow::Cow, collections::HashSet};
 
+use serde_json::Value;
+use serde_json_path::JsonPath;
 use sha2::{Digest as _, Sha256};
 
 use crate::config::{QueryMatchMode, RouteMatchConfig};
+
+#[derive(Debug)]
+pub enum MatchKeyError {
+    InvalidJsonBody(serde_json::Error),
+    InvalidJsonPath {
+        expression: String,
+        source: serde_json_path::ParseError,
+    },
+    SerializeJsonNode {
+        expression: String,
+        source: serde_json::Error,
+    },
+}
+
+impl std::fmt::Display for MatchKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJsonBody(source) => {
+                write!(f, "parse request body as JSON for matching: {source}")
+            }
+            Self::InvalidJsonPath { expression, source } => {
+                write!(f, "parse JSONPath expression `{expression}`: {source}")
+            }
+            Self::SerializeJsonNode { expression, source } => {
+                write!(
+                    f,
+                    "serialize JSONPath result for expression `{expression}`: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MatchKeyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidJsonBody(source) => Some(source),
+            Self::InvalidJsonPath { source, .. } => Some(source),
+            Self::SerializeJsonNode { source, .. } => Some(source),
+        }
+    }
+}
 
 /// Computes the match key used for caching/replay lookups.
 ///
@@ -21,18 +65,14 @@ use crate::config::{QueryMatchMode, RouteMatchConfig};
 ///   - `subset`: excluded from the hash; subset filtering is applied during recording lookup
 /// - `headers`: case-insensitive names, compared/serialized lowercased; values are raw bytes;
 ///   selected via allowlist and/or ignore list; sorted by name then value bytes
-/// - `body`: raw bytes as received
-///
-/// Notes:
-/// - This currently ignores `route_match.body_json` (JSONPath) until JSON field matching is
-///   implemented.
+/// - `body`: raw bytes as received (or selected JSONPath values when `body_json` is configured)
 pub fn compute_match_key(
     route_match: Option<&RouteMatchConfig>,
     method: &hyper::Method,
     uri: &hyper::Uri,
     headers: &hyper::HeaderMap,
     body: &[u8],
-) -> String {
+) -> Result<String, MatchKeyError> {
     let match_cfg = effective_match_config(route_match);
 
     let mut hasher = Sha256::new();
@@ -68,10 +108,14 @@ pub fn compute_match_key(
         }
     }
 
-    hash_tagged_bytes(&mut hasher, b"body", body);
+    if match_cfg.body_json.is_empty() {
+        hash_tagged_bytes(&mut hasher, b"body", body);
+    } else {
+        hash_json_fields(&mut hasher, &match_cfg.body_json, body)?;
+    }
 
     let digest = hasher.finalize();
-    hex_encode(&digest)
+    Ok(hex_encode(&digest))
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +126,7 @@ struct EffectiveMatchConfig {
     headers_include_lc: HashSet<String>,
     headers_ignore_lc: HashSet<String>,
     headers_enabled: bool,
+    body_json: Vec<String>,
 }
 
 fn effective_match_config(route_match: Option<&RouteMatchConfig>) -> EffectiveMatchConfig {
@@ -93,6 +138,7 @@ fn effective_match_config(route_match: Option<&RouteMatchConfig>) -> EffectiveMa
             headers_include_lc: HashSet::new(),
             headers_ignore_lc: HashSet::new(),
             headers_enabled: false,
+            body_json: Vec::new(),
         };
     };
 
@@ -116,6 +162,7 @@ fn effective_match_config(route_match: Option<&RouteMatchConfig>) -> EffectiveMa
         headers_include_lc,
         headers_ignore_lc,
         headers_enabled,
+        body_json: route_match.body_json.clone(),
     }
 }
 
@@ -208,6 +255,39 @@ fn normalized_headers_sorted(
     out
 }
 
+fn hash_json_fields(
+    hasher: &mut Sha256,
+    body_json_paths: &[String],
+    body: &[u8],
+) -> Result<(), MatchKeyError> {
+    let json: Value = serde_json::from_slice(body).map_err(MatchKeyError::InvalidJsonBody)?;
+
+    hash_len_prefixed(hasher, b"body_json");
+    hash_len_prefixed(hasher, body_json_paths.len().to_string().as_bytes());
+
+    for expression in body_json_paths {
+        let path =
+            JsonPath::parse(expression).map_err(|source| MatchKeyError::InvalidJsonPath {
+                expression: expression.clone(),
+                source,
+            })?;
+        let values = path.query(&json).all();
+
+        hash_len_prefixed(hasher, expression.as_bytes());
+        hash_len_prefixed(hasher, values.len().to_string().as_bytes());
+        for value in values {
+            let encoded =
+                serde_json::to_vec(value).map_err(|source| MatchKeyError::SerializeJsonNode {
+                    expression: expression.clone(),
+                    source,
+                })?;
+            hash_len_prefixed(hasher, &encoded);
+        }
+    }
+
+    Ok(())
+}
+
 fn hash_tagged_str(hasher: &mut Sha256, tag: &[u8], value: &str) {
     hash_tagged_bytes(hasher, tag, value.as_bytes());
 }
@@ -235,8 +315,18 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_match_key, query_params_match};
-    use crate::config::QueryMatchMode;
+    use super::{MatchKeyError, compute_match_key, query_params_match};
+    use crate::config::{QueryMatchMode, RouteMatchConfig};
+
+    fn key(
+        route_match: Option<&RouteMatchConfig>,
+        method: &hyper::Method,
+        uri: &hyper::Uri,
+        headers: &hyper::HeaderMap,
+        body: &[u8],
+    ) -> String {
+        compute_match_key(route_match, method, uri, headers, body).expect("match key should hash")
+    }
 
     #[test]
     fn match_key_ignores_authority_and_scheme() {
@@ -246,8 +336,8 @@ mod tests {
         let body = br#"{"a":1}"#;
 
         assert_eq!(
-            compute_match_key(None, &method, &a, &hyper::HeaderMap::new(), body),
-            compute_match_key(None, &method, &b, &hyper::HeaderMap::new(), body)
+            key(None, &method, &a, &hyper::HeaderMap::new(), body),
+            key(None, &method, &b, &hyper::HeaderMap::new(), body)
         );
     }
 
@@ -258,8 +348,8 @@ mod tests {
         let b: hyper::Uri = "http://example.com/api/hello?a=0&a=1&b=2".parse().unwrap();
 
         assert_eq!(
-            compute_match_key(None, &method, &a, &hyper::HeaderMap::new(), b""),
-            compute_match_key(None, &method, &b, &hyper::HeaderMap::new(), b"")
+            key(None, &method, &a, &hyper::HeaderMap::new(), b""),
+            key(None, &method, &b, &hyper::HeaderMap::new(), b"")
         );
     }
 
@@ -286,8 +376,8 @@ headers = ["X-A", "x-b"]
         b.insert("x-a", hyper::header::HeaderValue::from_static("1"));
 
         assert_eq!(
-            compute_match_key(Some(&route_match), &method, &uri, &a, b""),
-            compute_match_key(Some(&route_match), &method, &uri, &b, b"")
+            key(Some(&route_match), &method, &uri, &a, b""),
+            key(Some(&route_match), &method, &uri, &b, b"")
         );
     }
 
@@ -320,8 +410,8 @@ headers = ["X-A"]
         );
 
         assert_eq!(
-            compute_match_key(Some(&route_match), &method, &uri, &a, b""),
-            compute_match_key(Some(&route_match), &method, &uri, &b, b"")
+            key(Some(&route_match), &method, &uri, &a, b""),
+            key(Some(&route_match), &method, &uri, &b, b"")
         );
     }
 
@@ -347,8 +437,8 @@ headers = ["X-A", "X-B"]
         missing_b.insert("X-A", hyper::header::HeaderValue::from_static("1"));
 
         assert_ne!(
-            compute_match_key(Some(&route_match), &method, &uri, &with_b, b""),
-            compute_match_key(Some(&route_match), &method, &uri, &missing_b, b"")
+            key(Some(&route_match), &method, &uri, &with_b, b""),
+            key(Some(&route_match), &method, &uri, &missing_b, b"")
         );
     }
 
@@ -395,8 +485,8 @@ headers_ignore = ["Date", "X-Request-Id"]
         );
 
         assert_eq!(
-            compute_match_key(Some(&route_match), &method, &uri, &a, b""),
-            compute_match_key(Some(&route_match), &method, &uri, &b, b"")
+            key(Some(&route_match), &method, &uri, &a, b""),
+            key(Some(&route_match), &method, &uri, &b, b"")
         );
     }
 
@@ -407,8 +497,8 @@ headers_ignore = ["Date", "X-Request-Id"]
         let headers = hyper::HeaderMap::new();
 
         assert_ne!(
-            compute_match_key(None, &method, &uri, &headers, b"a"),
-            compute_match_key(None, &method, &uri, &headers, b"b")
+            key(None, &method, &uri, &headers, b"a"),
+            key(None, &method, &uri, &headers, b"b")
         );
     }
 
@@ -420,8 +510,8 @@ headers_ignore = ["Date", "X-Request-Id"]
         let b: hyper::Uri = "http://example.com/api/hello?x=2".parse().unwrap();
 
         assert_ne!(
-            compute_match_key(None, &method, &a, &headers, b""),
-            compute_match_key(None, &method, &b, &headers, b"")
+            key(None, &method, &a, &headers, b""),
+            key(None, &method, &b, &headers, b"")
         );
     }
 
@@ -436,8 +526,8 @@ headers_ignore = ["Date", "X-Request-Id"]
         let b: hyper::Uri = "http://example.com/api/hello?x=2".parse().unwrap();
 
         assert_eq!(
-            compute_match_key(Some(&route_match), &method, &a, &headers, b""),
-            compute_match_key(Some(&route_match), &method, &b, &headers, b"")
+            key(Some(&route_match), &method, &a, &headers, b""),
+            key(Some(&route_match), &method, &b, &headers, b"")
         );
     }
 
@@ -452,8 +542,8 @@ headers_ignore = ["Date", "X-Request-Id"]
         let b: hyper::Uri = "http://example.com/api/hello?x=2&y=3".parse().unwrap();
 
         assert_eq!(
-            compute_match_key(Some(&route_match), &method, &a, &headers, b""),
-            compute_match_key(Some(&route_match), &method, &b, &headers, b"")
+            key(Some(&route_match), &method, &a, &headers, b""),
+            key(Some(&route_match), &method, &b, &headers, b"")
         );
     }
 
@@ -489,8 +579,8 @@ headers_ignore = ["Date", "X-Request-Id"]
         let headers = hyper::HeaderMap::new();
 
         assert_eq!(
-            compute_match_key(Some(&route_match), &hyper::Method::GET, &uri, &headers, b""),
-            compute_match_key(
+            key(Some(&route_match), &hyper::Method::GET, &uri, &headers, b""),
+            key(
                 Some(&route_match),
                 &hyper::Method::POST,
                 &uri,
@@ -501,8 +591,94 @@ headers_ignore = ["Date", "X-Request-Id"]
     }
 
     #[test]
+    fn body_json_matching_ignores_unselected_fields() {
+        let route_match: RouteMatchConfig = toml::from_str(
+            r#"
+body_json = ["$.model", "$.messages[*].role"]
+"#,
+        )
+        .unwrap();
+
+        let method = hyper::Method::POST;
+        let uri: hyper::Uri = "http://example.com/api/hello".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+        let a = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"a"}],"temperature":0.2}"#;
+        let b = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"b"}],"temperature":0.9}"#;
+
+        assert_eq!(
+            key(Some(&route_match), &method, &uri, &headers, a),
+            key(Some(&route_match), &method, &uri, &headers, b)
+        );
+    }
+
+    #[test]
+    fn body_json_matching_tracks_nested_array_changes() {
+        let route_match: RouteMatchConfig = toml::from_str(
+            r#"
+body_json = ["$.payload.items[*].id"]
+"#,
+        )
+        .unwrap();
+
+        let method = hyper::Method::POST;
+        let uri: hyper::Uri = "http://example.com/api/hello".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+        let a = br#"{"payload":{"items":[{"id":1},{"id":2}]}}"#;
+        let b = br#"{"payload":{"items":[{"id":1},{"id":3}]}}"#;
+
+        assert_ne!(
+            key(Some(&route_match), &method, &uri, &headers, a),
+            key(Some(&route_match), &method, &uri, &headers, b)
+        );
+    }
+
+    #[test]
+    fn body_json_matching_returns_error_for_invalid_json() {
+        let route_match: RouteMatchConfig = toml::from_str(
+            r#"
+body_json = ["$.model"]
+"#,
+        )
+        .unwrap();
+
+        let err = compute_match_key(
+            Some(&route_match),
+            &hyper::Method::POST,
+            &"http://example.com/api/hello".parse().unwrap(),
+            &hyper::HeaderMap::new(),
+            br#"{"model":"gpt-4o-mini""#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, MatchKeyError::InvalidJsonBody(_)));
+        assert!(err.to_string().contains("parse request body as JSON"));
+    }
+
+    #[test]
+    fn body_json_matching_returns_error_for_invalid_jsonpath() {
+        let route_match: RouteMatchConfig = toml::from_str(
+            r#"
+body_json = ["$["]
+"#,
+        )
+        .unwrap();
+
+        let err = compute_match_key(
+            Some(&route_match),
+            &hyper::Method::POST,
+            &"http://example.com/api/hello".parse().unwrap(),
+            &hyper::HeaderMap::new(),
+            br#"{"model":"gpt-4o-mini"}"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, MatchKeyError::InvalidJsonPath { .. }));
+        assert!(err.to_string().contains("parse JSONPath expression"));
+    }
+
+    #[test]
     fn match_key_is_lowercase_hex_sha256() {
-        let key = compute_match_key(
+        let key = key(
             None,
             &hyper::Method::GET,
             &"http://example.com/api/hello?x=1".parse().unwrap(),

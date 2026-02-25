@@ -115,7 +115,8 @@ body_json = ["$.api_key"]
 Recordings are organized into **named sessions** (inspired by VCR cassettes):
 
 - Each session is an isolated collection of recordings.
-- The active session is set via config, CLI flag, or admin API.
+- Active session precedence at startup is: CLI `--active-session` override > config `storage.active_session` (or `default` if unset).
+- Admin API activation is a process-local runtime override (not persisted to config) and lasts until restart.
 - Sessions can be created, listed, switched, and deleted.
 - Use cases: separate recording sets for different test scenarios, API versions, or environments.
 
@@ -289,6 +290,7 @@ Exposed on a configurable admin port (default: proxy port + 1) under the `/_admi
 |---|---|---|
 | `/_admin/sessions` | GET | List sessions |
 | `/_admin/sessions` | POST | Create a session |
+| `/_admin/sessions/:name/activate` | POST | Activate a session for the running process (runtime only, not persisted) |
 | `/_admin/sessions/:name` | DELETE | Delete a session |
 | `/_admin/sessions/:name/recordings` | GET | List recordings (with pagination, filtering) |
 | `/_admin/sessions/:name/recordings/:id` | GET | Get a specific recording |

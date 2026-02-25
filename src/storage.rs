@@ -287,6 +287,18 @@ impl SessionManager {
                 SessionManagerError::Internal(format!("join delete session task failed: {err}"))
             })?
     }
+
+    pub async fn open_session_storage(&self, name: &str) -> Result<Storage, SessionManagerError> {
+        let base_path = self.base_path.clone();
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || open_session_storage_blocking(&base_path, &name))
+            .await
+            .map_err(|err| {
+                SessionManagerError::Internal(format!(
+                    "join open session storage task failed: {err}"
+                ))
+            })?
+    }
 }
 
 fn open_connection(path: &Path) -> anyhow::Result<Connection> {
@@ -466,6 +478,23 @@ fn delete_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionMa
         ))
     })?;
     Ok(())
+}
+
+fn open_session_storage_blocking(
+    base_path: &Path,
+    name: &str,
+) -> Result<Storage, SessionManagerError> {
+    let session_dir =
+        session::resolve_session_dir(base_path, name).map_err(invalid_session_name)?;
+    let db_path =
+        session::resolve_session_db_path(base_path, name).map_err(invalid_session_name)?;
+
+    if !session_dir.is_dir() || !db_path.exists() {
+        return Err(SessionManagerError::NotFound(name.to_owned()));
+    }
+
+    Storage::open(db_path)
+        .map_err(|err| SessionManagerError::Internal(format!("open session `{name}`: {err}")))
 }
 
 fn backfill_request_query_norm(conn: &Connection) -> anyhow::Result<()> {
@@ -1344,5 +1373,18 @@ active_session = "default"
 
         let err = manager.delete_session("missing").await.unwrap_err();
         assert_eq!(err, SessionManagerError::NotFound("missing".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn session_manager_open_session_storage_requires_existing_session() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+
+        let err = manager.open_session_storage("missing").await.unwrap_err();
+        assert_eq!(err, SessionManagerError::NotFound("missing".to_owned()));
+
+        manager.create_session("default").await.unwrap();
+        let storage = manager.open_session_storage("default").await.unwrap();
+        assert!(storage.db_path().exists());
     }
 }

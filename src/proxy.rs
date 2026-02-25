@@ -4,7 +4,7 @@ use std::{
     error::Error as StdError,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -87,7 +87,13 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         ),
         None => None,
     };
-    let runtime_status = Arc::new(RuntimeStatus::new(config, listen_addr, admin_listen_addr));
+    let session_runtime = Arc::new(RwLock::new(ActiveSessionRuntime::from_config(config)?));
+    let runtime_status = Arc::new(RuntimeStatus::new(
+        config,
+        listen_addr,
+        admin_listen_addr,
+        Arc::clone(&session_runtime),
+    ));
     let session_manager = SessionManager::from_config(config)?;
 
     let mut connector = HttpConnector::new();
@@ -98,6 +104,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         config,
         client,
         Arc::clone(&runtime_status),
+        Arc::clone(&session_runtime),
     )?);
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -126,6 +133,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         let admin_state = Arc::new(AdminState {
             status: Arc::clone(&runtime_status),
             session_manager,
+            session_runtime,
         });
         let admin_join = tokio::spawn(async move {
             loop {
@@ -209,10 +217,30 @@ impl CacheLogOutcome {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ActiveSessionRuntime {
+    active_session: String,
+    storage: Option<Storage>,
+}
+
+impl ActiveSessionRuntime {
+    fn from_config(config: &Config) -> anyhow::Result<Self> {
+        Ok(Self {
+            active_session: config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.active_session.as_deref())
+                .unwrap_or("default")
+                .to_owned(),
+            storage: Storage::from_config(config)?,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct RuntimeStatus {
     started_at: Instant,
-    active_session: String,
+    session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     routes_configured: usize,
     proxy_listen_addr: String,
     admin_listen_addr: Option<String>,
@@ -227,6 +255,7 @@ struct RuntimeStatus {
 struct AdminState {
     status: Arc<RuntimeStatus>,
     session_manager: Option<SessionManager>,
+    session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,17 +311,11 @@ impl RuntimeStatus {
         config: &Config,
         proxy_listen_addr: SocketAddr,
         admin_listen_addr: Option<SocketAddr>,
+        session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     ) -> Self {
-        let active_session = config
-            .storage
-            .as_ref()
-            .and_then(|storage| storage.active_session.as_deref())
-            .unwrap_or("default")
-            .to_owned();
-
         Self {
             started_at: Instant::now(),
-            active_session,
+            session_runtime,
             routes_configured: config.routes.len(),
             proxy_listen_addr: proxy_listen_addr.to_string(),
             admin_listen_addr: admin_listen_addr.map(|addr| addr.to_string()),
@@ -306,9 +329,13 @@ impl RuntimeStatus {
 
     fn snapshot(&self) -> AdminStatusResponse {
         let uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let session_runtime = self
+            .session_runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         AdminStatusResponse {
             uptime_ms,
-            active_session: self.active_session.clone(),
+            active_session: session_runtime.active_session.clone(),
             proxy_listen_addr: self.proxy_listen_addr.clone(),
             admin_listen_addr: self.admin_listen_addr.clone(),
             routes_configured: self.routes_configured,
@@ -322,8 +349,12 @@ impl RuntimeStatus {
         }
     }
 
-    fn active_session(&self) -> &str {
-        &self.active_session
+    fn active_session(&self) -> String {
+        self.session_runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_session
+            .clone()
     }
 }
 
@@ -331,7 +362,7 @@ impl RuntimeStatus {
 struct ProxyState {
     routes: Vec<ProxyRoute>,
     client: HttpClient,
-    storage: Option<Storage>,
+    session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     status: Arc<RuntimeStatus>,
     max_body_bytes: usize,
 }
@@ -341,6 +372,7 @@ impl ProxyState {
         config: &Config,
         client: HttpClient,
         status: Arc<RuntimeStatus>,
+        session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     ) -> anyhow::Result<Self> {
         let mut parsed_routes = Vec::with_capacity(config.routes.len());
         for (idx, route) in config.routes.iter().enumerate() {
@@ -384,7 +416,7 @@ impl ProxyState {
         Ok(Self {
             routes: parsed_routes,
             client,
-            storage: Storage::from_config(config)?,
+            session_runtime,
             status,
             max_body_bytes: config.proxy.max_body_bytes,
         })
@@ -392,6 +424,13 @@ impl ProxyState {
 
     fn route_for(&self, path: &str) -> Option<&ProxyRoute> {
         select_route(&self.routes, path)
+    }
+
+    fn active_session_snapshot(&self) -> ActiveSessionRuntime {
+        self.session_runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -635,7 +674,12 @@ async fn proxy_handler(
         }
     };
 
-    let match_key = if state.storage.is_some() {
+    let ActiveSessionRuntime {
+        active_session: active_session_name,
+        storage: active_storage,
+    } = state.active_session_snapshot();
+
+    let match_key = if active_storage.is_some() {
         match matching::compute_match_key(
             route.match_config.as_ref(),
             &parts.method,
@@ -667,10 +711,10 @@ async fn proxy_handler(
     let mut should_record = false;
     match route.mode {
         RouteMode::Record => {
-            should_record = state.storage.is_some();
+            should_record = active_storage.is_some();
         }
         RouteMode::Replay => {
-            let Some(storage) = state.storage.as_ref() else {
+            let Some(storage) = active_storage.as_ref() else {
                 respond!(
                     None,
                     proxy_simple_response(
@@ -705,7 +749,7 @@ async fn proxy_handler(
                     if route.cache_miss == CacheMissPolicy::Error {
                         respond!(
                             None,
-                            replay_miss_response(route, state.status.active_session(), match_key,)
+                            replay_miss_response(route, &active_session_name, match_key,)
                         );
                     }
                 }
@@ -722,7 +766,8 @@ async fn proxy_handler(
             }
         }
         RouteMode::PassthroughCache => {
-            if let (Some(storage), Some(match_key)) = (state.storage.as_ref(), match_key.as_deref())
+            if let (Some(storage), Some(match_key)) =
+                (active_storage.as_ref(), match_key.as_deref())
             {
                 match lookup_recording_for_request(
                     storage,
@@ -858,7 +903,7 @@ async fn proxy_handler(
         Some(response_headers),
     ) = (
         should_record,
-        state.storage.as_ref(),
+        active_storage.as_ref(),
         record_match_key,
         record_request_method,
         record_request_uri,
@@ -1233,7 +1278,7 @@ async fn admin_handler(
             hyper::Method::GET => match session_manager.list_sessions().await {
                 Ok(sessions) => {
                     let response = AdminSessionsResponse {
-                        active_session: state.status.active_session().to_owned(),
+                        active_session: state.status.active_session(),
                         sessions,
                     };
                     Ok(admin_json_response(StatusCode::OK, &response))
@@ -1285,6 +1330,48 @@ async fn admin_handler(
         };
     }
 
+    if let Some(session_name) = path
+        .strip_prefix("/_admin/sessions/")
+        .and_then(|path| path.strip_suffix("/activate"))
+    {
+        if session_name.is_empty() || session_name.contains('/') {
+            return Ok(admin_error_response(StatusCode::NOT_FOUND, "not found"));
+        }
+
+        if method != hyper::Method::POST {
+            return Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        return match session_manager.open_session_storage(session_name).await {
+            Ok(storage) => {
+                let mut session_runtime = state
+                    .session_runtime
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                session_runtime.active_session = session_name.to_owned();
+                session_runtime.storage = Some(storage);
+                let response = SessionResponse {
+                    name: session_name.to_owned(),
+                };
+                Ok(admin_json_response(StatusCode::OK, &response))
+            }
+            Err(err) => Ok(admin_error_response(
+                status_for_session_error(&err),
+                err.to_string(),
+            )),
+        };
+    }
+
     if let Some(session_name) = path.strip_prefix("/_admin/sessions/") {
         if session_name.is_empty() || session_name.contains('/') {
             return Ok(admin_error_response(StatusCode::NOT_FOUND, "not found"));
@@ -1304,7 +1391,8 @@ async fn admin_handler(
             ));
         };
 
-        if session_name == state.status.active_session() {
+        let active_session = state.status.active_session();
+        if session_name == active_session {
             return Ok(admin_error_response(
                 StatusCode::CONFLICT,
                 format!("cannot delete active session `{session_name}`"),

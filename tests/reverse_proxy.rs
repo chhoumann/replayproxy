@@ -632,6 +632,225 @@ active_session = "default"
 }
 
 #[tokio::test]
+async fn admin_sessions_activation_switches_active_session_and_recording_target() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello?x=1", proxy.listen_addr)
+        .parse()
+        .unwrap();
+
+    let sessions_uri: Uri = format!("http://{admin_addr}/_admin/sessions")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(sessions_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(br#"{"name":"staging"}"#)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let activate_uri: Uri = format!("http://{admin_addr}/_admin/sessions/staging/activate")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(activate_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["name"].as_str(), Some("staging"));
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["active_session"].as_str(), Some("staging"));
+
+    let delete_active_uri: Uri = format!("http://{admin_addr}/_admin/sessions/staging")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(delete_active_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot delete active session")
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::from_static(b"after-switch")))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    let default_db_path = storage_dir.path().join("default").join("recordings.db");
+    let default_conn = Connection::open(default_db_path).unwrap();
+    let default_count: i64 = default_conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(default_count, 0);
+
+    let staging_db_path = storage_dir.path().join("staging").join("recordings.db");
+    let staging_conn = Connection::open(staging_db_path).unwrap();
+    let staging_count: i64 = staging_conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(staging_count, 1);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_sessions_activation_returns_informative_errors() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "default"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let activate_uri: Uri = format!("http://{admin_addr}/_admin/sessions/default/activate")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(activate_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("method not allowed")
+    );
+
+    let activate_missing_uri: Uri = format!("http://{admin_addr}/_admin/sessions/missing/activate")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(activate_missing_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("was not found"));
+
+    proxy.shutdown().await;
+
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let activate_uri: Uri = format!("http://{admin_addr}/_admin/sessions/default/activate")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(activate_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("session management is unavailable")
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn record_mode_persists_recording() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 

@@ -315,6 +315,10 @@ cache_miss = "error"
 
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body_bytes[..], b"upstream-body");
 

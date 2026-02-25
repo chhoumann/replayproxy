@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use replayproxy::config::Config;
+use replayproxy::{config::Config, logging};
 
 #[derive(Debug, Parser)]
 #[command(name = "replayproxy")]
@@ -20,6 +20,9 @@ enum Command {
         /// Override the active storage session.
         #[arg(long)]
         active_session: Option<String>,
+        /// Override log level (trace, debug, info, warn, error, off).
+        #[arg(long)]
+        log_level: Option<String>,
     },
 }
 
@@ -31,9 +34,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             config,
             active_session,
+            log_level,
         } => {
             let mut config = Config::load(config.as_deref())?;
             config.apply_active_session_override(active_session.as_deref());
+            logging::init(&config, log_level.as_deref())?;
             let proxy = replayproxy::proxy::serve(&config).await?;
             eprintln!(
                 "{}",
@@ -111,9 +116,11 @@ mod tests {
         let Command::Serve {
             config,
             active_session,
+            log_level,
         } = cli.command;
         assert_eq!(config, None);
         assert_eq!(active_session, None);
+        assert_eq!(log_level, None);
     }
 
     #[test]
@@ -123,9 +130,11 @@ mod tests {
         let Command::Serve {
             config,
             active_session,
+            log_level,
         } = cli.command;
         assert_eq!(config, Some(PathBuf::from("custom.toml")));
         assert_eq!(active_session, None);
+        assert_eq!(log_level, None);
     }
 
     #[test]
@@ -135,9 +144,11 @@ mod tests {
         let Command::Serve {
             config,
             active_session,
+            log_level,
         } = cli.command;
         assert_eq!(config, None);
         assert_eq!(active_session.as_deref(), Some("staging"));
+        assert_eq!(log_level, None);
     }
 
     #[test]
@@ -154,9 +165,25 @@ mod tests {
         let Command::Serve {
             config,
             active_session,
+            log_level,
         } = cli.command;
         assert_eq!(config, Some(PathBuf::from("custom.toml")));
         assert_eq!(active_session.as_deref(), Some("staging"));
+        assert_eq!(log_level, None);
+    }
+
+    #[test]
+    fn serve_parses_with_log_level_flag() {
+        let cli = Cli::try_parse_from(["replayproxy", "serve", "--log-level", "debug"])
+            .expect("cli parse should succeed");
+        let Command::Serve {
+            config,
+            active_session,
+            log_level,
+        } = cli.command;
+        assert_eq!(config, None);
+        assert_eq!(active_session, None);
+        assert_eq!(log_level.as_deref(), Some("debug"));
     }
 
     #[test]

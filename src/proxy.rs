@@ -405,6 +405,7 @@ struct AdminRecordingsQuery {
     limit: usize,
     method: Option<String>,
     url_contains: Option<String>,
+    body_contains: Option<String>,
 }
 
 impl Default for AdminRecordingsQuery {
@@ -414,6 +415,7 @@ impl Default for AdminRecordingsQuery {
             limit: ADMIN_RECORDINGS_DEFAULT_LIMIT,
             method: None,
             url_contains: None,
+            body_contains: None,
         }
     }
 }
@@ -2081,6 +2083,10 @@ fn parse_admin_recordings_query(uri: &Uri) -> Result<AdminRecordingsQuery, Strin
                 let value = value.trim();
                 query.url_contains = (!value.is_empty()).then_some(value.to_owned());
             }
+            "body_contains" => {
+                let value = value.trim();
+                query.body_contains = (!value.is_empty()).then_some(value.to_owned());
+            }
             _ => {}
         }
     }
@@ -2301,12 +2307,16 @@ async fn admin_handler(
             }
         };
 
-        let recordings_result = if query.method.is_some() || query.url_contains.is_some() {
+        let recordings_result = if query.method.is_some()
+            || query.url_contains.is_some()
+            || query.body_contains.is_some()
+        {
             storage
                 .search_recordings(
                     RecordingSearch {
                         method: query.method.clone(),
                         url_contains: query.url_contains.clone(),
+                        body_contains: query.body_contains.clone(),
                     },
                     query.offset,
                     query.limit,

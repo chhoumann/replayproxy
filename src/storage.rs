@@ -76,6 +76,7 @@ pub struct RecordingSummary {
 pub struct RecordingSearch {
     pub method: Option<String>,
     pub url_contains: Option<String>,
+    pub body_contains: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1019,6 +1020,12 @@ fn search_recordings_blocking(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let body_contains = search
+        .body_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
 
     let mut stmt = conn
         .prepare(
@@ -1033,14 +1040,19 @@ fn search_recordings_blocking(
             FROM recordings
             WHERE (?1 IS NULL OR request_method = ?1)
               AND (?2 IS NULL OR instr(request_uri, ?2) > 0)
+              AND (
+                ?3 IS NULL
+                OR instr(CAST(request_body AS TEXT), ?3) > 0
+                OR instr(CAST(response_body AS TEXT), ?3) > 0
+              )
             ORDER BY id DESC
-            LIMIT ?3 OFFSET ?4
+            LIMIT ?4 OFFSET ?5
             "#,
         )
         .context("prepare search recordings")?;
 
     let mut rows = stmt
-        .query(params![method, url_contains, limit, offset])
+        .query(params![method, url_contains, body_contains, limit, offset])
         .context("query search recordings")?;
 
     let mut summaries = Vec::new();
@@ -1310,6 +1322,7 @@ active_session = "default"
                 RecordingSearch {
                     method: Some("POST".to_owned()),
                     url_contains: Some("/chat".to_owned()),
+                    body_contains: None,
                 },
                 0,
                 10,
@@ -1320,6 +1333,69 @@ active_session = "default"
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].request_method, "POST");
         assert_eq!(results[0].request_uri, "/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn search_recordings_filters_by_body_content_in_request_or_response() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let mut base = Recording {
+            match_key: "body-search".to_owned(),
+            request_method: "POST".to_owned(),
+            request_uri: "/v1/chat/completions".to_owned(),
+            request_headers: Vec::new(),
+            request_body: br#"{"prompt":"alpha"}"#.to_vec(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: br#"{"message":"chat-completion"}"#.to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let chat_id = storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_method = "POST".to_owned();
+        base.request_uri = "/v1/embeddings".to_owned();
+        base.request_body = br#"{"input":"vector me"}"#.to_vec();
+        base.response_body = br#"{"embedding":"[0.1,0.2]"}"#.to_vec();
+        base.created_at_unix_ms += 1;
+        let embeddings_id = storage.insert_recording(base.clone()).await.unwrap();
+
+        base.request_method = "GET".to_owned();
+        base.request_uri = "/v1/models".to_owned();
+        base.request_body = Vec::new();
+        base.response_body = br#"{"data":["model-a","model-b"]}"#.to_vec();
+        base.created_at_unix_ms += 1;
+        storage.insert_recording(base).await.unwrap();
+
+        let request_body_results = storage
+            .search_recordings(
+                RecordingSearch {
+                    method: None,
+                    url_contains: None,
+                    body_contains: Some("vector me".to_owned()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(request_body_results.len(), 1);
+        assert_eq!(request_body_results[0].id, embeddings_id);
+
+        let response_body_results = storage
+            .search_recordings(
+                RecordingSearch {
+                    method: Some("POST".to_owned()),
+                    url_contains: Some("/chat".to_owned()),
+                    body_contains: Some("chat-completion".to_owned()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_body_results.len(), 1);
+        assert_eq!(response_body_results[0].id, chat_id);
     }
 
     #[tokio::test]

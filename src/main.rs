@@ -87,9 +87,9 @@ enum RecordingCommand {
         #[arg(long, default_value_t = DEFAULT_RECORDING_PAGE_LIMIT)]
         limit: usize,
     },
-    /// Search recordings by URL substring and optional leading HTTP method token.
+    /// Search recordings by URL substring, optional leading HTTP method token, and body content.
     Search {
-        /// Query text (examples: `/chat/completions`, `POST /chat`).
+        /// Query text (examples: `/chat/completions`, `POST /chat`, `POST /chat body:gpt-4o`).
         query: String,
         /// Optional session to query. Defaults to active session from config.
         #[arg(long)]
@@ -315,25 +315,54 @@ fn is_http_method_token(value: &str) -> bool {
     )
 }
 
+fn parse_recording_body_filter(query: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
+    const BODY_FILTER_PREFIX: &str = "body:";
+
+    let body_filter_start = if query.starts_with(BODY_FILTER_PREFIX) {
+        Some(0)
+    } else {
+        query.find(" body:").map(|idx| idx + 1)
+    };
+
+    let Some(body_filter_start) = body_filter_start else {
+        return Ok(((!query.is_empty()).then_some(query.to_owned()), None));
+    };
+
+    let url_contains = query[..body_filter_start].trim();
+    let body_contains = query[(body_filter_start + BODY_FILTER_PREFIX.len())..].trim();
+    if body_contains.is_empty() {
+        bail!("body filter cannot be empty; use `body:<text>`");
+    }
+
+    Ok((
+        (!url_contains.is_empty()).then_some(url_contains.to_owned()),
+        Some(body_contains.to_owned()),
+    ))
+}
+
 fn parse_recording_search_query(query: &str) -> anyhow::Result<RecordingSearch> {
     let query = query.trim();
     if query.is_empty() {
         bail!("search query cannot be empty");
     }
 
-    let mut parts = query.split_whitespace();
-    let first = parts.next().expect("split_whitespace always yields first");
-    if is_http_method_token(first) {
-        let remaining = parts.collect::<Vec<_>>().join(" ");
+    let first_token_end = query.find(char::is_whitespace).unwrap_or(query.len());
+    let first_token = &query[..first_token_end];
+    if is_http_method_token(first_token) {
+        let remaining = query[first_token_end..].trim_start();
+        let (url_contains, body_contains) = parse_recording_body_filter(remaining)?;
         return Ok(RecordingSearch {
-            method: Some(first.to_ascii_uppercase()),
-            url_contains: (!remaining.is_empty()).then_some(remaining),
+            method: Some(first_token.to_ascii_uppercase()),
+            url_contains,
+            body_contains,
         });
     }
 
+    let (url_contains, body_contains) = parse_recording_body_filter(query)?;
     Ok(RecordingSearch {
         method: None,
-        url_contains: Some(query.to_owned()),
+        url_contains,
+        body_contains,
     })
 }
 
@@ -545,13 +574,14 @@ mod tests {
 
     use super::{
         Cli, Command, RecordingCommand, RecordingCommandOutcome, SessionCommand,
-        SessionCommandOutcome, encode_uri_path_segment, redact_active_session, redact_if_present,
-        run_recording_command, run_session_command, startup_summary,
+        SessionCommandOutcome, encode_uri_path_segment, parse_recording_search_query,
+        redact_active_session, redact_if_present, run_recording_command, run_session_command,
+        startup_summary,
     };
     use clap::Parser;
     use replayproxy::{
         config::Config,
-        storage::{Recording, SessionManager, Storage},
+        storage::{Recording, RecordingSearch, SessionManager, Storage},
     };
     use tempfile::tempdir;
 
@@ -870,6 +900,47 @@ active_session = "{active_session}"
         );
     }
 
+    #[test]
+    fn recording_search_query_parser_supports_body_filter_syntax() {
+        assert_eq!(
+            parse_recording_search_query("POST /chat body:gpt-4o-mini").unwrap(),
+            RecordingSearch {
+                method: Some("POST".to_owned()),
+                url_contains: Some("/chat".to_owned()),
+                body_contains: Some("gpt-4o-mini".to_owned()),
+            }
+        );
+
+        assert_eq!(
+            parse_recording_search_query("body:assistant response text").unwrap(),
+            RecordingSearch {
+                method: None,
+                url_contains: None,
+                body_contains: Some("assistant response text".to_owned()),
+            }
+        );
+
+        assert_eq!(
+            parse_recording_search_query("GET").unwrap(),
+            RecordingSearch {
+                method: Some("GET".to_owned()),
+                url_contains: None,
+                body_contains: None,
+            }
+        );
+    }
+
+    #[test]
+    fn recording_search_query_parser_rejects_empty_body_filter() {
+        let err = parse_recording_search_query("POST /chat body:")
+            .expect_err("empty body filter should fail");
+        assert!(
+            err.to_string()
+                .contains("body filter cannot be empty; use `body:<text>`"),
+            "error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn session_create_list_delete_round_trip() {
         let temp_dir = tempdir().expect("tempdir should be created");
@@ -1117,6 +1188,29 @@ active_session = "{active_session}"
                 assert_eq!(recordings[0].id, second_id);
                 assert_eq!(recordings[0].request_method, "POST");
                 assert_eq!(recordings[0].request_uri, "/v1/chat/completions");
+            }
+            other => panic!("expected searched outcome, got {other:?}"),
+        }
+
+        let searched_by_body = run_recording_command(
+            &config,
+            RecordingCommand::Search {
+                query: "body:response:/v1/chat/completions".to_owned(),
+                session: None,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("recording body search should succeed");
+        match searched_by_body {
+            RecordingCommandOutcome::Searched {
+                session,
+                recordings,
+            } => {
+                assert_eq!(session, "default");
+                assert_eq!(recordings.len(), 1);
+                assert_eq!(recordings[0].id, second_id);
             }
             other => panic!("expected searched outcome, got {other:?}"),
         }

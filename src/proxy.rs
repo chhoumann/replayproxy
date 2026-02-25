@@ -27,14 +27,23 @@ type HttpClient = Client<HttpConnector, Full<Bytes>>;
 #[derive(Debug)]
 pub struct ProxyHandle {
     pub listen_addr: SocketAddr,
+    pub admin_listen_addr: Option<SocketAddr>,
     shutdown_tx: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
+    admin_shutdown_tx: Option<oneshot::Sender<()>>,
+    admin_join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProxyHandle {
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
+        if let Some(admin_shutdown_tx) = self.admin_shutdown_tx {
+            let _ = admin_shutdown_tx.send(());
+        }
         let _ = self.join.await;
+        if let Some(admin_join) = self.admin_join {
+            let _ = admin_join.await;
+        }
     }
 }
 
@@ -45,6 +54,24 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let listen_addr = listener
         .local_addr()
         .map_err(|err| anyhow::anyhow!("get local_addr: {err}"))?;
+    let admin_listener = if let Some(admin_port) = config.proxy.admin_port {
+        let admin_bind_addr = SocketAddr::new(config.proxy.listen.ip(), admin_port);
+        Some(
+            TcpListener::bind(admin_bind_addr)
+                .await
+                .map_err(|err| anyhow::anyhow!("bind admin {admin_bind_addr}: {err}"))?,
+        )
+    } else {
+        None
+    };
+    let admin_listen_addr = match admin_listener.as_ref() {
+        Some(admin_listener) => Some(
+            admin_listener
+                .local_addr()
+                .map_err(|err| anyhow::anyhow!("get admin local_addr: {err}"))?,
+        ),
+        None => None,
+    };
 
     let mut connector = HttpConnector::new();
     connector.enforce_http(false);
@@ -73,10 +100,38 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         }
     });
 
+    let (admin_shutdown_tx, admin_join) = if let Some(admin_listener) = admin_listener {
+        let (admin_shutdown_tx, mut admin_shutdown_rx) = oneshot::channel::<()>();
+        let admin_join = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut admin_shutdown_rx => break,
+                    accept = admin_listener.accept() => {
+                        let Ok((stream, _peer)) = accept else { continue };
+                        let io = TokioIo::new(stream);
+                        tokio::spawn(async move {
+                            let service = service_fn(admin_handler);
+                            let builder = ConnectionBuilder::new(TokioExecutor::new());
+                            if let Err(err) = builder.serve_connection(io, service).await {
+                                tracing::debug!("admin connection error: {err}");
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        (Some(admin_shutdown_tx), Some(admin_join))
+    } else {
+        (None, None)
+    };
+
     Ok(ProxyHandle {
         listen_addr,
+        admin_listen_addr,
         shutdown_tx,
         join,
+        admin_shutdown_tx,
+        admin_join,
     })
 }
 
@@ -537,6 +592,13 @@ fn simple_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response
+}
+
+async fn admin_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.uri().path() == "/_admin/status" {
+        return Ok(simple_response(StatusCode::OK, "ok"));
+    }
+    Ok(simple_response(StatusCode::NOT_FOUND, "not found"))
 }
 
 fn request_uri_for_recording(uri: &Uri) -> String {

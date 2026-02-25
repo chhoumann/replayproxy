@@ -83,6 +83,17 @@ impl Config {
         toml.parse()
     }
 
+    pub fn apply_active_session_override(&mut self, active_session_override: Option<&str>) {
+        let Some(active_session_override) = active_session_override else {
+            return;
+        };
+        let Some(storage) = self.storage.as_mut() else {
+            return;
+        };
+
+        storage.active_session = Some(active_session_override.to_owned());
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         for (idx, route) in self.routes.iter().enumerate() {
             route.validate(idx)?;
@@ -624,5 +635,39 @@ body_json = ["$["]
                 .contains(&missing_path.display().to_string()),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn apply_active_session_override_updates_storage_session() {
+        let mut config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+active_session = "from-config"
+"#,
+        )
+        .unwrap();
+
+        config.apply_active_session_override(Some("from-cli"));
+
+        let storage = config.storage.as_ref().expect("storage should exist");
+        assert_eq!(storage.active_session.as_deref(), Some("from-cli"));
+    }
+
+    #[test]
+    fn apply_active_session_override_is_noop_without_storage() {
+        let mut config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+"#,
+        )
+        .unwrap();
+
+        config.apply_active_session_override(Some("from-cli"));
+        assert!(config.storage.is_none());
     }
 }

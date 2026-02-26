@@ -1,0 +1,100 @@
+name: Validate Release Artifacts
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to validate (for example: v1.2.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          if [ -z "${tag}" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          if [ -z "${tag}" ]; then
+            echo "release tag is required"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.meta.outputs.tag }}"
+          target="${{ matrix.target }}"
+          mkdir -p dist
+          gh release download "${tag}" \
+            --pattern "SHA256SUMS" \
+            --pattern "replayproxy-${tag}-${target}.tar.gz" \
+            --dir dist
+
+      - name: Verify target checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          artifact="replayproxy-${{ steps.meta.outputs.tag }}-${{ matrix.target }}.tar.gz"
+          expected="$(awk -v name="${artifact}" '$2 == name {print $1}' SHA256SUMS)"
+          if [ -z "${expected}" ]; then
+            echo "missing checksum entry for ${artifact}"
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "${artifact}" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "${artifact}" | awk '{print $1}')"
+          fi
+          if [ "${expected}" != "${actual}" ]; then
+            echo "checksum mismatch for ${artifact}"
+            echo "expected=${expected}"
+            echo "actual=${actual}"
+            exit 1
+          fi
+
+      - name: Smoke test artifact binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="dist/replayproxy-${{ steps.meta.outputs.tag }}-${{ matrix.target }}.tar.gz"
+          mkdir -p smoke
+          tar -xzf "${artifact}" -C smoke
+          chmod +x smoke/replayproxy
+          smoke/replayproxy --version
+          smoke/replayproxy --help >/dev/null
+          smoke/replayproxy serve --help >/dev/null

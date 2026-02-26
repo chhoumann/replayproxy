@@ -57,7 +57,7 @@ use crate::{
     ca,
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RateLimitConfig, RedactConfig,
-        RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig,
+        RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig, WebSocketConfig,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
@@ -445,6 +445,7 @@ struct ProxyRoute {
     body_oversize: BodyOversizePolicy,
     match_config: Option<RouteMatchConfig>,
     streaming: Option<StreamingConfig>,
+    websocket: Option<WebSocketConfig>,
     rate_limit: Option<RouteRateLimit>,
     // Consumed by upcoming redaction storage steps.
     #[allow(dead_code)]
@@ -678,6 +679,7 @@ impl ProxyRuntimeConfig {
                 body_oversize: route.body_oversize.unwrap_or(BodyOversizePolicy::Error),
                 match_config: route.match_.clone(),
                 streaming: route.streaming.clone(),
+                websocket: route.websocket.clone(),
                 rate_limit: route.rate_limit.as_ref().map(RouteRateLimit::from_config),
                 redact: route.redact.clone(),
                 transform: load_route_transform_scripts(
@@ -2209,6 +2211,104 @@ async fn proxy_handler(
         }
     }
 
+    if route.websocket.is_some() && is_websocket_upgrade_request(&req) {
+        if route.mode == RouteMode::Replay {
+            respond!(
+                None,
+                proxy_simple_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "websocket replay mode is not implemented",
+                )
+            );
+        }
+
+        let upstream_uri = match resolve_upstream_uri_for_request(&route, req.uri()) {
+            Ok(Some(uri)) => uri,
+            Ok(None) => {
+                respond!(
+                    None,
+                    proxy_simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
+                );
+            }
+            Err(err) => {
+                tracing::debug!("failed to build websocket upstream uri: {err}");
+                respond!(
+                    None,
+                    proxy_simple_response(
+                        StatusCode::BAD_GATEWAY,
+                        "failed to build upstream request",
+                    )
+                );
+            }
+        };
+        if let Err(err) =
+            maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await
+        {
+            tracing::debug!(
+                route = %route.route_ref,
+                upstream = %upstream_uri,
+                error = ?err,
+                "record mode rate limiter rejected upstream request"
+            );
+            respond!(None, record_rate_limit_rejection_response(err));
+        }
+
+        let client_on_upgrade = hyper::upgrade::on(&mut req);
+        let (mut parts, body) = req.into_parts();
+        parts.uri = upstream_uri.clone();
+        set_host_header(&mut parts.headers, &upstream_uri);
+        parts.headers.remove("proxy-connection");
+        let upstream_req = Request::from_parts(parts, boxed_incoming(body));
+
+        state
+            .status
+            .upstream_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+        let upstream_started_at = Instant::now();
+        let mut upstream_res = match send_upstream_request(state.as_ref(), upstream_req).await {
+            Ok(res) => res,
+            Err(err) => {
+                let upstream_latency = upstream_started_at.elapsed();
+                tracing::debug!("websocket upstream request failed: {err}");
+                respond!(
+                    Some(upstream_latency),
+                    proxy_simple_response(StatusCode::BAD_GATEWAY, "upstream request failed",)
+                );
+            }
+        };
+        let upstream_latency = upstream_started_at.elapsed();
+
+        if upstream_res.status() == StatusCode::SWITCHING_PROTOCOLS {
+            let upstream_on_upgrade = hyper::upgrade::on(&mut upstream_res);
+            let websocket_route_ref = route.route_ref.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    tunnel_websocket_upgraded_connections(client_on_upgrade, upstream_on_upgrade)
+                        .await
+                {
+                    tracing::debug!(
+                        route = %websocket_route_ref,
+                        "websocket upgraded tunnel finished: {err}"
+                    );
+                }
+            });
+
+            let (mut upstream_parts, _upstream_body) = upstream_res.into_parts();
+            upstream_parts.headers.remove("proxy-connection");
+            respond!(
+                Some(upstream_latency),
+                Response::from_parts(upstream_parts, boxed_full(Bytes::new()))
+            );
+        }
+
+        let (mut upstream_parts, upstream_body) = upstream_res.into_parts();
+        strip_hop_by_hop_headers(&mut upstream_parts.headers);
+        respond!(
+            Some(upstream_latency),
+            Response::from_parts(upstream_parts, boxed_incoming(upstream_body))
+        );
+    }
+
     let has_on_request_transform = route.transform.on_request.is_some();
     let request_content_length = parse_content_length(req.headers());
     let request_known_oversize = request_content_length
@@ -3313,6 +3413,24 @@ async fn tunnel_upgraded_connection(
     Ok(())
 }
 
+async fn tunnel_websocket_upgraded_connections(
+    client_on_upgrade: hyper::upgrade::OnUpgrade,
+    upstream_on_upgrade: hyper::upgrade::OnUpgrade,
+) -> anyhow::Result<()> {
+    let client_upgraded = client_on_upgrade
+        .await
+        .map_err(|err| anyhow::anyhow!("upgrade client websocket connection: {err}"))?;
+    let upstream_upgraded = upstream_on_upgrade
+        .await
+        .map_err(|err| anyhow::anyhow!("upgrade upstream websocket connection: {err}"))?;
+    let mut client_upgraded = TokioIo::new(client_upgraded);
+    let mut upstream_upgraded = TokioIo::new(upstream_upgraded);
+    tokio::io::copy_bidirectional(&mut client_upgraded, &mut upstream_upgraded)
+        .await
+        .map_err(|err| anyhow::anyhow!("copy websocket upgraded bytes: {err}"))?;
+    Ok(())
+}
+
 fn normalize_tunneled_https_request_uri(
     connect_authority: &Authority,
     request_uri: &Uri,
@@ -3769,6 +3887,30 @@ fn strip_hop_by_hop_headers(headers: &mut hyper::HeaderMap) {
         headers.remove(*header_name);
     }
     headers.remove("proxy-connection");
+}
+
+fn header_contains_token(headers: &hyper::HeaderMap, header_name: HeaderName, token: &str) -> bool {
+    headers.get_all(header_name).iter().any(|value| {
+        value.to_str().ok().is_some_and(|raw| {
+            raw.split(',')
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+fn is_websocket_upgrade_request(req: &Request<Incoming>) -> bool {
+    if req.method() != Method::GET {
+        return false;
+    }
+
+    if !header_contains_token(req.headers(), header::CONNECTION, "upgrade") {
+        return false;
+    }
+
+    req.headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
 }
 
 fn simple_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
@@ -5037,6 +5179,7 @@ mod tests {
             body_oversize: BodyOversizePolicy::Error,
             match_config: None,
             streaming: None,
+            websocket: None,
             rate_limit: None,
             redact: None,
             transform: super::RouteTransformScripts::default(),

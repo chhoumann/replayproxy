@@ -11,6 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt as _, Full};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
@@ -36,6 +37,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_rustls::TlsConnector;
+use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use x509_parser::pem::parse_x509_pem;
 
 const BINARY_HEADER_VALUE: &[u8] = b"\x80\xffok";
@@ -1084,6 +1086,52 @@ path_prefix = "/"
     assert_eq!(second_capture.as_ref(), b"ping");
 
     drop(stream);
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_upgrade_route_relays_frames_bidirectionally() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_websocket_upstream().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://{upstream_addr}"
+
+[routes.websocket]
+recording_mode = "bidirectional"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let ws_url = format!("ws://{}/ws/echo", proxy.listen_addr);
+    let (mut ws_stream, response) = connect_async(ws_url).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(greeting))) = ws_stream.next().await else {
+        panic!("expected upstream greeting frame");
+    };
+    assert_eq!(greeting.to_string(), "upstream-ready");
+
+    ws_stream
+        .send(Message::Text("hello-proxy".into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(ack))) = ws_stream.next().await else {
+        panic!("expected upstream ack frame");
+    };
+    assert_eq!(ack.to_string(), "ack:hello-proxy");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured, "hello-proxy");
+
+    ws_stream.close(None).await.unwrap();
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
 }
@@ -5651,6 +5699,41 @@ async fn spawn_connect_upstream() -> (
         stream.read_exact(&mut second_message).await.unwrap();
         tx.send(Bytes::from(second_message)).await.unwrap();
         stream.write_all(b"pong").await.unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn spawn_websocket_upstream() -> (
+    SocketAddr,
+    mpsc::Receiver<String>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel::<String>(1);
+
+    let join = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket
+            .send(Message::Text("upstream-ready".into()))
+            .await
+            .unwrap();
+
+        let Some(Ok(message)) = websocket.next().await else {
+            panic!("expected one client frame");
+        };
+        let Message::Text(text) = message else {
+            panic!("expected text frame from client");
+        };
+        let text = text.to_string();
+        tx.send(text.clone()).await.unwrap();
+
+        websocket
+            .send(Message::Text(format!("ack:{text}").into()))
+            .await
+            .unwrap();
     });
 
     (addr, rx, move || join)

@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    session,
+    legacy_redaction, session,
     storage::{Recording, SessionManager, SessionManagerError, Storage},
 };
 
@@ -347,6 +347,8 @@ async fn collect_recordings_for_export(
                     summary.id
                 ))
             })?;
+        let mut recording = recording;
+        legacy_redaction::scrub_recording_for_legacy_redaction(&mut recording);
         recordings.push(ExportRecording {
             id: summary.id,
             recording,

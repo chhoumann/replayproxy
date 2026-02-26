@@ -1,4 +1,5 @@
 pub mod config;
+pub(crate) mod legacy_redaction;
 pub mod logging;
 pub mod matching;
 pub mod proxy;

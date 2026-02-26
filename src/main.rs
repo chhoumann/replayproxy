@@ -957,6 +957,7 @@ mod tests {
         session_export::SessionExportFormat,
         storage::{Recording, RecordingSearch, SessionManager, Storage},
     };
+    use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
 
     fn config_with_storage(base_path: &Path, active_session: Option<&str>) -> Config {
@@ -1058,6 +1059,45 @@ active_session = "{active_session}"
             response_body: format!("response:{uri}").into_bytes(),
             created_at_unix_ms,
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ExportedRecordingDocument {
+        #[serde(flatten)]
+        recording: Recording,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ImportManifest {
+        version: u32,
+        session: String,
+        format: SessionExportFormat,
+        exported_at_unix_ms: i64,
+        recordings: Vec<ImportManifestEntry>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ImportManifestEntry {
+        id: i64,
+        file: String,
+        request_method: String,
+        request_uri: String,
+        response_status: u16,
+        created_at_unix_ms: i64,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ImportRecordingDocument {
+        id: i64,
+        #[serde(flatten)]
+        recording: Recording,
+    }
+
+    fn header_value<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+        headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_slice())
     }
 
     #[test]
@@ -1975,6 +2015,112 @@ mode = "record"
     }
 
     #[tokio::test]
+    async fn session_export_applies_secondary_legacy_redaction_scrub() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        run_session_command(
+            &config,
+            SessionCommand::Create {
+                name: "default".to_owned(),
+            },
+        )
+        .await
+        .expect("default session should be created");
+        let storage = Storage::from_config(&config)
+            .expect("storage should load")
+            .expect("storage should be configured");
+
+        let mut recording = recording_fixture("legacy-key", "POST", "/v1/chat/completions", 42);
+        recording.request_headers = vec![
+            (
+                "Authorization".to_owned(),
+                b"Bearer sk-live-super-secret".to_vec(),
+            ),
+            ("x-request-id".to_owned(), b"safe-trace".to_vec()),
+        ];
+        recording.request_body = br#"{"token":"secret-token","safe":"ok"}"#.to_vec();
+        recording.response_headers = vec![
+            ("set-cookie".to_owned(), b"session=secret".to_vec()),
+            ("content-type".to_owned(), b"application/json".to_vec()),
+        ];
+        recording.response_body = br#"{"api_key":"secret-key","safe":"ok"}"#.to_vec();
+        storage
+            .insert_recording(recording)
+            .await
+            .expect("insert should succeed");
+
+        let export_dir = temp_dir.path().join("exports").join("default");
+        run_session_command(
+            &config,
+            SessionCommand::Export {
+                name: "default".to_owned(),
+                out: Some(export_dir.clone()),
+                format: SessionExportFormat::Json,
+            },
+        )
+        .await
+        .expect("session export should succeed");
+
+        let mut entries = fs::read_dir(export_dir.join("recordings"))
+            .expect("recordings dir should exist")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("recordings should list");
+        entries.sort_by_key(|entry| entry.path());
+        assert_eq!(entries.len(), 1);
+
+        let recording_bytes = fs::read(entries[0].path()).expect("recording should be readable");
+        let exported: ExportedRecordingDocument =
+            serde_json::from_slice(&recording_bytes).expect("recording should parse");
+
+        assert_eq!(
+            header_value(&exported.recording.request_headers, "authorization"),
+            Some(b"[REDACTED]".as_slice())
+        );
+        assert_eq!(
+            header_value(&exported.recording.request_headers, "x-request-id"),
+            Some(b"safe-trace".as_slice())
+        );
+        assert_eq!(
+            header_value(&exported.recording.response_headers, "set-cookie"),
+            Some(b"[REDACTED]".as_slice())
+        );
+        assert_eq!(
+            header_value(&exported.recording.response_headers, "content-type"),
+            Some(b"application/json".as_slice())
+        );
+
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&exported.recording.request_body).expect("request JSON");
+        assert_eq!(
+            request_json
+                .pointer("/token")
+                .and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            request_json
+                .pointer("/safe")
+                .and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+
+        let response_json: serde_json::Value =
+            serde_json::from_slice(&exported.recording.response_body).expect("response JSON");
+        assert_eq!(
+            response_json
+                .pointer("/api_key")
+                .and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            response_json
+                .pointer("/safe")
+                .and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+    }
+
+    #[tokio::test]
     async fn session_import_reads_manifest_and_inserts_recordings() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let config = config_with_storage(temp_dir.path(), Some("default"));
@@ -2115,6 +2261,137 @@ mode = "record"
         assert_eq!(result.format, SessionExportFormat::Yaml);
         assert_eq!(result.manifest_path, export_dir.join("index.yaml"));
         assert_eq!(result.recordings_imported, 1);
+    }
+
+    #[tokio::test]
+    async fn session_import_applies_secondary_legacy_redaction_scrub() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager should initialize")
+            .expect("storage should be configured");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should be created");
+
+        let import_dir = temp_dir.path().join("legacy-import");
+        fs::create_dir_all(import_dir.join("recordings")).expect("recordings dir should exist");
+
+        let mut legacy_recording =
+            recording_fixture("legacy-key", "POST", "/v1/chat/completions", 7);
+        legacy_recording.request_headers = vec![
+            (
+                "authorization".to_owned(),
+                b"Bearer sk-live-import-secret".to_vec(),
+            ),
+            ("x-request-id".to_owned(), b"safe-trace".to_vec()),
+        ];
+        legacy_recording.request_body = br#"{"access_token":"import-secret","safe":"ok"}"#.to_vec();
+        legacy_recording.response_headers =
+            vec![("set-cookie".to_owned(), b"session=import-secret".to_vec())];
+        legacy_recording.response_body =
+            br#"{"client_secret":"import-secret","safe":"ok"}"#.to_vec();
+
+        let relative_recording_path = "recordings/0001-post-v1-chat-completions-id1.json";
+        let recording_document = ImportRecordingDocument {
+            id: 1,
+            recording: legacy_recording,
+        };
+        fs::write(
+            import_dir.join(relative_recording_path),
+            serde_json::to_vec_pretty(&recording_document)
+                .expect("recording document should serialize"),
+        )
+        .expect("recording file should be written");
+
+        let manifest = ImportManifest {
+            version: 1,
+            session: "legacy".to_owned(),
+            format: SessionExportFormat::Json,
+            exported_at_unix_ms: 0,
+            recordings: vec![ImportManifestEntry {
+                id: 1,
+                file: relative_recording_path.to_owned(),
+                request_method: "POST".to_owned(),
+                request_uri: "/v1/chat/completions".to_owned(),
+                response_status: 200,
+                created_at_unix_ms: 7,
+            }],
+        };
+        fs::write(
+            import_dir.join("index.json"),
+            serde_json::to_vec_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("manifest should be written");
+
+        run_session_command(
+            &config,
+            SessionCommand::Import {
+                name: "staging".to_owned(),
+                input: import_dir,
+            },
+        )
+        .await
+        .expect("session import should succeed");
+
+        let staging_storage = manager
+            .open_session_storage("staging")
+            .await
+            .expect("staging storage should open");
+        let summaries = staging_storage
+            .list_recordings(0, 10)
+            .await
+            .expect("imported recordings should list");
+        assert_eq!(summaries.len(), 1);
+
+        let imported = staging_storage
+            .get_recording_by_id(summaries[0].id)
+            .await
+            .expect("fetch imported recording should succeed")
+            .expect("recording should exist");
+        assert_eq!(
+            header_value(&imported.request_headers, "authorization"),
+            Some(b"[REDACTED]".as_slice())
+        );
+        assert_eq!(
+            header_value(&imported.request_headers, "x-request-id"),
+            Some(b"safe-trace".as_slice())
+        );
+        assert_eq!(
+            header_value(&imported.response_headers, "set-cookie"),
+            Some(b"[REDACTED]".as_slice())
+        );
+
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&imported.request_body).expect("request JSON");
+        assert_eq!(
+            request_json
+                .pointer("/access_token")
+                .and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            request_json
+                .pointer("/safe")
+                .and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+
+        let response_json: serde_json::Value =
+            serde_json::from_slice(&imported.response_body).expect("response JSON");
+        assert_eq!(
+            response_json
+                .pointer("/client_secret")
+                .and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            response_json
+                .pointer("/safe")
+                .and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
     }
 
     #[tokio::test]

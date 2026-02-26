@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    session,
+    legacy_redaction, session,
     session_export::SessionExportFormat,
     storage::{Recording, SessionManager, SessionManagerError},
 };
@@ -158,7 +158,8 @@ fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError
         }
         validate_recording_file_extension(&entry.file, manifest.format)?;
         let recording_path = resolve_recording_path(in_dir, &entry.file)?;
-        let recording = read_recording_document(&recording_path, entry, manifest.format)?;
+        let mut recording = read_recording_document(&recording_path, entry, manifest.format)?;
+        legacy_redaction::scrub_recording_for_legacy_redaction(&mut recording);
         recordings.push(ParsedImportRecording {
             source: recording_path.to_string_lossy().into_owned(),
             recording,

@@ -1693,6 +1693,237 @@ recording_mode = "bidirectional"
 }
 
 #[tokio::test]
+async fn websocket_replay_mode_server_only_replays_server_frames_and_ignores_client_messages() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_websocket_upstream().await;
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.websocket]
+recording_mode = "server-only"
+"#,
+        storage_dir.path().display(),
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+
+    let record_ws_url = format!("ws://{}/ws/echo", record_proxy.listen_addr);
+    let (mut record_ws_stream, record_response) = connect_async(record_ws_url).await.unwrap();
+    assert_eq!(record_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(record_greeting))) = record_ws_stream.next().await else {
+        panic!("expected upstream greeting frame");
+    };
+    assert_eq!(record_greeting.to_string(), "upstream-ready");
+
+    record_ws_stream
+        .send(Message::Text("hello-proxy".into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(record_ack))) = record_ws_stream.next().await else {
+        panic!("expected upstream ack frame");
+    };
+    assert_eq!(record_ack.to_string(), "ack:hello-proxy");
+
+    let recorded_client_payload = upstream_rx.recv().await.unwrap();
+    assert_eq!(recorded_client_payload, "hello-proxy");
+
+    record_ws_stream.close(None).await.unwrap();
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+
+[routes.websocket]
+recording_mode = "server-only"
+"#,
+        storage_dir.path().display(),
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let replay_ws_url = format!("ws://{}/ws/echo", replay_proxy.listen_addr);
+    let (mut replay_ws_stream, replay_response) = connect_async(replay_ws_url).await.unwrap();
+    assert_eq!(replay_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(replayed_greeting))) = replay_ws_stream.next().await else {
+        panic!("expected replayed greeting frame");
+    };
+    assert_eq!(replayed_greeting.to_string(), "upstream-ready");
+
+    replay_ws_stream
+        .send(Message::Text("ignored-by-server-only-replay".into()))
+        .await
+        .unwrap();
+    replay_ws_stream
+        .send(Message::Binary(vec![0x44, 0x55, 0x66].into()))
+        .await
+        .unwrap();
+
+    let Some(Ok(Message::Text(replayed_ack))) = replay_ws_stream.next().await else {
+        panic!("expected replayed ack frame");
+    };
+    assert_eq!(replayed_ack.to_string(), "ack:hello-proxy");
+
+    let _ = replay_ws_stream.close(None).await;
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_replay_mode_bidirectional_replays_when_client_frames_match_recording() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    record_bidirectional_websocket_session(storage_dir.path(), session).await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+
+[routes.websocket]
+recording_mode = "bidirectional"
+"#,
+        storage_dir.path().display(),
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let replay_ws_url = format!("ws://{}/ws/echo", replay_proxy.listen_addr);
+    let (mut replay_ws_stream, replay_response) = connect_async(replay_ws_url).await.unwrap();
+    assert_eq!(replay_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(greeting))) = replay_ws_stream.next().await else {
+        panic!("expected replayed greeting frame");
+    };
+    assert_eq!(greeting.to_string(), "upstream-ready");
+
+    let Some(Ok(Message::Binary(banner))) = replay_ws_stream.next().await else {
+        panic!("expected replayed binary banner frame");
+    };
+    assert_eq!(banner.to_vec(), vec![0x01, 0x02, 0x03]);
+
+    replay_ws_stream
+        .send(Message::Text("hello-proxy".into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(ack_text))) = replay_ws_stream.next().await else {
+        panic!("expected replayed text ack frame");
+    };
+    assert_eq!(ack_text.to_string(), "ack:hello-proxy");
+
+    replay_ws_stream
+        .send(Message::Binary(vec![0x10, 0x20].into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Binary(ack_binary))) = replay_ws_stream.next().await else {
+        panic!("expected replayed binary ack frame");
+    };
+    assert_eq!(ack_binary.to_vec(), vec![0xaa, 0xbb, 0xcc]);
+
+    let _ = replay_ws_stream.close(None).await;
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_replay_mode_bidirectional_closes_on_client_frame_mismatch() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    record_bidirectional_websocket_session(storage_dir.path(), session).await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+
+[routes.websocket]
+recording_mode = "bidirectional"
+"#,
+        storage_dir.path().display(),
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let replay_ws_url = format!("ws://{}/ws/echo", replay_proxy.listen_addr);
+    let (mut replay_ws_stream, replay_response) = connect_async(replay_ws_url).await.unwrap();
+    assert_eq!(replay_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(greeting))) = replay_ws_stream.next().await else {
+        panic!("expected replayed greeting frame");
+    };
+    assert_eq!(greeting.to_string(), "upstream-ready");
+
+    let Some(Ok(Message::Binary(banner))) = replay_ws_stream.next().await else {
+        panic!("expected replayed binary banner frame");
+    };
+    assert_eq!(banner.to_vec(), vec![0x01, 0x02, 0x03]);
+
+    replay_ws_stream
+        .send(Message::Text("unexpected-client-frame".into()))
+        .await
+        .unwrap();
+    let close_message = timeout(Duration::from_secs(1), replay_ws_stream.next())
+        .await
+        .expect("expected replay mismatch close frame");
+    let Some(Ok(Message::Close(close_frame))) = close_message else {
+        panic!("expected replay mismatch close frame");
+    };
+    let close_frame = close_frame.expect("expected replay mismatch close frame details");
+    assert_eq!(
+        close_frame.code,
+        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+    );
+    assert!(close_frame.reason.to_string().contains("mismatch"));
+
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn https_connect_mitm_records_and_replays_requests() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
     let temp_dir = tempfile::tempdir().unwrap();
@@ -6535,6 +6766,73 @@ async fn spawn_websocket_bidirectional_upstream() -> (
     });
 
     (addr, rx, move || join)
+}
+
+async fn record_bidirectional_websocket_session(storage_dir: &Path, session: &str) {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_websocket_bidirectional_upstream().await;
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.websocket]
+recording_mode = "bidirectional"
+"#,
+        storage_dir.display(),
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+
+    let record_ws_url = format!("ws://{}/ws/echo", record_proxy.listen_addr);
+    let (mut record_ws_stream, record_response) = connect_async(record_ws_url).await.unwrap();
+    assert_eq!(record_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(greeting))) = record_ws_stream.next().await else {
+        panic!("expected upstream greeting frame");
+    };
+    assert_eq!(greeting.to_string(), "upstream-ready");
+
+    let Some(Ok(Message::Binary(banner))) = record_ws_stream.next().await else {
+        panic!("expected upstream binary banner frame");
+    };
+    assert_eq!(banner.to_vec(), vec![0x01, 0x02, 0x03]);
+
+    record_ws_stream
+        .send(Message::Text("hello-proxy".into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(ack_text))) = record_ws_stream.next().await else {
+        panic!("expected upstream text ack frame");
+    };
+    assert_eq!(ack_text.to_string(), "ack:hello-proxy");
+
+    record_ws_stream
+        .send(Message::Binary(vec![0x10, 0x20].into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Binary(ack_binary))) = record_ws_stream.next().await else {
+        panic!("expected upstream binary ack frame");
+    };
+    assert_eq!(ack_binary.to_vec(), vec![0xaa, 0xbb, 0xcc]);
+
+    let captured_text = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured_text, b"hello-proxy".to_vec());
+    let captured_binary = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured_binary, vec![0x10, 0x20]);
+
+    record_ws_stream.close(None).await.unwrap();
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
 }
 
 async fn read_http_response_head(stream: &mut TcpStream) -> Vec<u8> {

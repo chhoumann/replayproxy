@@ -78,6 +78,7 @@ use crate::{
 type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
 type ProxyHttpsConnector = HttpsConnector<HttpConnector>;
 type HttpClient = Client<ProxyHttpsConnector, ProxyBody>;
+type UpgradedWebSocket = tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 const SUBSET_QUERY_CANDIDATE_LIMIT: usize = 4096;
 const ADMIN_RECORDINGS_DEFAULT_LIMIT: usize = 100;
@@ -2641,52 +2642,168 @@ async fn proxy_handler(
     }
 
     if route.websocket.is_some() && is_websocket_upgrade_request(&req) {
-        if route.mode == RouteMode::Replay {
-            respond!(
-                None,
-                proxy_simple_response(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "websocket replay mode is not implemented",
-                )
-            );
-        }
-
         let websocket_recording_mode = route
             .websocket
             .as_ref()
             .and_then(|websocket| websocket.recording_mode)
             .unwrap_or(WebSocketRecordingMode::Bidirectional);
+        let preserve_websocket_timing = route
+            .streaming
+            .as_ref()
+            .map(|streaming| streaming.preserve_timing)
+            .unwrap_or(false);
+        let ActiveSessionRuntime {
+            active_session: active_session_name,
+            storage: active_storage,
+        } = state.active_session_snapshot();
+
+        if route.mode == RouteMode::Replay {
+            let replay_rate_limit_upstream_uri =
+                match resolve_upstream_uri_for_request(&route, req.uri()) {
+                    Ok(upstream_uri) => upstream_uri,
+                    Err(err) => {
+                        tracing::debug!("failed to build websocket replay upstream uri: {err}");
+                        None
+                    }
+                };
+            if let Some(replay_rate_limit_upstream_uri) = replay_rate_limit_upstream_uri.as_ref()
+                && let Some(required_delay) = maybe_reject_for_replay_rate_limit(
+                    state.as_ref(),
+                    &route,
+                    replay_rate_limit_upstream_uri,
+                )
+                .await
+            {
+                respond!(None, replay_rate_limit_rejection_response(required_delay));
+            }
+
+            let Some(storage) = active_storage.as_ref() else {
+                respond!(
+                    None,
+                    proxy_simple_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "storage not configured",
+                    )
+                );
+            };
+            let websocket_match_key =
+                match websocket_match_key_for_request(route.match_config.as_ref(), &req) {
+                    Ok(match_key) => match_key,
+                    Err((status, message)) => {
+                        respond!(None, proxy_simple_response(status, message))
+                    }
+                };
+            let replay_started_at = Instant::now();
+            let lookup_result = lookup_recording_for_request(
+                storage,
+                route.match_config.as_ref(),
+                req.uri(),
+                &websocket_match_key,
+            )
+            .await;
+            replay_latency = Some(replay_started_at.elapsed());
+            match lookup_result {
+                Ok(Some(stored_recording)) => {
+                    cache_outcome = CacheLogOutcome::Hit;
+                    state
+                        .status
+                        .cache_hits_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    let StoredRecording {
+                        id: replay_recording_id,
+                        recording: replay_recording,
+                    } = stored_recording;
+
+                    if replay_recording.response_status == StatusCode::SWITCHING_PROTOCOLS.as_u16()
+                    {
+                        let replay_frames =
+                            match storage.get_websocket_frames(replay_recording_id).await {
+                                Ok(frames) => frames,
+                                Err(err) => {
+                                    tracing::debug!(
+                                        route = %route.route_ref,
+                                        recording_id = replay_recording_id,
+                                        "failed to read websocket replay frames: {err}",
+                                    );
+                                    respond!(
+                                        None,
+                                        proxy_simple_response(
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            "failed to lookup recording",
+                                        )
+                                    );
+                                }
+                            };
+
+                        let client_on_upgrade = hyper::upgrade::on(&mut req);
+                        let websocket_route_ref = route.route_ref.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = replay_websocket_upgraded_connection(
+                                client_on_upgrade,
+                                replay_frames,
+                                websocket_recording_mode,
+                                preserve_websocket_timing,
+                            )
+                            .await
+                            {
+                                tracing::debug!(
+                                    route = %websocket_route_ref,
+                                    "websocket replay tunnel finished: {err}"
+                                );
+                            }
+                        });
+
+                        respond!(
+                            None,
+                            websocket_handshake_response_from_recording(
+                                replay_recording,
+                                req.headers(),
+                            )
+                        );
+                    }
+
+                    respond!(None, response_from_recording(replay_recording, None, false));
+                }
+                Ok(None) => {
+                    cache_outcome = CacheLogOutcome::Miss;
+                    state
+                        .status
+                        .cache_misses_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if route.cache_miss == CacheMissPolicy::Error {
+                        respond!(
+                            None,
+                            replay_miss_response(
+                                &route,
+                                &active_session_name,
+                                &websocket_match_key,
+                            )
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!("failed to lookup recording: {err}");
+                    respond!(
+                        None,
+                        proxy_simple_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to lookup recording",
+                        )
+                    );
+                }
+            }
+        }
+
         let pending_websocket_recording =
             if matches!(route.mode, RouteMode::Record | RouteMode::PassthroughCache) {
-                let ActiveSessionRuntime {
-                    active_session: _,
-                    storage: active_storage,
-                } = state.active_session_snapshot();
                 if let Some(storage) = active_storage {
-                    let websocket_match_key = match matching::compute_match_key(
-                        route.match_config.as_ref(),
-                        req.method(),
-                        req.uri(),
-                        req.headers(),
-                        &[],
-                    ) {
-                        Ok(match_key) => match_key,
-                        Err(err) => {
-                            tracing::debug!(error_kind = err.kind(), "failed to compute match key");
-                            let (status, message) = match err {
-                                matching::MatchKeyError::InvalidJsonBody(_) => (
-                                    StatusCode::BAD_REQUEST,
-                                    "invalid JSON request body for matching",
-                                ),
-                                matching::MatchKeyError::InvalidJsonPath { .. }
-                                | matching::MatchKeyError::SerializeJsonNode { .. } => (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "invalid route JSONPath matching configuration",
-                                ),
-                            };
-                            respond!(None, proxy_simple_response(status, message));
-                        }
-                    };
+                    let websocket_match_key =
+                        match websocket_match_key_for_request(route.match_config.as_ref(), &req) {
+                            Ok(match_key) => match_key,
+                            Err((status, message)) => {
+                                respond!(None, proxy_simple_response(status, message));
+                            }
+                        };
 
                     Some(PendingWebSocketRecording {
                         storage,
@@ -3808,6 +3925,49 @@ fn response_from_recording(
     response
 }
 
+fn websocket_handshake_response_from_recording(
+    recording: Recording,
+    request_headers: &hyper::HeaderMap,
+) -> Response<ProxyBody> {
+    let Recording {
+        response_status,
+        response_headers,
+        ..
+    } = recording;
+    let mut response = Response::new(boxed_full(Bytes::new()));
+    *response.status_mut() =
+        StatusCode::from_u16(response_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    for (name, value) in response_headers {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            tracing::debug!("invalid websocket replay header name in recording");
+            continue;
+        };
+        let Ok(header_value) = HeaderValue::from_bytes(&value) else {
+            tracing::debug!(
+                "invalid websocket replay header value in recording for {}",
+                header_name.as_str()
+            );
+            continue;
+        };
+        response.headers_mut().append(header_name, header_value);
+    }
+    response.headers_mut().remove("proxy-connection");
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS
+        && let Some(client_key) = request_headers
+            .get("sec-websocket-key")
+            .and_then(|value| value.to_str().ok())
+    {
+        let accept_key =
+            tokio_tungstenite::tungstenite::handshake::derive_accept_key(client_key.as_bytes());
+        if let Ok(accept_header) = HeaderValue::from_str(&accept_key) {
+            response
+                .headers_mut()
+                .insert("sec-websocket-accept", accept_header);
+        }
+    }
+    response
+}
+
 async fn lookup_recording_for_request(
     storage: &Storage,
     route_match: Option<&RouteMatchConfig>,
@@ -4157,6 +4317,249 @@ async fn tunnel_websocket_upgraded_connections(
     Ok(())
 }
 
+async fn replay_websocket_upgraded_connection(
+    client_on_upgrade: hyper::upgrade::OnUpgrade,
+    replay_frames: Vec<WebSocketFrame>,
+    replay_mode: WebSocketRecordingMode,
+    preserve_timing: bool,
+) -> anyhow::Result<()> {
+    let client_upgraded = client_on_upgrade
+        .await
+        .map_err(|err| anyhow::anyhow!("upgrade client websocket connection: {err}"))?;
+    let mut client_websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(client_upgraded),
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+
+    match replay_mode {
+        WebSocketRecordingMode::ServerOnly => {
+            replay_websocket_server_only_frames(
+                &mut client_websocket,
+                replay_frames.as_slice(),
+                preserve_timing,
+            )
+            .await
+        }
+        WebSocketRecordingMode::Bidirectional => {
+            replay_websocket_bidirectional_frames(
+                &mut client_websocket,
+                replay_frames.as_slice(),
+                preserve_timing,
+            )
+            .await
+        }
+    }
+}
+
+async fn replay_websocket_server_only_frames(
+    client_websocket: &mut UpgradedWebSocket,
+    replay_frames: &[WebSocketFrame],
+    preserve_timing: bool,
+) -> anyhow::Result<()> {
+    let replay_started_at = TokioInstant::now();
+    for replay_frame in replay_frames
+        .iter()
+        .filter(|frame| frame.direction == WebSocketFrameDirection::ServerToClient)
+    {
+        if preserve_timing
+            && wait_for_websocket_replay_deadline_with_client_drain(
+                client_websocket,
+                replay_started_at,
+                replay_frame.offset_ms,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        if drain_available_client_websocket_messages(client_websocket).await? {
+            return Ok(());
+        }
+        let replay_message = websocket_message_for_recorded_frame(replay_frame)?;
+        if let Err(err) = client_websocket.send(replay_message).await {
+            if websocket_is_closed_error(&err) {
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!(
+                "write replay websocket message to client: {err}"
+            ));
+        }
+    }
+
+    let _ = client_websocket.close(None).await;
+    Ok(())
+}
+
+async fn replay_websocket_bidirectional_frames(
+    client_websocket: &mut UpgradedWebSocket,
+    replay_frames: &[WebSocketFrame],
+    preserve_timing: bool,
+) -> anyhow::Result<()> {
+    let replay_started_at = TokioInstant::now();
+    for replay_frame in replay_frames {
+        match replay_frame.direction {
+            WebSocketFrameDirection::ServerToClient => {
+                wait_for_websocket_replay_frame_offset(
+                    replay_started_at,
+                    replay_frame.offset_ms,
+                    preserve_timing,
+                )
+                .await;
+                let replay_message = websocket_message_for_recorded_frame(replay_frame)?;
+                if let Err(err) = client_websocket.send(replay_message).await {
+                    if websocket_is_closed_error(&err) {
+                        return Ok(());
+                    }
+                    return Err(anyhow::anyhow!(
+                        "write replay websocket message to client: {err}"
+                    ));
+                }
+            }
+            WebSocketFrameDirection::ClientToServer => {
+                let Some(client_message) =
+                    next_replay_client_data_message(client_websocket).await?
+                else {
+                    return Err(anyhow::anyhow!(
+                        "client websocket closed before replay frame {}",
+                        replay_frame.frame_index
+                    ));
+                };
+                if client_message.is_close() {
+                    return Err(anyhow::anyhow!(
+                        "client websocket closed before replay frame {}",
+                        replay_frame.frame_index
+                    ));
+                }
+                if !websocket_message_matches_recorded_frame(&client_message, replay_frame) {
+                    let mismatch_reason = format!(
+                        "replay websocket client frame mismatch at frame {}",
+                        replay_frame.frame_index
+                    );
+                    send_websocket_mismatch_close(client_websocket, mismatch_reason.as_str()).await;
+                    return Err(anyhow::anyhow!("{mismatch_reason}"));
+                }
+            }
+        }
+    }
+
+    let _ = client_websocket.close(None).await;
+    Ok(())
+}
+
+async fn wait_for_websocket_replay_frame_offset(
+    replay_started_at: TokioInstant,
+    frame_offset_ms: u64,
+    preserve_timing: bool,
+) {
+    if !preserve_timing {
+        return;
+    }
+    let Some(frame_deadline) =
+        replay_started_at.checked_add(Duration::from_millis(frame_offset_ms))
+    else {
+        return;
+    };
+    tokio::time::sleep_until(frame_deadline).await;
+}
+
+async fn wait_for_websocket_replay_deadline_with_client_drain(
+    client_websocket: &mut UpgradedWebSocket,
+    replay_started_at: TokioInstant,
+    frame_offset_ms: u64,
+) -> anyhow::Result<bool> {
+    let Some(frame_deadline) =
+        replay_started_at.checked_add(Duration::from_millis(frame_offset_ms))
+    else {
+        return Ok(false);
+    };
+
+    loop {
+        if TokioInstant::now() >= frame_deadline {
+            return Ok(false);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(frame_deadline) => {
+                return Ok(false);
+            }
+            maybe_client_message = client_websocket.next() => {
+                match maybe_client_message {
+                    None => return Ok(true),
+                    Some(Ok(message)) => {
+                        if message.is_close() {
+                            return Ok(true);
+                        }
+                    }
+                    Some(Err(err)) if websocket_is_closed_error(&err) => return Ok(true),
+                    Some(Err(err)) => {
+                        return Err(anyhow::anyhow!(
+                            "read client websocket message while waiting for replay frame: {err}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn drain_available_client_websocket_messages(
+    client_websocket: &mut UpgradedWebSocket,
+) -> anyhow::Result<bool> {
+    loop {
+        let maybe_client_message =
+            tokio::time::timeout(Duration::ZERO, client_websocket.next()).await;
+        match maybe_client_message {
+            Err(_) => return Ok(false),
+            Ok(None) => return Ok(true),
+            Ok(Some(Ok(message))) => {
+                if message.is_close() {
+                    return Ok(true);
+                }
+            }
+            Ok(Some(Err(err))) if websocket_is_closed_error(&err) => return Ok(true),
+            Ok(Some(Err(err))) => {
+                return Err(anyhow::anyhow!(
+                    "read client websocket message while draining replay input: {err}"
+                ));
+            }
+        }
+    }
+}
+
+async fn next_replay_client_data_message(
+    client_websocket: &mut UpgradedWebSocket,
+) -> anyhow::Result<Option<tokio_tungstenite::tungstenite::Message>> {
+    loop {
+        let Some(client_message) = client_websocket.next().await else {
+            return Ok(None);
+        };
+        let client_message = match client_message {
+            Ok(client_message) => client_message,
+            Err(err) if websocket_is_closed_error(&err) => return Ok(None),
+            Err(err) => return Err(anyhow::anyhow!("read client websocket message: {err}")),
+        };
+        match client_message {
+            tokio_tungstenite::tungstenite::Message::Text(_)
+            | tokio_tungstenite::tungstenite::Message::Binary(_)
+            | tokio_tungstenite::tungstenite::Message::Close(_) => return Ok(Some(client_message)),
+            tokio_tungstenite::tungstenite::Message::Ping(_)
+            | tokio_tungstenite::tungstenite::Message::Pong(_)
+            | tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+        }
+    }
+}
+
+async fn send_websocket_mismatch_close(client_websocket: &mut UpgradedWebSocket, reason: &str) {
+    let _ = client_websocket
+        .send(tokio_tungstenite::tungstenite::Message::Close(Some(
+            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                reason: reason.to_owned().into(),
+            },
+        )))
+        .await;
+}
+
 fn websocket_is_closed_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
     matches!(
         err,
@@ -4195,6 +4598,36 @@ fn maybe_record_websocket_message(
         message_type,
         payload,
     });
+}
+
+fn websocket_message_for_recorded_frame(
+    replay_frame: &WebSocketFrame,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::Message> {
+    match replay_frame.message_type {
+        WebSocketMessageType::Text => {
+            let payload = String::from_utf8(replay_frame.payload.clone()).map_err(|err| {
+                anyhow::anyhow!(
+                    "decode replay websocket text frame {} as UTF-8: {err}",
+                    replay_frame.frame_index
+                )
+            })?;
+            Ok(tokio_tungstenite::tungstenite::Message::Text(
+                payload.into(),
+            ))
+        }
+        WebSocketMessageType::Binary => Ok(tokio_tungstenite::tungstenite::Message::Binary(
+            replay_frame.payload.clone().into(),
+        )),
+    }
+}
+
+fn websocket_message_matches_recorded_frame(
+    message: &tokio_tungstenite::tungstenite::Message,
+    replay_frame: &WebSocketFrame,
+) -> bool {
+    websocket_message_payload_for_recording(message).is_some_and(|(message_type, payload)| {
+        message_type == replay_frame.message_type && payload == replay_frame.payload
+    })
 }
 
 fn websocket_message_payload_for_recording(
@@ -4692,6 +5125,33 @@ fn is_websocket_upgrade_request(req: &Request<Incoming>) -> bool {
         .get(header::UPGRADE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+}
+
+fn websocket_match_key_for_request(
+    route_match_config: Option<&RouteMatchConfig>,
+    req: &Request<Incoming>,
+) -> Result<String, (StatusCode, &'static str)> {
+    matching::compute_match_key(
+        route_match_config,
+        req.method(),
+        req.uri(),
+        req.headers(),
+        &[],
+    )
+    .map_err(|err| {
+        tracing::debug!(error_kind = err.kind(), "failed to compute match key");
+        match err {
+            matching::MatchKeyError::InvalidJsonBody(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid JSON request body for matching",
+            ),
+            matching::MatchKeyError::InvalidJsonPath { .. }
+            | matching::MatchKeyError::SerializeJsonNode { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid route JSONPath matching configuration",
+            ),
+        }
+    })
 }
 
 fn simple_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {

@@ -33,6 +33,14 @@ bd dolt push          # Push beads updates to remote
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
+8. **Auto-shutdown (autocodex sessions)** - After handoff, terminate the active tmux session:
+   ```bash
+   scripts/autocodex-closeout.sh \
+     --quality-gates-summary "<tests/lints/build checks performed>" \
+     --handoff-note "<final summary for operators>"
+   ```
+   - Script refuses shutdown unless completion criteria are met (`open=0`, `in_progress=0`, `blocked=0`, `ready=0`) and git is clean/up to date.
+   - Use `--dry-run` to validate behavior without terminating tmux.
 
 **CRITICAL RULES:**
 - Work is NOT complete until `git push` succeeds

@@ -200,6 +200,25 @@ fn query_params_sorted(query: Option<&str>) -> Vec<(&str, &str)> {
     out
 }
 
+pub(crate) fn query_param_count(query: Option<&str>) -> usize {
+    query
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|segment| !segment.is_empty())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) fn stored_query_norm_param_count(stored_query_norm: &str) -> usize {
+    if let Some(query_fingerprints) = stored_query_norm.strip_prefix(QUERY_NORM_FINGERPRINT_PREFIX)
+    {
+        return query_param_count(Some(query_fingerprints));
+    }
+    query_param_count(Some(stored_query_norm))
+}
+
 fn normalized_query_from_sorted(sorted: &[(&str, &str)]) -> String {
     let mut normalized = String::new();
     for (idx, (name, value)) in sorted.iter().enumerate() {
@@ -648,7 +667,8 @@ mod tests {
     use super::{
         MatchKeyError, ParsedSubsetQuery, compute_match_key,
         normalize_stored_query_norm_to_fingerprint, normalized_query, normalized_query_fingerprint,
-        query_params_match, subset_normalized_query_matches_parsed_request,
+        query_param_count, query_params_match, stored_query_norm_param_count,
+        subset_normalized_query_matches_parsed_request,
         subset_query_candidate_fingerprints_with_limit,
         subset_query_candidate_normalizations_with_limit, subset_query_matches_parsed_request,
     };
@@ -1159,6 +1179,22 @@ headers_ignore = ["Date", "X-Request-Id"]
         expected.sort_unstable();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn query_param_count_ignores_empty_segments() {
+        assert_eq!(query_param_count(None), 0);
+        assert_eq!(query_param_count(Some("")), 0);
+        assert_eq!(query_param_count(Some("&&a=1&&b=2&")), 2);
+    }
+
+    #[test]
+    fn stored_query_norm_param_count_supports_fingerprint_and_legacy_formats() {
+        assert_eq!(stored_query_norm_param_count("a=1&b=2"), 2);
+        assert_eq!(
+            stored_query_norm_param_count(&normalized_query_fingerprint(Some("a=1&b=2&c=3"))),
+            3
+        );
     }
 
     #[test]

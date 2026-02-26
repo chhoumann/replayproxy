@@ -4189,14 +4189,7 @@ async fn lookup_recording_for_request_with_subset_limit(
     }
 
     let request_query = request_uri.query();
-    let request_query_param_count = request_query
-        .map(|query| {
-            query
-                .split('&')
-                .filter(|segment| !segment.is_empty())
-                .count()
-        })
-        .unwrap_or(0);
+    let request_query_param_count = matching::query_param_count(request_query);
 
     if let Some(subset_query_normalizations) =
         matching::subset_query_candidate_fingerprints_with_limit(

@@ -4,6 +4,11 @@ on:
   release:
     types:
       - published
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       tag:
@@ -15,12 +20,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-validate-${{ github.workflow }}-${{ github.ref }}
+  group: release-validate-${{ github.event.release.tag_name || github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: false
 
 jobs:
   validate:
     name: validate-${{ matrix.target }}
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -40,10 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.event.release.tag_name }}"
-          if [ -z "${tag}" ]; then
-            tag="${{ inputs.tag }}"
-          fi
+          tag="${{ github.event.release.tag_name || github.event.workflow_run.head_branch || inputs.tag || '' }}"
           if [ -z "${tag}" ]; then
             echo "release tag is required"
             exit 1
@@ -60,10 +66,23 @@ jobs:
           tag="${{ steps.meta.outputs.tag }}"
           target="${{ matrix.target }}"
           mkdir -p dist
-          gh release download "${tag}" \
-            --pattern "SHA256SUMS" \
-            --pattern "replayproxy-${tag}-${target}.tar.gz" \
-            --dir dist
+          for attempt in 1 2 3 4 5 6; do
+            if gh release download "${tag}" \
+              --pattern "SHA256SUMS" \
+              --pattern "replayproxy-${tag}-${target}.tar.gz" \
+              --dir dist; then
+              break
+            fi
+
+            if [ "${attempt}" -eq 6 ]; then
+              echo "failed to download release assets for ${tag} (${target})"
+              exit 1
+            fi
+
+            echo "assets not available yet; retrying in 10s (attempt ${attempt}/6)"
+            rm -f dist/SHA256SUMS "dist/replayproxy-${tag}-${target}.tar.gz"
+            sleep 10
+          done
 
       - name: Verify target checksum
         shell: bash

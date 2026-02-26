@@ -426,3 +426,4 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 - [`docs/session-export-format.md`](docs/session-export-format.md)
 - [`docs/live-api-validation.md`](docs/live-api-validation.md)
 - [`docs/performance.md`](docs/performance.md)
+- [`RELEASE_POLICY.md`](RELEASE_POLICY.md)

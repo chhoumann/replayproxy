@@ -38,7 +38,7 @@ Runtime mode resolution is:
 
 1. `routes[].mode` (if set)
 2. `proxy.mode` (if set)
-3. fallback `passthrough-cache`
+3. fallback `passthrough-cache` (also accepted as `hybrid`)
 
 ## Install
 
@@ -447,6 +447,7 @@ Mode workflow from CLI:
 replayproxy mode --config ./replayproxy.toml show --admin-addr 127.0.0.1:8081
 replayproxy mode --config ./replayproxy.toml set replay --admin-addr 127.0.0.1:8081
 replayproxy mode --config ./replayproxy.toml set record --admin-addr 127.0.0.1:8081 --persist
+replayproxy mode --config ./replayproxy.toml set hybrid --admin-addr 127.0.0.1:8081
 ```
 
 `mode set --persist` updates `proxy.mode` in the loaded config file.
@@ -525,7 +526,7 @@ curl -sS http://127.0.0.1:8081/_admin/status
 
 Common fixes:
 
-- Seed recordings first in `record` or `passthrough-cache` mode.
+- Seed recordings first in `record` or `hybrid` (`passthrough-cache`) mode.
 - Confirm active session is the one you expect.
 - Confirm route match settings (method/path/query/headers/body) still match the traffic.
 - Use `cache_miss = "forward"` if replay misses should fall back upstream.

@@ -14,7 +14,7 @@ The proxy operates in one of three modes, **configurable per route**:
 |---|---|
 | **Record** | Forward all requests to upstream, store request/response pairs in the database. Never serve from cache. |
 | **Replay** | Serve exclusively from cache. On cache miss: configurable per route to either return a `502 Gateway Not Recorded` error or fall through to upstream. |
-| **Passthrough-cache** | Forward to upstream, cache the response, and on subsequent matching requests return the cached version. |
+| **Passthrough-cache** (`hybrid` alias) | Replay cached responses when present; on misses, forward upstream and store the new response. |
 
 ---
 
@@ -91,6 +91,7 @@ To ensure deterministic matching, request components are normalized before hashi
 [[routes]]
 path_prefix = "/v1/chat/completions"
 mode = "passthrough-cache"
+# mode = "hybrid"        # equivalent alias
 cache_miss = "forward"   # or "error"
 
 [routes.match]

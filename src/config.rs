@@ -938,6 +938,7 @@ fn redact_error(route_name: Option<&str>, message: String) -> anyhow::Error {
 pub enum RouteMode {
     Record,
     Replay,
+    #[serde(alias = "hybrid")]
     PassthroughCache,
 }
 
@@ -959,8 +960,11 @@ impl FromStr for RouteMode {
         match s {
             "record" => Ok(Self::Record),
             "replay" => Ok(Self::Replay),
+            "hybrid" => Ok(Self::PassthroughCache),
             "passthrough-cache" => Ok(Self::PassthroughCache),
-            _ => bail!("invalid mode `{s}`; expected one of: record, replay, passthrough-cache"),
+            _ => bail!(
+                "invalid mode `{s}`; expected one of: record, replay, passthrough-cache, hybrid"
+            ),
         }
     }
 }
@@ -1349,6 +1353,35 @@ wat = 123
 
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "err: {err}");
+    }
+
+    #[test]
+    fn hybrid_mode_alias_parses_as_passthrough_cache() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+mode = "hybrid"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "https://example.com"
+mode = "hybrid"
+"#;
+
+        let config = Config::from_toml_str(toml).expect("config should parse");
+        assert_eq!(config.proxy.mode, Some(RouteMode::PassthroughCache));
+        assert_eq!(
+            config.routes.first().and_then(|route| route.mode),
+            Some(RouteMode::PassthroughCache)
+        );
+    }
+
+    #[test]
+    fn route_mode_from_str_accepts_hybrid_alias() {
+        let parsed = "hybrid"
+            .parse::<RouteMode>()
+            .expect("hybrid alias should parse");
+        assert_eq!(parsed, RouteMode::PassthroughCache);
     }
 
     #[test]

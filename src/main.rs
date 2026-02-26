@@ -221,7 +221,7 @@ enum ModeCommand {
     },
     /// Set runtime mode on a running proxy process.
     Set {
-        /// Mode value (`record`, `replay`, or `passthrough-cache`).
+        /// Mode value (`record`, `replay`, `passthrough-cache`, or `hybrid` alias).
         mode: RouteMode,
         /// Explicit admin listen address (`host:port`), required when config uses `admin_port = 0`.
         #[arg(long)]
@@ -2357,6 +2357,25 @@ admin_bind = "127.0.0.2"
                 mode: RouteMode::Replay,
                 admin_addr: Some("127.0.0.1:9090".parse().unwrap()),
                 persist: true,
+            }
+        );
+    }
+
+    #[test]
+    fn mode_set_parses_with_hybrid_alias() {
+        let cli = Cli::try_parse_from(["replayproxy", "mode", "set", "hybrid"])
+            .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Mode { config, action } => (config, action),
+            other => panic!("expected mode command, got {other:?}"),
+        };
+        assert_eq!(config, None);
+        assert_eq!(
+            action,
+            ModeCommand::Set {
+                mode: RouteMode::PassthroughCache,
+                admin_addr: None,
+                persist: false,
             }
         );
     }

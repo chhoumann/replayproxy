@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::io::ErrorKind;
 use std::{
     collections::HashMap,
     env, fs,
@@ -6,8 +8,6 @@ use std::{
     process::{Command, Output},
     sync::{Arc, Mutex},
 };
-#[cfg(target_os = "linux")]
-use std::io::ErrorKind;
 
 use anyhow::{Context, bail};
 use rcgen::{

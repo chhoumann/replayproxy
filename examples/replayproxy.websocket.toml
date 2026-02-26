@@ -1,0 +1,19 @@
+# WebSocket reverse-proxy workflow (record -> replay).
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+mode = "record"
+
+[storage]
+path = "./.replayproxy-data"
+active_session = "default"
+
+[[routes]]
+name = "ws-echo"
+path_prefix = "/ws"
+upstream = "http://127.0.0.1:9001"
+mode = "record"
+cache_miss = "error"
+
+[routes.websocket]
+recording_mode = "bidirectional"

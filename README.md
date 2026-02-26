@@ -77,6 +77,8 @@ Example configs:
 
 - [`examples/replayproxy.minimal.toml`](examples/replayproxy.minimal.toml)
 - [`examples/replayproxy.llm-redacted.toml`](examples/replayproxy.llm-redacted.toml)
+- [`examples/replayproxy.websocket.toml`](examples/replayproxy.websocket.toml)
+- [`examples/replayproxy.grpc.toml`](examples/replayproxy.grpc.toml)
 
 Lua transform examples:
 
@@ -95,6 +97,8 @@ Proto-aware gRPC matching via `[routes.grpc]` requires the `grpc` feature:
 ```bash
 cargo run --features grpc -- serve --config ./replayproxy.toml
 ```
+
+See [Quickstart: gRPC record then replay](#quickstart-grpc-record-then-replay) for a command-driven workflow.
 
 ## Quickstart: record then replay (reverse proxy)
 
@@ -161,6 +165,85 @@ curl -i "http://127.0.0.1:8080/get?not-recorded=1"
 ```
 
 Expected in replay mode: `502` with JSON body including `error`, `route`, `session`, and `match_key`.
+
+## Quickstart: WebSocket record then replay
+
+This flow uses [`examples/replayproxy.websocket.toml`](examples/replayproxy.websocket.toml) and `websocat`.
+
+1. Start your WebSocket upstream at `127.0.0.1:9001`, then run replayproxy:
+
+```bash
+replayproxy serve --config ./examples/replayproxy.websocket.toml
+```
+
+2. Connect through replayproxy in record mode and send frames:
+
+```bash
+websocat ws://127.0.0.1:8080/ws/echo
+```
+
+3. Confirm recording state, then switch to replay mode:
+
+```bash
+replayproxy recording --config ./examples/replayproxy.websocket.toml list
+replayproxy mode --config ./examples/replayproxy.websocket.toml set replay --admin-addr 127.0.0.1:8081
+```
+
+4. Re-run the same WebSocket flow:
+
+```bash
+websocat ws://127.0.0.1:8080/ws/echo
+```
+
+Expected: replay serves recorded frames from local storage. In `bidirectional` mode, client frame order/type/payload must match the original recording.
+
+## Quickstart: gRPC record then replay
+
+This flow uses [`examples/replayproxy.grpc.toml`](examples/replayproxy.grpc.toml), a local gRPC upstream on `127.0.0.1:50051`, and `grpcurl`.
+
+1. Start replayproxy with gRPC feature support:
+
+```bash
+cargo run --features grpc -- serve --config ./examples/replayproxy.grpc.toml
+```
+
+2. Record one request:
+
+```bash
+grpcurl -plaintext \
+  -import-path ./examples/protos \
+  -proto inference.proto \
+  -d '{"model_name":"model-a","input_text":"hello world","trace_id":"trace-a"}' \
+  127.0.0.1:8080 inference.InferenceService/Predict
+```
+
+3. Switch to replay mode:
+
+```bash
+replayproxy mode --config ./examples/replayproxy.grpc.toml set replay --admin-addr 127.0.0.1:8081
+```
+
+4. Replay hit (same gRPC `match_fields`, different non-match field):
+
+```bash
+grpcurl -plaintext \
+  -import-path ./examples/protos \
+  -proto inference.proto \
+  -d '{"model_name":"model-a","input_text":"hello world","trace_id":"trace-b"}' \
+  127.0.0.1:8080 inference.InferenceService/Predict
+```
+
+5. Replay miss (change a configured gRPC `match_field`):
+
+```bash
+grpcurl -plaintext \
+  -import-path ./examples/protos \
+  -proto inference.proto \
+  -d '{"model_name":"model-a","input_text":"different prompt","trace_id":"trace-c"}' \
+  127.0.0.1:8080 inference.InferenceService/Predict
+```
+
+Expected: replay hit is served from storage; replay miss returns `502 Gateway Not Recorded` unless `cache_miss = "forward"`.
 
 ## Reverse proxy vs forward proxy
 
@@ -395,6 +478,25 @@ Common fixes:
 - Ensure admin listener is enabled via `proxy.admin_port` or pass explicit `--admin-addr`.
 - If `admin_api_token` is configured, ensure the loaded config has the matching token (CLI admin calls forward it automatically).
 - `mode set --persist` requires a config file path source.
+
+### gRPC proto-aware matching not taking effect
+
+- Build/run replayproxy with `--features grpc` when using `[routes.grpc].match_fields`.
+- Without the `grpc` feature, replayproxy falls back to opaque request-body matching, which can cause unexpected replay misses.
+- `routes.grpc.match_fields` requires at least one `routes.grpc.proto_files` entry, and proto paths are resolved relative to the config file.
+- Ensure the client sends gRPC content types (`application/grpc` or `application/grpc+...`) and that `path_prefix` matches your service path.
+
+### WebSocket replay closes with mismatch
+
+- In replay mode with `recording_mode = "bidirectional"`, client frames must match the recorded order, type, and payload.
+- On mismatch, replayproxy closes the socket with a WebSocket policy close frame and mismatch reason.
+- Use `recording_mode = "server-only"` when client payloads are nondeterministic and should not be enforced in replay.
+- If you get `502 Gateway Not Recorded` before upgrade, verify mode/session and recording presence:
+
+```bash
+replayproxy mode --config ./examples/replayproxy.websocket.toml show --admin-addr 127.0.0.1:8081
+replayproxy recording --config ./examples/replayproxy.websocket.toml search "/ws/echo"
+```
 
 ### CA/TLS issues
 

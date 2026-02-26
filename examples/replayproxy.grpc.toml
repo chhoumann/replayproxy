@@ -1,0 +1,20 @@
+# gRPC reverse-proxy workflow with proto-aware match fields.
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+mode = "record"
+
+[storage]
+path = "./.replayproxy-data"
+active_session = "default"
+
+[[routes]]
+name = "grpc-inference"
+path_prefix = "/inference.InferenceService"
+upstream = "http://127.0.0.1:50051"
+mode = "record"
+cache_miss = "error"
+
+[routes.grpc]
+proto_files = ["./protos/inference.proto"]
+match_fields = ["model_name", "input_text"]

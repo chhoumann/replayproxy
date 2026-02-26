@@ -50,6 +50,18 @@ impl ScriptResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptRecording {
+    pub request: ScriptRequest,
+    pub response: ScriptResponse,
+}
+
+impl ScriptRecording {
+    pub fn new(request: ScriptRequest, response: ScriptResponse) -> Self {
+        Self { request, response }
+    }
+}
+
 pub fn run_on_request_script(
     route_ref: &str,
     script_label: &str,
@@ -79,6 +91,46 @@ pub fn run_on_response_script(
     let transformed = run_message_script(
         route_ref,
         "on_response",
+        "response",
+        script_label,
+        script_source,
+        response,
+        response_to_lua_table,
+        response_from_lua_table,
+    )?;
+    *response = transformed;
+    Ok(())
+}
+
+pub fn run_on_record_script(
+    route_ref: &str,
+    script_label: &str,
+    script_source: &str,
+    recording: &mut ScriptRecording,
+) -> anyhow::Result<()> {
+    let transformed = run_message_script(
+        route_ref,
+        "on_record",
+        "recording",
+        script_label,
+        script_source,
+        recording,
+        recording_to_lua_table,
+        recording_from_lua_table,
+    )?;
+    *recording = transformed;
+    Ok(())
+}
+
+pub fn run_on_replay_script(
+    route_ref: &str,
+    script_label: &str,
+    script_source: &str,
+    response: &mut ScriptResponse,
+) -> anyhow::Result<()> {
+    let transformed = run_message_script(
+        route_ref,
+        "on_replay",
         "response",
         script_label,
         script_source,
@@ -187,6 +239,13 @@ fn response_to_lua_table(lua: &Lua, response: &ScriptResponse) -> mlua::Result<T
     Ok(table)
 }
 
+fn recording_to_lua_table(lua: &Lua, recording: &ScriptRecording) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("request", request_to_lua_table(lua, &recording.request)?)?;
+    table.set("response", response_to_lua_table(lua, &recording.response)?)?;
+    Ok(table)
+}
+
 fn request_from_lua_table(table: Table) -> anyhow::Result<ScriptRequest> {
     let method: String = table
         .get("method")
@@ -240,6 +299,19 @@ fn response_from_lua_table(table: Table) -> anyhow::Result<ScriptResponse> {
         status,
         headers,
         body,
+    })
+}
+
+fn recording_from_lua_table(table: Table) -> anyhow::Result<ScriptRecording> {
+    let request_table: Table = table
+        .get("request")
+        .map_err(|err| anyhow::anyhow!("`recording.request` must be present and a table: {err}"))?;
+    let response_table: Table = table.get("response").map_err(|err| {
+        anyhow::anyhow!("`recording.response` must be present and a table: {err}")
+    })?;
+    Ok(ScriptRecording {
+        request: request_from_lua_table(request_table)?,
+        response: response_from_lua_table(response_table)?,
     })
 }
 
@@ -308,7 +380,10 @@ fn script_context_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{ScriptRequest, ScriptResponse, run_on_request_script, run_on_response_script};
+    use super::{
+        ScriptRecording, ScriptRequest, ScriptResponse, run_on_record_script, run_on_replay_script,
+        run_on_request_script, run_on_response_script,
+    };
     use std::collections::BTreeMap;
 
     fn headers(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -395,5 +470,74 @@ end
         assert!(message.contains("routes[2] (openai)"), "err: {message}");
         assert!(message.contains("scripts/request.lua"), "err: {message}");
         assert!(message.contains("boom"), "err: {message}");
+    }
+
+    #[test]
+    fn record_script_can_mutate_nested_request_and_response_values() {
+        let mut recording = ScriptRecording::new(
+            ScriptRequest::new(
+                "POST",
+                "/v1/chat",
+                headers(&[("authorization", "Bearer live")]),
+                br#"{"secret":"token"}"#.to_vec(),
+            ),
+            ScriptResponse::new(200, headers(&[("x-cache", "miss")]), b"upstream".to_vec()),
+        );
+        let script = r#"
+function transform(recording)
+  recording.request.headers["authorization"] = "[REDACTED]"
+  recording.request.body = "{\"secret\":\"[REDACTED]\"}"
+  recording.response.status = 203
+  recording.response.headers["x-cache"] = "recorded"
+  recording.response.body = "stored-response"
+  return recording
+end
+"#;
+
+        run_on_record_script(
+            "routes[3] (record)",
+            "scripts/on_record.lua",
+            script,
+            &mut recording,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recording.request.headers.get("authorization"),
+            Some(&"[REDACTED]".to_string())
+        );
+        assert_eq!(recording.request.body, br#"{"secret":"[REDACTED]"}"#);
+        assert_eq!(recording.response.status, 203);
+        assert_eq!(
+            recording.response.headers.get("x-cache"),
+            Some(&"recorded".to_string())
+        );
+        assert_eq!(recording.response.body, b"stored-response");
+    }
+
+    #[test]
+    fn replay_script_can_mutate_cached_response() {
+        let mut response = ScriptResponse::new(
+            201,
+            headers(&[("content-type", "text/plain")]),
+            b"cached".to_vec(),
+        );
+        let script = r#"
+response.status = 202
+response.headers["x-replayed"] = "1"
+response.body = "transformed-cache"
+"#;
+
+        run_on_replay_script(
+            "routes[4] (replay)",
+            "scripts/on_replay.lua",
+            script,
+            &mut response,
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 202);
+        assert_eq!(response.headers.get("x-replayed"), Some(&"1".to_string()));
+        assert_eq!(response.body, b"transformed-cache");
     }
 }

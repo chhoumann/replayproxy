@@ -366,6 +366,241 @@ on_response = "{}"
     let _ = upstream_shutdown().await;
 }
 
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn on_record_script_mutates_persisted_recording_without_changing_live_response() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_without_binary_header().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    fs::create_dir_all(&storage_dir).unwrap();
+    let script_path = temp_dir.path().join("on_record.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(recording)
+  recording.request.headers["authorization"] = "[REDACTED]"
+  recording.request.body = "{\"stored\":true}"
+  recording.response.status = 203
+  recording.response.headers["x-recorded"] = "1"
+  recording.response.body = "stored-response"
+  return recording
+end
+"#,
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.transform]
+on_record = "{}"
+"#,
+        storage_dir.display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let uri: Uri = format!("http://{}/api/store", proxy.listen_addr)
+        .parse()
+        .unwrap();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::AUTHORIZATION, "Bearer live-token")
+        .body(Full::new(Bytes::from_static(br#"{"live":true}"#)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(res.headers().get("x-recorded").is_none());
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/store");
+    assert_eq!(captured.body.as_ref(), br#"{"live":true}"#);
+
+    let db_path = storage_dir.join("default").join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let (request_headers, response_status, response_headers, request_body, response_body): (
+        String,
+        u16,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+    ) = conn
+        .query_row(
+            "SELECT request_headers_json, response_status, response_headers_json, request_body, response_body FROM recordings LIMIT 1;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    let request_headers: Vec<(String, Vec<u8>)> = serde_json::from_str(&request_headers).unwrap();
+    let response_headers: Vec<(String, Vec<u8>)> = serde_json::from_str(&response_headers).unwrap();
+    assert_eq!(
+        request_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"[REDACTED]".as_slice())
+    );
+    assert_eq!(response_status, 203);
+    assert_eq!(
+        response_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-recorded"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"1".as_slice())
+    );
+    assert_eq!(request_body.as_slice(), br#"{"stored":true}"#);
+    assert_eq!(response_body.as_slice(), b"stored-response");
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn on_replay_script_mutates_cached_response_without_changing_stored_recording() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_without_binary_header().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    fs::create_dir_all(&storage_dir).unwrap();
+    let script_path = temp_dir.path().join("on_replay.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(response)
+  response.status = 202
+  response.headers["x-replayed"] = "1"
+  response.body = response.body .. "::replayed"
+  return response
+end
+"#,
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+
+[routes.transform]
+on_replay = "{}"
+"#,
+        storage_dir.display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let uri: Uri = format!("http://{}/api/replay", proxy.listen_addr)
+        .parse()
+        .unwrap();
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(res.headers().get("x-replayed").is_none());
+    let first_body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(first_body.as_ref(), b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/replay");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        res.headers().get("x-replayed"),
+        Some(&HeaderValue::from_static("1"))
+    );
+    let second_body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(second_body.as_ref(), b"upstream-body::replayed");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        res.headers().get("x-replayed"),
+        Some(&HeaderValue::from_static("1"))
+    );
+    let third_body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(third_body.as_ref(), b"upstream-body::replayed");
+
+    assert!(
+        upstream_rx.recv().await.is_none(),
+        "replayed requests should not hit upstream"
+    );
+
+    let db_path = storage_dir.join("default").join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let (response_status, response_headers, response_body): (u16, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT response_status, response_headers_json, response_body FROM recordings LIMIT 1;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let response_headers: Vec<(String, Vec<u8>)> = serde_json::from_str(&response_headers).unwrap();
+    assert_eq!(response_status, StatusCode::CREATED.as_u16());
+    assert_eq!(response_body.as_slice(), b"upstream-body");
+    assert!(
+        response_headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("x-replayed")),
+        "stored recording should not be modified by on_replay"
+    );
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
 #[tokio::test]
 async fn forward_proxy_forwards_absolute_form_request_without_configured_upstream() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;

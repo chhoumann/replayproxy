@@ -50,7 +50,8 @@ use tokio_rustls::TlsAcceptor;
 
 #[cfg(feature = "scripting")]
 use crate::scripting::{
-    ScriptRequest, ScriptResponse, run_on_request_script, run_on_response_script,
+    ScriptRecording, ScriptRequest, ScriptResponse, run_on_record_script, run_on_replay_script,
+    run_on_request_script, run_on_response_script,
 };
 use crate::{
     ca,
@@ -2692,16 +2693,6 @@ async fn proxy_handler(
         record_response_status,
         record_response_headers,
     ) {
-        let request_headers = redact_recording_headers(request_headers, route.redact.as_ref());
-        let response_headers = redact_recording_headers(response_headers, route.redact.as_ref());
-        let request_body =
-            redact_recording_body_json(request_body.as_slice(), route.redact.as_ref());
-        let response_body = redact_recording_body_json(body_bytes.as_ref(), route.redact.as_ref());
-        let response_chunks = response_chunks_for_storage(
-            body_bytes.as_ref(),
-            response_body.as_slice(),
-            response_chunks,
-        );
         let created_at_unix_ms = match Recording::now_unix_ms() {
             Ok(ts) => ts,
             Err(err) => {
@@ -2716,7 +2707,7 @@ async fn proxy_handler(
             }
         };
 
-        let recording = Recording {
+        let mut recording = Recording {
             match_key,
             request_method,
             request_uri,
@@ -2724,9 +2715,53 @@ async fn proxy_handler(
             request_body,
             response_status,
             response_headers,
-            response_body,
+            response_body: body_bytes.to_vec(),
             created_at_unix_ms,
         };
+
+        #[cfg(not(feature = "scripting"))]
+        if route.transform.on_record.is_some() {
+            tracing::debug!(
+                route = %route.route_ref,
+                "on_record script is configured but scripting support is disabled"
+            );
+            respond!(
+                Some(upstream_latency),
+                proxy_simple_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "on_record script configured but this replayproxy build does not include scripting support",
+                )
+            );
+        }
+
+        #[cfg(feature = "scripting")]
+        if let Some(script) = route.transform.on_record.as_ref() {
+            if let Err(err) = apply_on_record_script(&route.route_ref, script, &mut recording) {
+                tracing::debug!("failed to run on_record script: {err}");
+                respond!(
+                    Some(upstream_latency),
+                    proxy_simple_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "on_record script failed"
+                    )
+                );
+            }
+        }
+
+        let pre_redaction_response_body = recording.response_body.clone();
+        recording.request_headers =
+            redact_recording_headers(recording.request_headers, route.redact.as_ref());
+        recording.response_headers =
+            redact_recording_headers(recording.response_headers, route.redact.as_ref());
+        recording.request_body =
+            redact_recording_body_json(recording.request_body.as_slice(), route.redact.as_ref());
+        recording.response_body =
+            redact_recording_body_json(recording.response_body.as_slice(), route.redact.as_ref());
+        let response_chunks = response_chunks_for_storage(
+            pre_redaction_response_body.as_slice(),
+            recording.response_body.as_slice(),
+            response_chunks,
+        );
 
         match storage.insert_recording(recording).await {
             Ok(recording_id) => {
@@ -2897,7 +2932,7 @@ async fn response_from_stored_recording(
         .as_ref()
         .map(|streaming| streaming.preserve_timing)
         .unwrap_or(false);
-    let response_chunks = if route.streaming.is_some() {
+    let mut response_chunks = if route.streaming.is_some() {
         match storage.get_response_chunks(stored_recording.id).await {
             Ok(chunks) => Some(chunks).filter(|chunks| !chunks.is_empty()),
             Err(err) => {
@@ -2912,7 +2947,37 @@ async fn response_from_stored_recording(
     } else {
         None
     };
-    response_from_recording(stored_recording.recording, response_chunks, preserve_timing)
+    let mut recording = stored_recording.recording;
+
+    #[cfg(not(feature = "scripting"))]
+    if route.transform.on_replay.is_some() {
+        tracing::debug!(
+            route = %route.route_ref,
+            "on_replay script is configured but scripting support is disabled"
+        );
+        return proxy_simple_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "on_replay script configured but this replayproxy build does not include scripting support",
+        );
+    }
+
+    #[cfg(feature = "scripting")]
+    if let Some(script) = route.transform.on_replay.as_ref() {
+        if let Err(err) = apply_on_replay_script(
+            &route.route_ref,
+            script,
+            &mut recording,
+            &mut response_chunks,
+        ) {
+            tracing::debug!("failed to run on_replay script: {err}");
+            return proxy_simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "on_replay script failed",
+            );
+        }
+    }
+
+    response_from_recording(recording, response_chunks, preserve_timing)
 }
 
 fn response_from_recording(
@@ -2926,6 +2991,11 @@ fn response_from_recording(
         response_body,
         ..
     } = recording;
+    let body_len = response_body.len();
+    let use_chunk_stream = response_chunks
+        .as_ref()
+        .map(|chunks| !chunks.is_empty())
+        .unwrap_or(false);
     let body = match response_chunks {
         Some(chunks) if !chunks.is_empty() => boxed_replay_chunks(chunks, preserve_timing),
         _ => boxed_full(Bytes::from(response_body)),
@@ -2949,6 +3019,13 @@ fn response_from_recording(
         response.headers_mut().append(header_name, header_value);
     }
     strip_hop_by_hop_headers(response.headers_mut());
+    if use_chunk_stream {
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+    } else if let Ok(content_length) = HeaderValue::from_str(&body_len.to_string()) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, content_length);
+    }
 
     response
 }
@@ -3332,6 +3409,91 @@ fn apply_on_response_script(
 }
 
 #[cfg(feature = "scripting")]
+fn apply_on_record_script(
+    route_ref: &str,
+    script: &LoadedScript,
+    recording: &mut Recording,
+) -> anyhow::Result<()> {
+    let mut script_recording = ScriptRecording::new(
+        ScriptRequest::new(
+            recording.request_method.clone(),
+            recording.request_uri.clone(),
+            script_headers_from_recording_headers(
+                &recording.request_headers,
+                "on_record",
+                "request.headers",
+            )?,
+            recording.request_body.clone(),
+        ),
+        ScriptResponse::new(
+            recording.response_status,
+            script_headers_from_recording_headers(
+                &recording.response_headers,
+                "on_record",
+                "response.headers",
+            )?,
+            recording.response_body.clone(),
+        ),
+    );
+    run_on_record_script(
+        route_ref,
+        &script.path.display().to_string(),
+        script.source.as_ref(),
+        &mut script_recording,
+    )?;
+
+    recording.request_method = script_recording.request.method;
+    recording.request_uri = script_recording.request.url;
+    recording.request_headers =
+        script_headers_to_recording_headers(script_recording.request.headers)?;
+    recording.request_body = script_recording.request.body;
+    recording.response_status = script_recording.response.status;
+    recording.response_headers =
+        script_headers_to_recording_headers(script_recording.response.headers)?;
+    recording.response_body = script_recording.response.body;
+    Ok(())
+}
+
+#[cfg(feature = "scripting")]
+fn apply_on_replay_script(
+    route_ref: &str,
+    script: &LoadedScript,
+    recording: &mut Recording,
+    response_chunks: &mut Option<Vec<ResponseChunk>>,
+) -> anyhow::Result<()> {
+    let original_body = recording.response_body.clone();
+    let mut response = ScriptResponse::new(
+        recording.response_status,
+        script_headers_from_recording_headers(
+            &recording.response_headers,
+            "on_replay",
+            "response.headers",
+        )?,
+        recording.response_body.clone(),
+    );
+    run_on_replay_script(
+        route_ref,
+        &script.path.display().to_string(),
+        script.source.as_ref(),
+        &mut response,
+    )?;
+
+    recording.response_status = response.status;
+    recording.response_headers = script_headers_to_recording_headers(response.headers)?;
+    recording.response_body = response.body;
+
+    if let Some(chunks) = response_chunks.take() {
+        let adjusted = response_chunks_for_storage(
+            original_body.as_slice(),
+            recording.response_body.as_slice(),
+            chunks,
+        );
+        *response_chunks = Some(adjusted).filter(|chunks| !chunks.is_empty());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "scripting")]
 fn script_headers_from_http(
     headers: &hyper::HeaderMap,
     hook_name: &str,
@@ -3350,6 +3512,24 @@ fn script_headers_from_http(
 }
 
 #[cfg(feature = "scripting")]
+fn script_headers_from_recording_headers(
+    headers: &[(String, Vec<u8>)],
+    hook_name: &str,
+    field_name: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (name, value) in headers {
+        let value = std::str::from_utf8(value).map_err(|err| {
+            anyhow::anyhow!(
+                "cannot run {hook_name} script with non-UTF-8 value for `{field_name}.{name}`: {err}",
+            )
+        })?;
+        out.insert(name.clone(), value.to_owned());
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "scripting")]
 fn script_headers_to_http(headers: BTreeMap<String, String>) -> anyhow::Result<hyper::HeaderMap> {
     let mut out = hyper::HeaderMap::new();
     for (name, value) in headers {
@@ -3359,6 +3539,22 @@ fn script_headers_to_http(headers: BTreeMap<String, String>) -> anyhow::Result<h
             anyhow::anyhow!("invalid transformed header value for `{name}`: {err}")
         })?;
         out.insert(header_name, header_value);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "scripting")]
+fn script_headers_to_recording_headers(
+    headers: BTreeMap<String, String>,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid transformed header name `{name}`: {err}"))?;
+        HeaderValue::from_str(&value).map_err(|err| {
+            anyhow::anyhow!("invalid transformed header value for `{name}`: {err}")
+        })?;
+        out.push((name, value.into_bytes()));
     }
     Ok(out)
 }
@@ -4921,6 +5117,8 @@ upstream = "http://127.0.0.1:1"
         fs::create_dir_all(&scripts_dir).expect("scripts dir should be created");
         let request_script_path = scripts_dir.join("on_request.lua");
         let response_script_path = scripts_dir.join("on_response.lua");
+        let record_script_path = scripts_dir.join("on_record.lua");
+        let replay_script_path = scripts_dir.join("on_replay.lua");
         fs::write(
             &request_script_path,
             "function transform(request) return request end",
@@ -4931,6 +5129,16 @@ upstream = "http://127.0.0.1:1"
             "function transform(response) return response end",
         )
         .expect("response script should be written");
+        fs::write(
+            &record_script_path,
+            "function transform(recording) return recording end",
+        )
+        .expect("record script should be written");
+        fs::write(
+            &replay_script_path,
+            "function transform(response) return response end",
+        )
+        .expect("replay script should be written");
         let config_path = temp_dir.path().join("replayproxy.toml");
         fs::write(
             &config_path,
@@ -4946,6 +5154,8 @@ upstream = "http://127.0.0.1:1234"
 [routes.transform]
 on_request = "scripts/on_request.lua"
 on_response = "scripts/on_response.lua"
+on_record = "scripts/on_record.lua"
+on_replay = "scripts/on_replay.lua"
 "#,
         )
         .expect("config should be written");
@@ -4965,6 +5175,16 @@ on_response = "scripts/on_response.lua"
             .on_response
             .as_ref()
             .expect("on_response should be loaded");
+        let loaded_record = route
+            .transform
+            .on_record
+            .as_ref()
+            .expect("on_record should be loaded");
+        let loaded_replay = route
+            .transform
+            .on_replay
+            .as_ref()
+            .expect("on_replay should be loaded");
 
         assert_eq!(loaded_request.path, request_script_path);
         assert_eq!(
@@ -4974,6 +5194,16 @@ on_response = "scripts/on_response.lua"
         assert_eq!(loaded_response.path, response_script_path);
         assert_eq!(
             loaded_response.source.as_ref(),
+            "function transform(response) return response end"
+        );
+        assert_eq!(loaded_record.path, record_script_path);
+        assert_eq!(
+            loaded_record.source.as_ref(),
+            "function transform(recording) return recording end"
+        );
+        assert_eq!(loaded_replay.path, replay_script_path);
+        assert_eq!(
+            loaded_replay.source.as_ref(),
             "function transform(response) return response end"
         );
     }

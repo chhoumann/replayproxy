@@ -384,7 +384,6 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 
 - WebSocket capture/replay is not implemented yet.
 - gRPC capture/replay is not implemented yet.
-- Lua transform runtime currently applies `on_request` and `on_response`; `on_record` and `on_replay` are not wired yet.
 - Session export/import moves recording objects but not streaming chunk metadata.
 - No built-in TTL/retention/eviction policy for stored recordings.
 - Query `subset` matching can fall back to scan-heavy behavior on very large candidate sets.

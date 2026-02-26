@@ -4,6 +4,7 @@ use std::{
     convert::Infallible,
     error::Error as StdError,
     fmt::Write as _,
+    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
@@ -20,7 +21,6 @@ use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::{Frame, Incoming},
-    client::conn::http1,
     header::{self, HeaderName, HeaderValue},
     http::uri::Authority,
     service::service_fn,
@@ -167,7 +167,6 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let runtime_mode_override = Arc::new(RwLock::new(None));
 
     let state = Arc::new(ProxyState::new(
-        listen_addr,
         Arc::clone(&runtime_config),
         client,
         Arc::clone(&runtime_status),
@@ -1387,7 +1386,6 @@ fn absolute_watch_path(path: &std::path::Path) -> PathBuf {
 
 #[derive(Debug)]
 struct ProxyState {
-    proxy_listen_addr: SocketAddr,
     runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
     client: HttpClient,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
@@ -1403,7 +1401,6 @@ struct MitmTlsState {
 
 impl ProxyState {
     fn new(
-        proxy_listen_addr: SocketAddr,
         runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
         client: HttpClient,
         status: Arc<RuntimeStatus>,
@@ -1412,7 +1409,6 @@ impl ProxyState {
         mitm_tls: Option<Arc<MitmTlsState>>,
     ) -> Self {
         Self {
-            proxy_listen_addr,
             runtime_config,
             client,
             session_runtime,
@@ -2700,8 +2696,7 @@ async fn mitm_upgraded_connection(
         let state = Arc::clone(&state);
         let connect_authority = service_connect_authority.clone();
         async move {
-            let response =
-                dispatch_tunneled_request_via_proxy_listener(req, state, &connect_authority).await;
+            let response = dispatch_tunneled_https_request(req, state, connect_authority).await;
             Ok::<_, Infallible>(response)
         }
     });
@@ -2713,94 +2708,31 @@ async fn mitm_upgraded_connection(
     Ok(())
 }
 
-async fn dispatch_tunneled_request_via_proxy_listener(
+fn dispatch_tunneled_https_request(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
-    connect_authority: &Authority,
-) -> Response<ProxyBody> {
-    let req = match normalize_tunneled_https_request(req, connect_authority) {
-        Ok(req) => req,
-        Err(err) => {
-            tracing::debug!(
-                authority = %connect_authority,
-                "failed to normalize CONNECT tunneled request: {err}"
-            );
-            return proxy_simple_response(
-                StatusCode::BAD_REQUEST,
-                "invalid HTTPS request target inside CONNECT tunnel",
-            );
-        }
-    };
+    connect_authority: Authority,
+) -> Pin<Box<dyn Future<Output = Response<ProxyBody>> + Send>> {
+    Box::pin(async move {
+        let req = match normalize_tunneled_https_request(req, &connect_authority) {
+            Ok(req) => req,
+            Err(err) => {
+                tracing::debug!(
+                    authority = %connect_authority,
+                    "failed to normalize CONNECT tunneled request: {err}"
+                );
+                return proxy_simple_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid HTTPS request target inside CONNECT tunnel",
+                );
+            }
+        };
 
-    let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            tracing::debug!("failed reading CONNECT tunneled request body: {err}");
-            return proxy_simple_response(
-                StatusCode::BAD_REQUEST,
-                "failed to read HTTPS request body inside CONNECT tunnel",
-            );
+        match proxy_handler(req, state).await {
+            Ok(response) => response,
+            Err(never) => match never {},
         }
-    };
-
-    let stream = match TcpStream::connect(state.proxy_listen_addr).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            tracing::debug!(
-                proxy_listen = %state.proxy_listen_addr,
-                "failed opening internal proxy dispatch connection for CONNECT tunnel: {err}"
-            );
-            return proxy_simple_response(
-                StatusCode::BAD_GATEWAY,
-                "failed dispatching HTTPS request inside CONNECT tunnel",
-            );
-        }
-    };
-    let io = TokioIo::new(stream);
-    let (mut sender, connection) = match http1::handshake::<_, Full<Bytes>>(io).await {
-        Ok(handshake) => handshake,
-        Err(err) => {
-            tracing::debug!("failed internal proxy dispatch handshake for CONNECT tunnel: {err}");
-            return proxy_simple_response(
-                StatusCode::BAD_GATEWAY,
-                "failed dispatching HTTPS request inside CONNECT tunnel",
-            );
-        }
-    };
-    let connection_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-
-    let internal_request = Request::from_parts(parts, Full::new(body_bytes));
-    let response = match sender.send_request(internal_request).await {
-        Ok(response) => response,
-        Err(err) => {
-            tracing::debug!("internal proxy dispatch request for CONNECT tunnel failed: {err}");
-            connection_task.abort();
-            return proxy_simple_response(
-                StatusCode::BAD_GATEWAY,
-                "failed dispatching HTTPS request inside CONNECT tunnel",
-            );
-        }
-    };
-    drop(sender);
-
-    let (response_parts, response_body) = response.into_parts();
-    let response_body_bytes = match response_body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            tracing::debug!("failed reading internal proxy dispatch response body: {err}");
-            connection_task.abort();
-            return proxy_simple_response(
-                StatusCode::BAD_GATEWAY,
-                "failed reading HTTPS response body inside CONNECT tunnel",
-            );
-        }
-    };
-
-    let _ = connection_task.await;
-    Response::from_parts(response_parts, boxed_full(response_body_bytes))
+    })
 }
 
 fn set_host_header(headers: &mut hyper::HeaderMap, uri: &Uri) {

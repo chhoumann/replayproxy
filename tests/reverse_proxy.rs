@@ -351,6 +351,140 @@ cache_miss = "error"
 }
 
 #[tokio::test]
+async fn https_connect_mitm_replay_streaming_preserves_chunk_boundaries() {
+    let expected_chunks = vec![
+        Bytes::from_static(b"data: first\n\n"),
+        Bytes::from_static(b"data: second\n\n"),
+        Bytes::from_static(b"data: done\n\n"),
+    ];
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_with_response_chunks(expected_chunks.clone()).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ca_dir = temp_dir.path().join("ca");
+    let ca_paths = replayproxy::ca::generate_ca(&ca_dir, false).unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    let session = "default";
+    let expected_body = Bytes::from_static(b"data: first\n\ndata: second\n\ndata: done\n\n");
+
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.streaming]
+preserve_timing = false
+"#,
+        ca_paths.cert_path.display(),
+        ca_paths.key_path.display(),
+        storage_dir.display(),
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+    let tls_client_config = tls_client_config_for_ca_cert(&ca_paths.cert_path);
+
+    let (record_status, record_body) = send_https_get_via_connect(
+        record_proxy.listen_addr,
+        "api.example.test:443",
+        "api.example.test",
+        Arc::clone(&tls_client_config),
+        "/api/stream",
+    )
+    .await;
+    assert_eq!(record_status, StatusCode::CREATED);
+    assert_eq!(record_body, expected_body);
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/stream");
+
+    let db_path = storage_dir.join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT chunk_index, offset_ms, chunk_body
+            FROM recording_response_chunks
+            ORDER BY chunk_index ASC
+            "#,
+        )
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    let mut recorded_chunks = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        recorded_chunks.push((
+            row.get::<_, i64>(0).unwrap(),
+            row.get::<_, i64>(1).unwrap(),
+            row.get::<_, Vec<u8>>(2).unwrap(),
+        ));
+    }
+    assert_eq!(recorded_chunks.len(), expected_chunks.len());
+    for (index, expected_chunk) in expected_chunks.iter().enumerate() {
+        let (stored_index, _, stored_body) = &recorded_chunks[index];
+        assert_eq!(*stored_index, i64::try_from(index).unwrap());
+        assert_eq!(stored_body.as_slice(), expected_chunk.as_ref());
+    }
+
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+
+[routes.streaming]
+preserve_timing = false
+"#,
+        ca_paths.cert_path.display(),
+        ca_paths.key_path.display(),
+        storage_dir.display(),
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let (replay_status, replay_chunks) = send_https_get_chunks_via_connect(
+        replay_proxy.listen_addr,
+        "api.example.test:443",
+        "api.example.test",
+        tls_client_config,
+        "/api/stream",
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::CREATED);
+    assert_eq!(replay_chunks, expected_chunks);
+
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn oversized_request_body_returns_413_without_hitting_upstream() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
@@ -4176,6 +4310,31 @@ async fn send_https_get_via_connect(
     tls_client_config: Arc<ClientConfig>,
     request_uri: &str,
 ) -> (StatusCode, Bytes) {
+    let (status, chunks) = send_https_get_chunks_via_connect(
+        proxy_addr,
+        connect_authority,
+        tls_server_name,
+        tls_client_config,
+        request_uri,
+    )
+    .await;
+
+    let total_len: usize = chunks.iter().map(Bytes::len).sum();
+    let mut body = Vec::with_capacity(total_len);
+    for chunk in chunks {
+        body.extend_from_slice(chunk.as_ref());
+    }
+
+    (status, Bytes::from(body))
+}
+
+async fn send_https_get_chunks_via_connect(
+    proxy_addr: SocketAddr,
+    connect_authority: &str,
+    tls_server_name: &str,
+    tls_client_config: Arc<ClientConfig>,
+    request_uri: &str,
+) -> (StatusCode, Vec<Bytes>) {
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     let connect_request = format!(
         "CONNECT {connect_authority} HTTP/1.1\r\nHost: {connect_authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
@@ -4207,12 +4366,22 @@ async fn send_https_get_via_connect(
         .unwrap();
     let res = sender.send_request(req).await.unwrap();
     let status = res.status();
-    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let mut body = res.into_body();
+    let mut chunks = Vec::new();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.unwrap();
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if !data.is_empty() {
+            chunks.push(data);
+        }
+    }
 
     drop(sender);
     let _ = connection_task.await;
 
-    (status, body)
+    (status, chunks)
 }
 
 async fn spawn_upstream() -> (

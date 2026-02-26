@@ -4174,20 +4174,6 @@ async fn lookup_recording_for_request_with_subset_limit(
     }
 
     let request_query = request_uri.query();
-    if let Some(subset_query_normalizations) =
-        matching::subset_query_candidate_normalizations_with_limit(
-            request_query,
-            subset_candidate_limit,
-        )
-    {
-        return storage
-            .get_latest_recording_with_id_by_match_key_and_query_subset(
-                match_key,
-                subset_query_normalizations,
-            )
-            .await;
-    }
-
     let request_query_param_count = request_query
         .map(|query| {
             query
@@ -4196,11 +4182,59 @@ async fn lookup_recording_for_request_with_subset_limit(
                 .count()
         })
         .unwrap_or(0);
+
+    if let Some(subset_query_normalizations) =
+        matching::subset_query_candidate_normalizations_with_limit(
+            request_query,
+            subset_candidate_limit,
+        )
+    {
+        let fast_path_result = storage
+            .get_latest_recording_with_id_by_match_key_and_query_subset(
+                match_key,
+                subset_query_normalizations,
+            )
+            .await?;
+        if fast_path_result.is_some() {
+            return Ok(fast_path_result);
+        }
+
+        return run_subset_lookup_fallback_scan(
+            storage,
+            match_key,
+            request_query,
+            subset_candidate_limit,
+            request_query_param_count,
+            "fast_path_miss",
+        )
+        .await;
+    }
+
+    run_subset_lookup_fallback_scan(
+        storage,
+        match_key,
+        request_query,
+        subset_candidate_limit,
+        request_query_param_count,
+        "candidate_limit_exceeded",
+    )
+    .await
+}
+
+async fn run_subset_lookup_fallback_scan(
+    storage: &Storage,
+    match_key: &str,
+    request_query: Option<&str>,
+    subset_candidate_limit: usize,
+    request_query_param_count: usize,
+    fallback_reason: &'static str,
+) -> anyhow::Result<Option<StoredRecording>> {
     tracing::debug!(
         match_key = %sanitize_match_key(match_key),
         subset_candidate_limit,
         request_query_param_count,
-        "subset candidate combinations exceeded limit; falling back to recording scan"
+        fallback_reason,
+        "subset lookup falling back to recording scan"
     );
 
     let fallback_result = storage
@@ -4213,6 +4247,7 @@ async fn lookup_recording_for_request_with_subset_limit(
         match_key = %sanitize_match_key(match_key),
         subset_candidate_limit,
         request_query_param_count,
+        fallback_reason,
         matched = fallback_result.recording.is_some(),
         scanned_rows = fallback_result.scanned_rows,
         "completed subset lookup fallback recording scan"

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{config::Config, matching, session};
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const SQLITE_MAX_BIND_PARAMS: usize = 999;
 const QUERY_SUBSET_CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMS - 1;
 
@@ -64,6 +64,29 @@ pub struct ResponseChunk {
     pub chunk_index: u32,
     pub offset_ms: u64,
     pub chunk_body: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebSocketFrameDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebSocketMessageType {
+    Text,
+    Binary,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct WebSocketFrame {
+    pub frame_index: u32,
+    pub offset_ms: u64,
+    pub direction: WebSocketFrameDirection,
+    pub message_type: WebSocketMessageType,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +212,23 @@ impl Storage {
         .context("join insert_response_chunks task")?
     }
 
+    pub async fn insert_websocket_frames(
+        &self,
+        recording_id: i64,
+        frames: Vec<WebSocketFrame>,
+    ) -> anyhow::Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            insert_websocket_frames_blocking(&db_path, recording_id, frames)
+        })
+        .await
+        .context("join insert_websocket_frames task")?
+    }
+
     pub async fn get_recording_by_match_key(
         &self,
         match_key: &str,
@@ -241,6 +281,16 @@ impl Storage {
         tokio::task::spawn_blocking(move || get_response_chunks_blocking(&db_path, recording_id))
             .await
             .context("join get_response_chunks task")?
+    }
+
+    pub async fn get_websocket_frames(
+        &self,
+        recording_id: i64,
+    ) -> anyhow::Result<Vec<WebSocketFrame>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || get_websocket_frames_blocking(&db_path, recording_id))
+            .await
+            .context("join get_websocket_frames task")?
     }
 
     pub async fn get_latest_recording_by_match_key_and_query_subset(
@@ -503,19 +553,38 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
 
                 CREATE INDEX IF NOT EXISTS recording_response_chunks_replay_idx
                   ON recording_response_chunks(recording_id, chunk_index);
+
+                CREATE TABLE IF NOT EXISTS recording_websocket_frames (
+                  recording_id INTEGER NOT NULL,
+                  frame_index INTEGER NOT NULL,
+                  direction TEXT NOT NULL CHECK(direction IN ('client-to-server', 'server-to-client')),
+                  message_type TEXT NOT NULL CHECK(message_type IN ('text', 'binary')),
+                  offset_ms INTEGER NOT NULL,
+                  payload BLOB NOT NULL,
+                  PRIMARY KEY (recording_id, frame_index),
+                  FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS recording_websocket_frames_replay_idx
+                  ON recording_websocket_frames(recording_id, frame_index);
                 "#,
             )
-            .context("create sqlite schema v3")?;
+            .context("create sqlite schema v4")?;
 
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-                .context("set PRAGMA user_version=3")?;
+                .context("set PRAGMA user_version=4")?;
             Ok(())
         }
         1 => {
             migrate_v1_to_v2(conn)?;
-            migrate_v2_to_v3(conn)
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
         }
-        2 => migrate_v2_to_v3(conn),
+        2 => {
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
+        }
+        3 => migrate_v3_to_v4(conn),
         SCHEMA_VERSION => Ok(()),
         _ => anyhow::bail!(
             "unsupported recordings.db schema version {user_version} (expected {SCHEMA_VERSION})"
@@ -560,8 +629,33 @@ fn migrate_v2_to_v3(conn: &mut Connection) -> anyhow::Result<()> {
     )
     .context("migrate sqlite schema v2 -> v3")?;
 
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+    conn.pragma_update(None, "user_version", 3)
         .context("set PRAGMA user_version=3")?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(conn: &mut Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS recording_websocket_frames (
+          recording_id INTEGER NOT NULL,
+          frame_index INTEGER NOT NULL,
+          direction TEXT NOT NULL CHECK(direction IN ('client-to-server', 'server-to-client')),
+          message_type TEXT NOT NULL CHECK(message_type IN ('text', 'binary')),
+          offset_ms INTEGER NOT NULL,
+          payload BLOB NOT NULL,
+          PRIMARY KEY (recording_id, frame_index),
+          FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS recording_websocket_frames_replay_idx
+          ON recording_websocket_frames(recording_id, frame_index);
+        "#,
+    )
+    .context("migrate sqlite schema v3 -> v4")?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("set PRAGMA user_version=4")?;
     Ok(())
 }
 
@@ -800,6 +894,79 @@ fn insert_response_chunks_blocking(
     Ok(())
 }
 
+fn websocket_frame_direction_to_db_value(direction: WebSocketFrameDirection) -> &'static str {
+    match direction {
+        WebSocketFrameDirection::ClientToServer => "client-to-server",
+        WebSocketFrameDirection::ServerToClient => "server-to-client",
+    }
+}
+
+fn websocket_frame_direction_from_db_value(value: &str) -> anyhow::Result<WebSocketFrameDirection> {
+    match value {
+        "client-to-server" => Ok(WebSocketFrameDirection::ClientToServer),
+        "server-to-client" => Ok(WebSocketFrameDirection::ServerToClient),
+        _ => anyhow::bail!("deserialize websocket frame direction `{value}`"),
+    }
+}
+
+fn websocket_message_type_to_db_value(message_type: WebSocketMessageType) -> &'static str {
+    match message_type {
+        WebSocketMessageType::Text => "text",
+        WebSocketMessageType::Binary => "binary",
+    }
+}
+
+fn websocket_message_type_from_db_value(value: &str) -> anyhow::Result<WebSocketMessageType> {
+    match value {
+        "text" => Ok(WebSocketMessageType::Text),
+        "binary" => Ok(WebSocketMessageType::Binary),
+        _ => anyhow::bail!("deserialize websocket message_type `{value}`"),
+    }
+}
+
+fn insert_websocket_frames_blocking(
+    path: &Path,
+    recording_id: i64,
+    frames: Vec<WebSocketFrame>,
+) -> anyhow::Result<()> {
+    let mut conn = open_connection(path)?;
+    let tx = conn
+        .transaction()
+        .context("open websocket frame transaction")?;
+    {
+        let mut stmt = tx
+            .prepare(
+                r#"
+                INSERT INTO recording_websocket_frames (
+                  recording_id,
+                  frame_index,
+                  direction,
+                  message_type,
+                  offset_ms,
+                  payload
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )
+            .context("prepare insert websocket frame")?;
+
+        for frame in frames {
+            let offset_ms = i64::try_from(frame.offset_ms)
+                .context("websocket frame offset_ms exceeds sqlite integer range")?;
+            stmt.execute(params![
+                recording_id,
+                i64::from(frame.frame_index),
+                websocket_frame_direction_to_db_value(frame.direction),
+                websocket_message_type_to_db_value(frame.message_type),
+                offset_ms,
+                frame.payload
+            ])
+            .context("insert recording websocket frame")?;
+        }
+    }
+    tx.commit().context("commit websocket frame transaction")?;
+    Ok(())
+}
+
 fn get_response_chunks_blocking(
     path: &Path,
     recording_id: i64,
@@ -848,6 +1015,66 @@ fn get_response_chunks_blocking(
     }
 
     Ok(chunks)
+}
+
+fn get_websocket_frames_blocking(
+    path: &Path,
+    recording_id: i64,
+) -> anyhow::Result<Vec<WebSocketFrame>> {
+    let conn = open_connection(path)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+              frame_index,
+              direction,
+              message_type,
+              offset_ms,
+              payload
+            FROM recording_websocket_frames
+            WHERE recording_id = ?1
+            ORDER BY frame_index ASC
+            "#,
+        )
+        .context("prepare select websocket frames by recording id")?;
+
+    let mut rows = stmt
+        .query(params![recording_id])
+        .context("query websocket frames by recording id")?;
+
+    let mut frames = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .context("iterate websocket frames by recording id")?
+    {
+        let frame_index = row
+            .get::<_, i64>(0)
+            .context("deserialize websocket frame index")?;
+        let direction = row
+            .get::<_, String>(1)
+            .context("deserialize websocket frame direction")?;
+        let message_type = row
+            .get::<_, String>(2)
+            .context("deserialize websocket message_type")?;
+        let offset_ms = row
+            .get::<_, i64>(3)
+            .context("deserialize websocket frame offset_ms")?;
+        let payload = row
+            .get::<_, Vec<u8>>(4)
+            .context("deserialize websocket frame payload")?;
+
+        frames.push(WebSocketFrame {
+            frame_index: u32::try_from(frame_index)
+                .context("websocket frame index cannot be negative or exceed u32")?,
+            direction: websocket_frame_direction_from_db_value(&direction)?,
+            message_type: websocket_message_type_from_db_value(&message_type)?,
+            offset_ms: u64::try_from(offset_ms)
+                .context("websocket frame offset_ms cannot be negative")?,
+            payload,
+        });
+    }
+
+    Ok(frames)
 }
 
 fn recording_query_from_uri(uri: &str) -> Option<&str> {
@@ -1341,6 +1568,7 @@ mod tests {
 
     use super::{
         Recording, RecordingSearch, ResponseChunk, SessionManager, SessionManagerError, Storage,
+        WebSocketFrame, WebSocketFrameDirection, WebSocketMessageType,
     };
     use crate::{config::Config, matching, session};
 
@@ -1506,6 +1734,108 @@ active_session = "default"
 
         assert!(
             err.to_string().contains("insert recording response chunk"),
+            "err: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_and_fetch_websocket_frames_orders_by_frame_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let recording = Recording {
+            match_key: "ws-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/ws/echo".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 101,
+            response_headers: Vec::new(),
+            response_body: Vec::new(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let recording_id = storage.insert_recording(recording).await.unwrap();
+
+        storage
+            .insert_websocket_frames(
+                recording_id,
+                vec![
+                    WebSocketFrame {
+                        frame_index: 2,
+                        offset_ms: 55,
+                        direction: WebSocketFrameDirection::ServerToClient,
+                        message_type: WebSocketMessageType::Binary,
+                        payload: vec![0xde, 0xad, 0xbe, 0xef],
+                    },
+                    WebSocketFrame {
+                        frame_index: 0,
+                        offset_ms: 5,
+                        direction: WebSocketFrameDirection::ServerToClient,
+                        message_type: WebSocketMessageType::Text,
+                        payload: b"hello".to_vec(),
+                    },
+                    WebSocketFrame {
+                        frame_index: 1,
+                        offset_ms: 20,
+                        direction: WebSocketFrameDirection::ClientToServer,
+                        message_type: WebSocketMessageType::Text,
+                        payload: b"ack".to_vec(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let frames = storage.get_websocket_frames(recording_id).await.unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                WebSocketFrame {
+                    frame_index: 0,
+                    offset_ms: 5,
+                    direction: WebSocketFrameDirection::ServerToClient,
+                    message_type: WebSocketMessageType::Text,
+                    payload: b"hello".to_vec(),
+                },
+                WebSocketFrame {
+                    frame_index: 1,
+                    offset_ms: 20,
+                    direction: WebSocketFrameDirection::ClientToServer,
+                    message_type: WebSocketMessageType::Text,
+                    payload: b"ack".to_vec(),
+                },
+                WebSocketFrame {
+                    frame_index: 2,
+                    offset_ms: 55,
+                    direction: WebSocketFrameDirection::ServerToClient,
+                    message_type: WebSocketMessageType::Binary,
+                    payload: vec![0xde, 0xad, 0xbe, 0xef],
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_websocket_frames_requires_existing_recording() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let err = storage
+            .insert_websocket_frames(
+                42,
+                vec![WebSocketFrame {
+                    frame_index: 0,
+                    offset_ms: 0,
+                    direction: WebSocketFrameDirection::ServerToClient,
+                    message_type: WebSocketMessageType::Text,
+                    payload: b"missing-parent".to_vec(),
+                }],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("insert recording websocket frame"),
             "err: {err}"
         );
     }
@@ -1820,6 +2150,51 @@ active_session = "default"
     }
 
     #[tokio::test]
+    async fn delete_recording_cascades_websocket_frames() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let recording = Recording {
+            match_key: "ws-cascade-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/ws/stream".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 101,
+            response_headers: Vec::new(),
+            response_body: Vec::new(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let recording_id = storage.insert_recording(recording).await.unwrap();
+        storage
+            .insert_websocket_frames(
+                recording_id,
+                vec![
+                    WebSocketFrame {
+                        frame_index: 0,
+                        offset_ms: 0,
+                        direction: WebSocketFrameDirection::ServerToClient,
+                        message_type: WebSocketMessageType::Text,
+                        payload: b"hello".to_vec(),
+                    },
+                    WebSocketFrame {
+                        frame_index: 1,
+                        offset_ms: 10,
+                        direction: WebSocketFrameDirection::ClientToServer,
+                        message_type: WebSocketMessageType::Text,
+                        payload: b"world".to_vec(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(storage.delete_recording(recording_id).await.unwrap());
+        let frames = storage.get_websocket_frames(recording_id).await.unwrap();
+        assert!(frames.is_empty());
+    }
+
+    #[tokio::test]
     async fn count_recordings_returns_total_rows() {
         let temp_dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
@@ -2088,7 +2463,7 @@ active_session = "default"
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 3);
+        assert_eq!(user_version, 4);
 
         let query_norm: String = conn
             .query_row(
@@ -2108,6 +2483,15 @@ active_session = "default"
             .unwrap();
         assert_eq!(chunk_table_exists, 1);
 
+        let websocket_frame_table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'recording_websocket_frames'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(websocket_frame_table_exists, 1);
+
         let subset_query_norms = matching::subset_query_candidate_normalizations_with_limit(
             Some("a=1&b=2&c=3"),
             usize::MAX,
@@ -2121,7 +2505,7 @@ active_session = "default"
     }
 
     #[tokio::test]
-    async fn open_migrates_v2_schema_to_v3_streaming_chunk_table() {
+    async fn open_migrates_v2_schema_to_v4_streaming_and_websocket_tables() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("recordings.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -2156,7 +2540,7 @@ active_session = "default"
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 3);
+        assert_eq!(user_version, 4);
 
         let chunk_table_exists: i64 = conn
             .query_row(
@@ -2166,6 +2550,75 @@ active_session = "default"
             )
             .unwrap();
         assert_eq!(chunk_table_exists, 1);
+
+        let websocket_frame_table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'recording_websocket_frames'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(websocket_frame_table_exists, 1);
+    }
+
+    #[tokio::test]
+    async fn open_migrates_v3_schema_to_v4_websocket_frame_table() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("recordings.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE recordings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              match_key TEXT NOT NULL,
+              request_method TEXT NOT NULL,
+              request_uri TEXT NOT NULL,
+              request_query_norm TEXT NOT NULL DEFAULT '',
+              request_headers_json TEXT NOT NULL,
+              request_body BLOB NOT NULL,
+              response_status INTEGER NOT NULL,
+              response_headers_json TEXT NOT NULL,
+              response_body BLOB NOT NULL,
+              created_at_unix_ms INTEGER NOT NULL
+            );
+
+            CREATE INDEX recordings_match_key_idx ON recordings(match_key);
+            CREATE INDEX recordings_match_key_query_norm_idx
+              ON recordings(match_key, request_query_norm, id DESC);
+
+            CREATE TABLE recording_response_chunks (
+              recording_id INTEGER NOT NULL,
+              chunk_index INTEGER NOT NULL,
+              offset_ms INTEGER NOT NULL,
+              chunk_body BLOB NOT NULL,
+              PRIMARY KEY (recording_id, chunk_index),
+              FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX recording_response_chunks_replay_idx
+              ON recording_response_chunks(recording_id, chunk_index);
+            PRAGMA user_version = 3;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = Storage::open(db_path).unwrap();
+        let conn = rusqlite::Connection::open(storage.db_path()).unwrap();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 4);
+
+        let websocket_frame_table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'recording_websocket_frames'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(websocket_frame_table_exists, 1);
     }
 
     #[tokio::test]

@@ -461,6 +461,185 @@ cache_miss = "error"
     replay_proxy.shutdown().await;
 }
 
+#[tokio::test]
+async fn grpc_proto_aware_record_then_replay_matches_selected_fields() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    fs::create_dir_all(&storage_dir).unwrap();
+    let proto_path = temp_dir.path().join("inference.proto");
+    fs::write(
+        &proto_path,
+        r#"
+syntax = "proto3";
+package inference;
+
+service InferenceService {
+  rpc Predict (PredictRequest) returns (PredictResponse);
+}
+
+message PredictRequest {
+  string model_name = 1;
+  string input_text = 2;
+  string trace_id = 3;
+}
+
+message PredictResponse {
+  string output_text = 1;
+}
+"#,
+    )
+    .unwrap();
+
+    let session = "default";
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/inference.InferenceService"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.grpc]
+proto_files = ["{}"]
+match_fields = ["model_name", "input_text"]
+"#,
+        storage_dir.display(),
+        proto_path.display(),
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+
+    let stream = TcpStream::connect(record_proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let recorded_payload =
+        grpc_unary_frame(&encode_predict_request("model-a", "hello world", "trace-a"));
+    let record_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/inference.InferenceService/Predict",
+            record_proxy.listen_addr
+        ))
+        .header(header::HOST, record_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(recorded_payload.clone()))
+        .unwrap();
+    let record_response = sender.send_request(record_request).await.unwrap();
+    assert_eq!(record_response.status(), StatusCode::OK);
+    let record_body = record_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&record_body[..], b"\x00\x00\x00\x00\x00");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/inference.InferenceService/Predict");
+    assert_eq!(captured.body, recorded_payload);
+
+    drop(sender);
+    let _ = connection_task.await;
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/inference.InferenceService"
+upstream = "http://{upstream_addr}"
+mode = "replay"
+cache_miss = "error"
+
+[routes.grpc]
+proto_files = ["{}"]
+match_fields = ["model_name", "input_text"]
+"#,
+        storage_dir.display(),
+        proto_path.display(),
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let stream = TcpStream::connect(replay_proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let replay_hit_payload =
+        grpc_unary_frame(&encode_predict_request("model-a", "hello world", "trace-b"));
+    let replay_hit_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/inference.InferenceService/Predict",
+            replay_proxy.listen_addr
+        ))
+        .header(header::HOST, replay_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(replay_hit_payload))
+        .unwrap();
+    let replay_hit_response = sender.send_request(replay_hit_request).await.unwrap();
+    assert_eq!(replay_hit_response.status(), StatusCode::OK);
+    let replay_hit_body = replay_hit_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&replay_hit_body[..], b"\x00\x00\x00\x00\x00");
+
+    let replay_miss_payload = grpc_unary_frame(&encode_predict_request(
+        "model-a",
+        "different prompt",
+        "trace-a",
+    ));
+    let replay_miss_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/inference.InferenceService/Predict",
+            replay_proxy.listen_addr
+        ))
+        .header(header::HOST, replay_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(replay_miss_payload))
+        .unwrap();
+    let replay_miss_response = sender.send_request(replay_miss_request).await.unwrap();
+    assert_eq!(replay_miss_response.status(), StatusCode::BAD_GATEWAY);
+    let miss_body = response_json(replay_miss_response).await;
+    assert_eq!(miss_body["error"], "Gateway Not Recorded");
+
+    drop(sender);
+    let _ = connection_task.await;
+    replay_proxy.shutdown().await;
+}
+
 #[cfg(feature = "scripting")]
 #[tokio::test]
 async fn on_request_script_mutates_request_before_matching_and_forwarding() {
@@ -6303,6 +6482,36 @@ async fn spawn_grpc_upstream() -> (
     });
 
     (addr, rx, move || join)
+}
+
+fn grpc_unary_frame(payload: &[u8]) -> Bytes {
+    let mut framed = Vec::with_capacity(payload.len() + 5);
+    framed.push(0);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    Bytes::from(framed)
+}
+
+fn encode_predict_request(model_name: &str, input_text: &str, trace_id: &str) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encode_proto_string_field(1, model_name, &mut encoded);
+    encode_proto_string_field(2, input_text, &mut encoded);
+    encode_proto_string_field(3, trace_id, &mut encoded);
+    encoded
+}
+
+fn encode_proto_string_field(field_number: u32, value: &str, out: &mut Vec<u8>) {
+    encode_varint(((field_number << 3) | 2).into(), out);
+    encode_varint(value.len() as u64, out);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
 }
 
 async fn spawn_upstream_with_responses(

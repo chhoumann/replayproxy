@@ -34,6 +34,10 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnectionBuilder,
 };
+#[cfg(feature = "grpc")]
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, MessageDescriptor, SerializeOptions, prost::Message as _,
+};
 use regex::Regex;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
@@ -58,7 +62,7 @@ use crate::{
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, GrpcConfig, QueryMatchMode, RateLimitConfig,
         RedactConfig, RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig,
-        WebSocketConfig,
+        WebSocketConfig, grpc_match_field_to_json_path,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
@@ -447,8 +451,6 @@ struct ProxyRoute {
     match_config: Option<RouteMatchConfig>,
     streaming: Option<StreamingConfig>,
     websocket: Option<WebSocketConfig>,
-    // Consumed by upcoming gRPC route matching steps.
-    #[allow(dead_code)]
     grpc: Option<RouteGrpcDescriptors>,
     rate_limit: Option<RouteRateLimit>,
     // Consumed by upcoming redaction storage steps.
@@ -493,13 +495,22 @@ struct LoadedScript {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteGrpcDescriptors {
     match_fields: Vec<String>,
+    match_json_paths: Vec<String>,
     proto_files: Vec<LoadedGrpcProtoFile>,
+    #[cfg(feature = "grpc")]
+    descriptor_sets: Vec<Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadedGrpcProtoFile {
     path: PathBuf,
     descriptor_bytes: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+struct GrpcProtoAwareMatchInput {
+    match_body: Vec<u8>,
+    body_json_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -827,10 +838,34 @@ fn load_route_grpc_descriptors(
     }
 
     validate_grpc_proto_sources(route_ref, &proto_source_paths, config_source_path)?;
+    let match_json_paths = grpc
+        .match_fields
+        .iter()
+        .map(|match_field| grpc_match_field_to_json_path(match_field))
+        .collect();
+
+    #[cfg(feature = "grpc")]
+    let descriptor_sets = load_grpc_descriptor_sets(
+        route_ref,
+        &proto_files,
+        &proto_source_paths,
+        config_source_path,
+    )?;
+
+    #[cfg(not(feature = "grpc"))]
+    if !grpc.match_fields.is_empty() {
+        tracing::debug!(
+            route = route_ref,
+            "grpc.match_fields configured but this build does not include `grpc`; using opaque matching",
+        );
+    }
 
     Ok(Some(RouteGrpcDescriptors {
         match_fields: grpc.match_fields.clone(),
+        match_json_paths,
         proto_files,
+        #[cfg(feature = "grpc")]
+        descriptor_sets,
     }))
 }
 
@@ -853,6 +888,46 @@ fn validate_grpc_proto_sources(
     })?;
 
     Ok(())
+}
+
+#[cfg(feature = "grpc")]
+fn load_grpc_descriptor_sets(
+    route_ref: &str,
+    proto_files: &[LoadedGrpcProtoFile],
+    proto_source_paths: &[PathBuf],
+    config_source_path: Option<&Path>,
+) -> anyhow::Result<Vec<Arc<[u8]>>> {
+    let mut descriptor_sets = Vec::new();
+
+    if !proto_source_paths.is_empty() {
+        let include_paths = grpc_proto_include_paths(proto_source_paths, config_source_path);
+        let compiled_descriptor_set = protox::compile(
+            proto_source_paths.iter().map(PathBuf::as_path),
+            include_paths.iter().map(PathBuf::as_path),
+        )
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "{route_ref}: compile `routes.grpc.proto_files` descriptors for runtime decode: {err}"
+            )
+        })?;
+        descriptor_sets.push(Arc::from(compiled_descriptor_set.encode_to_vec()));
+    }
+
+    for proto_file in proto_files {
+        if proto_file_extension_is_proto(proto_file.path.as_path()) {
+            continue;
+        }
+
+        DescriptorPool::decode(proto_file.descriptor_bytes.as_ref()).map_err(|err| {
+            anyhow::anyhow!(
+                "{route_ref}: decode `routes.grpc.proto_files` descriptor set {}: {err}",
+                proto_file.path.display()
+            )
+        })?;
+        descriptor_sets.push(Arc::clone(&proto_file.descriptor_bytes));
+    }
+
+    Ok(descriptor_sets)
 }
 
 fn grpc_proto_include_paths(
@@ -2246,6 +2321,185 @@ fn boxed_replay_chunks(chunks: Vec<ResponseChunk>, preserve_timing: bool) -> Pro
     ReplayChunkBody::new(chunks, preserve_timing).boxed()
 }
 
+fn route_match_config_with_body_json(
+    route_match: Option<&RouteMatchConfig>,
+    body_json_paths: &[String],
+) -> RouteMatchConfig {
+    let mut config = route_match.cloned().unwrap_or(RouteMatchConfig {
+        method: true,
+        path: true,
+        query: QueryMatchMode::Exact,
+        headers: Vec::new(),
+        headers_ignore: Vec::new(),
+        body_json: Vec::new(),
+    });
+    config.body_json = body_json_paths.to_vec();
+    config
+}
+
+fn derive_grpc_proto_aware_match_input(
+    route: &ProxyRoute,
+    uri: &Uri,
+    headers: &hyper::HeaderMap,
+    body: &[u8],
+) -> anyhow::Result<Option<GrpcProtoAwareMatchInput>> {
+    let Some(grpc) = route.grpc.as_ref() else {
+        return Ok(None);
+    };
+    if grpc.match_json_paths.is_empty() || !is_grpc_content_type(headers) {
+        return Ok(None);
+    }
+
+    #[cfg(feature = "grpc")]
+    {
+        let match_body = grpc_decode_request_body_as_json(grpc, uri, body)?;
+        Ok(Some(GrpcProtoAwareMatchInput {
+            match_body,
+            body_json_paths: grpc.match_json_paths.clone(),
+        }))
+    }
+
+    #[cfg(not(feature = "grpc"))]
+    {
+        let _ = (uri, body);
+        tracing::debug!(
+            route = %route.route_ref,
+            "grpc.match_fields configured but this build does not include `grpc`; using opaque matching"
+        );
+        Ok(None)
+    }
+}
+
+fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
+    let Some(value) = headers.get(header::CONTENT_TYPE) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/grpc" || media_type.starts_with("application/grpc+")
+}
+
+fn grpc_path_service_and_method(path: &str) -> Option<(&str, &str)> {
+    let path = path.strip_prefix('/')?;
+    let mut segments = path.split('/');
+    let service = segments.next()?;
+    let method = segments.next()?;
+    if service.is_empty() || method.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some((service, method))
+}
+
+#[cfg(feature = "grpc")]
+fn grpc_decode_request_body_as_json(
+    grpc: &RouteGrpcDescriptors,
+    uri: &Uri,
+    body: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let (service_name, method_name) = grpc_path_service_and_method(uri.path())
+        .ok_or_else(|| anyhow::anyhow!("parse gRPC method path `{}`", uri.path()))?;
+    let input_message = grpc_find_input_message_descriptor(grpc, service_name, method_name)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "gRPC method `{service_name}/{method_name}` not found in configured descriptors"
+            )
+        })?;
+
+    let message_frames = grpc_uncompressed_message_frames(body)?;
+    let mut decoded_messages = Vec::with_capacity(message_frames.len());
+    let serialize_options = SerializeOptions::new().use_proto_field_name(true);
+    for frame in message_frames {
+        let dynamic_message =
+            DynamicMessage::decode(input_message.clone(), frame).map_err(|err| {
+                anyhow::anyhow!(
+                    "decode gRPC request message for `{service_name}/{method_name}`: {err}"
+                )
+            })?;
+        let mut serializer = serde_json::Serializer::new(Vec::new());
+        dynamic_message
+            .serialize_with_options(&mut serializer, &serialize_options)
+            .map_err(|err| anyhow::anyhow!("serialize gRPC request message as JSON: {err}"))?;
+        let serialized = serializer.into_inner();
+        let json_value: Value = serde_json::from_slice(serialized.as_slice())
+            .map_err(|err| anyhow::anyhow!("parse serialized gRPC request JSON: {err}"))?;
+        decoded_messages.push(json_value);
+    }
+
+    let decoded_json = if decoded_messages.len() == 1 {
+        decoded_messages
+            .into_iter()
+            .next()
+            .expect("single-element vector must yield one value")
+    } else {
+        Value::Array(decoded_messages)
+    };
+    serde_json::to_vec(&decoded_json)
+        .map_err(|err| anyhow::anyhow!("serialize decoded gRPC request JSON: {err}"))
+}
+
+#[cfg(feature = "grpc")]
+fn grpc_find_input_message_descriptor(
+    grpc: &RouteGrpcDescriptors,
+    service_name: &str,
+    method_name: &str,
+) -> anyhow::Result<Option<MessageDescriptor>> {
+    for descriptor_set in &grpc.descriptor_sets {
+        let descriptor_pool = DescriptorPool::decode(descriptor_set.as_ref())
+            .map_err(|err| anyhow::anyhow!("decode gRPC descriptor set: {err}"))?;
+        let Some(service_descriptor) = descriptor_pool.get_service_by_name(service_name) else {
+            continue;
+        };
+        if let Some(method_descriptor) = service_descriptor
+            .methods()
+            .find(|descriptor| descriptor.name() == method_name)
+        {
+            return Ok(Some(method_descriptor.input()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "grpc")]
+fn grpc_uncompressed_message_frames(body: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
+    const GRPC_FRAME_HEADER_LEN: usize = 5;
+
+    let mut frames = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        if body.len().saturating_sub(cursor) < GRPC_FRAME_HEADER_LEN {
+            anyhow::bail!("gRPC frame header is truncated");
+        }
+
+        let compressed_flag = body[cursor];
+        if compressed_flag != 0 {
+            anyhow::bail!("compressed gRPC request messages are not supported");
+        }
+
+        let message_len = u32::from_be_bytes([
+            body[cursor + 1],
+            body[cursor + 2],
+            body[cursor + 3],
+            body[cursor + 4],
+        ]) as usize;
+        cursor += GRPC_FRAME_HEADER_LEN;
+        if body.len().saturating_sub(cursor) < message_len {
+            anyhow::bail!("gRPC frame payload is truncated");
+        }
+        let message_end = cursor + message_len;
+        frames.push(&body[cursor..message_end]);
+        cursor = message_end;
+    }
+
+    Ok(frames)
+}
+
 async fn proxy_handler(
     mut req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -2720,13 +2974,45 @@ async fn proxy_handler(
         storage: active_storage,
     } = state.active_session_snapshot();
 
+    let grpc_proto_aware_match_input = match derive_grpc_proto_aware_match_input(
+        &route,
+        &parts.uri,
+        &parts.headers,
+        body_bytes.as_ref(),
+    ) {
+        Ok(match_input) => match_input,
+        Err(err) => {
+            tracing::debug!(
+                route = %route.route_ref,
+                "failed to derive proto-aware gRPC match input: {err}",
+            );
+            None
+        }
+    };
+    let route_match_override = grpc_proto_aware_match_input
+        .as_ref()
+        .map(|grpc_match_input| {
+            route_match_config_with_body_json(
+                route.match_config.as_ref(),
+                &grpc_match_input.body_json_paths,
+            )
+        });
+    let match_route_config = route_match_override
+        .as_ref()
+        .or(route.match_config.as_ref());
+    let match_body = grpc_proto_aware_match_input
+        .as_ref()
+        .map_or(body_bytes.as_ref(), |grpc_match_input| {
+            grpc_match_input.match_body.as_slice()
+        });
+
     let match_key = if active_storage.is_some() {
         match matching::compute_match_key(
-            route.match_config.as_ref(),
+            match_route_config,
             &parts.method,
             &parts.uri,
             &parts.headers,
-            body_bytes.as_ref(),
+            match_body,
         ) {
             Ok(match_key) => Some(match_key),
             Err(err) => {

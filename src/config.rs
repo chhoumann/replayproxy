@@ -567,6 +567,26 @@ impl RouteConfig {
             for proto_file in &mut grpc.proto_files {
                 *proto_file = expand_tilde(proto_file)?;
             }
+            if !grpc.match_fields.is_empty() && grpc.proto_files.is_empty() {
+                bail!(
+                    "{route_name}: `routes.grpc.match_fields` requires at least one `routes.grpc.proto_files` entry"
+                );
+            }
+            for match_field in &mut grpc.match_fields {
+                let trimmed = match_field.trim();
+                if trimmed.is_empty() {
+                    bail!("{route_name}: `routes.grpc.match_fields` entries must not be empty");
+                }
+
+                let json_path_expression = grpc_match_field_to_json_path(trimmed);
+                JsonPath::parse(&json_path_expression).map_err(|err| {
+                    anyhow::anyhow!(
+                        "{}: invalid `routes.grpc.match_fields` entry `{trimmed}` ({json_path_expression}): {err}",
+                        route_name
+                    )
+                })?;
+                *match_field = trimmed.to_owned();
+            }
         }
 
         if let Some(route_match) = self.match_.as_ref() {
@@ -847,6 +867,14 @@ pub struct RouteMatchConfig {
 
 fn default_true() -> bool {
     true
+}
+
+pub(crate) fn grpc_match_field_to_json_path(match_field: &str) -> String {
+    let trimmed = match_field.trim();
+    if trimmed.starts_with('$') {
+        return trimmed.to_owned();
+    }
+    format!("$.{trimmed}")
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1173,6 +1201,52 @@ body_json = ["$["]
         assert!(
             err.to_string()
                 .contains("invalid `routes.match.body_json` expression"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn grpc_match_fields_require_proto_files() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/grpc"
+upstream = "http://127.0.0.1:1234"
+
+[routes.grpc]
+match_fields = ["model_name"]
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "`routes.grpc.match_fields` requires at least one `routes.grpc.proto_files` entry"
+            ),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_grpc_match_field_path_fails_fast() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/grpc"
+upstream = "http://127.0.0.1:1234"
+
+[routes.grpc]
+proto_files = ["/tmp/descriptors.pb"]
+match_fields = ["$["]
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid `routes.grpc.match_fields` entry"),
             "err: {err}"
         );
     }

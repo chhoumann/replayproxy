@@ -30,6 +30,26 @@ const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
 const PRESET_FILE_EXTENSION: &str = "toml";
 const USER_PRESETS_DIR_NAME: &str = "presets";
 
+#[derive(Debug, Clone, Copy)]
+struct BundledPreset {
+    name: &'static str,
+    source: &'static str,
+    bytes: &'static [u8],
+}
+
+const BUNDLED_PRESETS: &[BundledPreset] = &[
+    BundledPreset {
+        name: "anthropic",
+        source: "embedded:presets/anthropic.toml",
+        bytes: include_bytes!("../presets/anthropic.toml"),
+    },
+    BundledPreset {
+        name: "openai",
+        source: "embedded:presets/openai.toml",
+        bytes: include_bytes!("../presets/openai.toml"),
+    },
+];
+
 #[derive(Debug, Parser)]
 #[command(name = "replayproxy")]
 struct Cli {
@@ -297,7 +317,7 @@ enum CaCommandOutcome {
 enum PresetCommandOutcome {
     Imported {
         name: String,
-        source_path: PathBuf,
+        source: String,
         output_path: PathBuf,
         overwritten: bool,
     },
@@ -315,10 +335,6 @@ fn configured_active_session(config: &Config) -> String {
         .and_then(|storage| storage.active_session.as_deref())
         .unwrap_or(session::DEFAULT_SESSION_NAME)
         .to_owned()
-}
-
-fn bundled_presets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("presets")
 }
 
 fn user_presets_dir() -> anyhow::Result<PathBuf> {
@@ -345,55 +361,30 @@ fn validate_preset_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn list_bundled_presets(presets_dir: &Path) -> anyhow::Result<Vec<String>> {
-    let entries = fs::read_dir(presets_dir).map_err(|err| {
-        anyhow::anyhow!(
-            "read bundled presets directory {}: {err}",
-            presets_dir.display()
-        )
-    })?;
-
-    let mut preset_names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|err| {
-            anyhow::anyhow!(
-                "read entry in bundled presets directory {}: {err}",
-                presets_dir.display()
-            )
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some(PRESET_FILE_EXTENSION) {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        preset_names.push(stem.to_owned());
-    }
-    preset_names.sort();
+fn list_bundled_presets() -> Vec<&'static str> {
+    let mut preset_names = BUNDLED_PRESETS
+        .iter()
+        .map(|preset| preset.name)
+        .collect::<Vec<_>>();
+    preset_names.sort_unstable();
     preset_names.dedup();
-    Ok(preset_names)
+    preset_names
 }
 
-fn resolve_preset_source_path(name: &str) -> anyhow::Result<PathBuf> {
+fn resolve_bundled_preset(name: &str) -> anyhow::Result<&'static BundledPreset> {
     validate_preset_name(name)?;
 
-    let presets_dir = bundled_presets_dir();
-    let source_path = presets_dir.join(format!("{name}.{PRESET_FILE_EXTENSION}"));
-    if source_path.is_file() {
-        return Ok(source_path);
+    if let Some(preset) = BUNDLED_PRESETS.iter().find(|preset| preset.name == name) {
+        return Ok(preset);
     }
 
-    let available = list_bundled_presets(&presets_dir)?;
+    let available = list_bundled_presets();
     let available = if available.is_empty() {
         "none".to_owned()
     } else {
         available.join(", ")
     };
-    bail!(
-        "unknown preset `{name}` in {} (available: {available})",
-        presets_dir.display()
-    )
+    bail!("unknown preset `{name}` (available: {available})")
 }
 
 fn resolve_admin_addr_for_command(
@@ -912,7 +903,7 @@ fn run_ca_command(command: CaCommand) -> anyhow::Result<CaCommandOutcome> {
 fn run_preset_command(command: PresetCommand) -> anyhow::Result<PresetCommandOutcome> {
     match command {
         PresetCommand::Import { name } => {
-            let source_path = resolve_preset_source_path(&name)?;
+            let preset = resolve_bundled_preset(&name)?;
             let output_dir = user_presets_dir()?;
             fs::create_dir_all(&output_dir).map_err(|err| {
                 anyhow::anyhow!("create presets directory {}: {err}", output_dir.display())
@@ -920,17 +911,13 @@ fn run_preset_command(command: PresetCommand) -> anyhow::Result<PresetCommandOut
 
             let output_path = output_dir.join(format!("{name}.{PRESET_FILE_EXTENSION}"));
             let overwritten = output_path.exists();
-            fs::copy(&source_path, &output_path).map_err(|err| {
-                anyhow::anyhow!(
-                    "copy preset `{name}` from {} to {}: {err}",
-                    source_path.display(),
-                    output_path.display()
-                )
+            fs::write(&output_path, preset.bytes).map_err(|err| {
+                anyhow::anyhow!("write preset `{name}` to {}: {err}", output_path.display())
             })?;
 
             Ok(PresetCommandOutcome::Imported {
                 name,
-                source_path,
+                source: preset.source.to_owned(),
                 output_path,
                 overwritten,
             })
@@ -1038,13 +1025,13 @@ fn print_preset_command_outcome(outcome: PresetCommandOutcome) {
     match outcome {
         PresetCommandOutcome::Imported {
             name,
-            source_path,
+            source,
             output_path,
             overwritten,
         } => {
             println!(
                 "imported preset `{name}` from {} to {}",
-                source_path.display(),
+                source,
                 output_path.display()
             );
             if overwritten {

@@ -51,12 +51,9 @@ fn preset_import_copies_bundled_file_to_home_presets_dir() {
         imported_path.display()
     );
 
-    let bundled_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("presets")
-        .join("openai.toml");
-    let bundled_bytes = fs::read(&bundled_path).expect("bundled preset should be readable");
     let imported_bytes = fs::read(&imported_path).expect("imported preset should be readable");
-    assert_eq!(imported_bytes, bundled_bytes);
+    let bundled_bytes = &include_bytes!("../presets/openai.toml")[..];
+    assert_eq!(imported_bytes.as_slice(), bundled_bytes);
 
     Config::from_path(&imported_path).expect("imported preset config should parse");
 }

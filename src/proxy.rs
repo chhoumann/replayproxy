@@ -358,10 +358,15 @@ fn maybe_autogenerate_tls_ca_material(cert_path: &Path, key_path: &Path) -> anyh
     let key_parent = key_path.parent();
     if cert_file_name == Some(ca::CA_CERT_FILE_NAME)
         && key_file_name == Some(ca::CA_KEY_FILE_NAME)
-        && cert_parent.is_some()
         && cert_parent == key_parent
     {
-        let ca_dir = cert_parent.expect("checked is_some");
+        let Some(ca_dir) = cert_parent else {
+            anyhow::bail!(
+                "missing `proxy.tls` CA parent directory for {} and {}",
+                cert_path.display(),
+                key_path.display()
+            );
+        };
         let generated = ca::generate_ca(ca_dir, false)
             .map_err(|err| anyhow::anyhow!("auto-generate TLS CA material: {err}"))?;
         tracing::info!(

@@ -55,6 +55,13 @@ pub enum CaInstallResult {
     },
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxDistroInfo {
+    id: String,
+    id_like: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafCertMaterial {
     pub hostname: String,
@@ -482,30 +489,15 @@ fn exit_status_summary(status: std::process::ExitStatus) -> String {
 
 #[cfg(target_os = "linux")]
 fn install_ca_linux(cert_path: &Path) -> anyhow::Result<CaInstallResult> {
-    let mut failures = Vec::new();
-
-    if command_exists("trust") {
-        let output = Command::new("trust")
-            .arg("anchor")
-            .arg(cert_path)
-            .output()
-            .context("run `trust anchor`")?;
-        if output.status.success() {
-            return Ok(CaInstallResult::Installed {
-                method: "trust",
-                details: format!(
-                    "installed CA with `trust anchor` from {}",
-                    cert_path.display()
-                ),
-            });
-        }
-        failures.push(format!(
-            "`trust anchor` failed ({})",
-            command_failure_summary(&output)
-        ));
-    } else {
-        failures.push("`trust` command not found".to_owned());
+    if let Some(distro) =
+        detect_linux_distro().filter(|distro| !supports_linux_update_ca_certificates(distro))
+    {
+        return Ok(CaInstallResult::Manual {
+            details: unsupported_linux_distro_details(&distro, cert_path),
+        });
     }
+
+    let mut failures = Vec::new();
 
     if command_exists("update-ca-certificates") {
         let target_path = Path::new(LINUX_SYSTEM_CERT_INSTALL_PATH);
@@ -526,6 +518,13 @@ fn install_ca_linux(cert_path: &Path) -> anyhow::Result<CaInstallResult> {
             }
             Err(err) => {
                 failures.push(format!("copy to {} failed: {err}", target_path.display()));
+                return Ok(CaInstallResult::Manual {
+                    details: format!(
+                        "automatic Linux install was not successful: {}.\n{}",
+                        failures.join("; "),
+                        linux_manual_install_instructions(cert_path)
+                    ),
+                });
             }
         }
 
@@ -556,6 +555,83 @@ fn install_ca_linux(cert_path: &Path) -> anyhow::Result<CaInstallResult> {
             linux_manual_install_instructions(cert_path)
         ),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_distro() -> Option<LinuxDistroInfo> {
+    let contents = fs::read_to_string("/etc/os-release").ok()?;
+    parse_linux_distro_from_os_release(&contents)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_distro_from_os_release(contents: &str) -> Option<LinuxDistroInfo> {
+    let mut id = None;
+    let mut id_like = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = parse_os_release_value(raw_value);
+
+        match key {
+            "ID" => id = Some(value.to_ascii_lowercase()),
+            "ID_LIKE" => {
+                id_like = value
+                    .split_ascii_whitespace()
+                    .map(|token| token.to_ascii_lowercase())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
+    Some(LinuxDistroInfo { id: id?, id_like })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_os_release_value(raw_value: &str) -> String {
+    let raw_value = raw_value.trim();
+    if raw_value.len() >= 2 {
+        let first = raw_value.as_bytes()[0];
+        let last = raw_value.as_bytes()[raw_value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return raw_value[1..raw_value.len() - 1].to_owned();
+        }
+    }
+    raw_value.to_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn supports_linux_update_ca_certificates(distro: &LinuxDistroInfo) -> bool {
+    matches_supported_linux_distro(&distro.id)
+        || distro
+            .id_like
+            .iter()
+            .any(|token| matches_supported_linux_distro(token))
+}
+
+#[cfg(target_os = "linux")]
+fn matches_supported_linux_distro(token: &str) -> bool {
+    matches!(token, "debian" | "ubuntu" | "alpine")
+}
+
+#[cfg(target_os = "linux")]
+fn unsupported_linux_distro_details(distro: &LinuxDistroInfo, cert_path: &Path) -> String {
+    let id_like = if distro.id_like.is_empty() {
+        "<none>".to_owned()
+    } else {
+        distro.id_like.join(" ")
+    };
+    format!(
+        "automatic Linux CA install via `update-ca-certificates` is not supported for distro ID `{}` (ID_LIKE={id_like}).\n{}",
+        distro.id,
+        linux_manual_install_instructions(cert_path)
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -606,7 +682,12 @@ mod tests {
 
     use super::{
         DEFAULT_CA_SUBDIR, LeafCertGenerator, default_ca_dir_from_home, export_ca_cert,
-        generate_ca, linux_manual_install_instructions, validate_ca_material,
+        generate_ca, validate_ca_material,
+    };
+    #[cfg(target_os = "linux")]
+    use super::{
+        LinuxDistroInfo, linux_manual_install_instructions, parse_linux_distro_from_os_release,
+        supports_linux_update_ca_certificates, unsupported_linux_distro_details,
     };
     use tempfile::tempdir;
     use x509_parser::extensions::GeneralName;
@@ -849,6 +930,74 @@ mod tests {
         assert!(
             instructions.contains("trust anchor"),
             "instructions: {instructions}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_linux_distro_from_os_release_extracts_id_and_id_like() {
+        let parsed = parse_linux_distro_from_os_release(
+            r#"
+NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE="debian"
+"#,
+        )
+        .expect("valid os-release content should parse");
+        assert_eq!(parsed.id, "ubuntu");
+        assert_eq!(parsed.id_like, vec!["debian"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supports_linux_update_ca_certificates_matches_supported_families() {
+        let debian_family = LinuxDistroInfo {
+            id: "linuxmint".to_owned(),
+            id_like: vec!["ubuntu".to_owned(), "debian".to_owned()],
+        };
+        assert!(
+            supports_linux_update_ca_certificates(&debian_family),
+            "expected Debian-like distribution to be supported"
+        );
+
+        let alpine = LinuxDistroInfo {
+            id: "alpine".to_owned(),
+            id_like: Vec::new(),
+        };
+        assert!(
+            supports_linux_update_ca_certificates(&alpine),
+            "expected Alpine to be supported"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supports_linux_update_ca_certificates_rejects_unsupported_distros() {
+        let fedora = LinuxDistroInfo {
+            id: "fedora".to_owned(),
+            id_like: vec!["rhel".to_owned()],
+        };
+        assert!(
+            !supports_linux_update_ca_certificates(&fedora),
+            "expected non-Debian distro to be treated as unsupported"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_linux_distro_details_reports_detected_distribution() {
+        let distro = LinuxDistroInfo {
+            id: "fedora".to_owned(),
+            id_like: vec!["rhel".to_owned()],
+        };
+        let details = unsupported_linux_distro_details(&distro, Path::new("/tmp/ca/cert.pem"));
+        assert!(
+            details.contains("fedora"),
+            "details should include distro identifier: {details}"
+        );
+        assert!(
+            details.contains("Manual install options"),
+            "details should include fallback manual steps: {details}"
         );
     }
 

@@ -585,9 +585,25 @@ struct AdminConfigReloadResponse {
     source: String,
     routes_before: usize,
     routes_after: usize,
+    routes_added: usize,
+    routes_removed: usize,
+    routes_changed: usize,
     max_body_bytes_before: usize,
     max_body_bytes_after: usize,
     changed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RouteDiffSummary {
+    added: Vec<usize>,
+    removed: Vec<usize>,
+    changed: Vec<usize>,
+}
+
+impl RouteDiffSummary {
+    fn has_changes(&self) -> bool {
+        !(self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -849,6 +865,86 @@ impl RuntimeStatus {
     }
 }
 
+fn summarize_route_diff(
+    current: &ProxyRuntimeConfig,
+    next: &ProxyRuntimeConfig,
+) -> RouteDiffSummary {
+    let mut summary = RouteDiffSummary::default();
+    let route_count = current.routes.len().max(next.routes.len());
+
+    for idx in 0..route_count {
+        match (current.routes.get(idx), next.routes.get(idx)) {
+            (None, Some(_)) => summary.added.push(idx),
+            (Some(_), None) => summary.removed.push(idx),
+            (Some(current_route), Some(next_route)) => {
+                if !proxy_route_configs_equal(current_route, next_route) {
+                    summary.changed.push(idx);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    summary
+}
+
+fn proxy_route_configs_equal(current: &ProxyRoute, next: &ProxyRoute) -> bool {
+    current.route_ref == next.route_ref
+        && current.path_prefix == next.path_prefix
+        && current.path_exact == next.path_exact
+        && current.path_regex.as_ref().map(Regex::as_str)
+            == next.path_regex.as_ref().map(Regex::as_str)
+        && current.upstream.as_ref().map(Uri::to_string)
+            == next.upstream.as_ref().map(Uri::to_string)
+        && current.mode == next.mode
+        && current.cache_miss == next.cache_miss
+        && current.body_oversize == next.body_oversize
+        && route_match_configs_equal(current.match_config.as_ref(), next.match_config.as_ref())
+        && redact_configs_equal(current.redact.as_ref(), next.redact.as_ref())
+}
+
+fn route_match_configs_equal(
+    current: Option<&RouteMatchConfig>,
+    next: Option<&RouteMatchConfig>,
+) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(current), Some(next)) => {
+            current.method == next.method
+                && current.path == next.path
+                && current.query == next.query
+                && current.headers == next.headers
+                && current.headers_ignore == next.headers_ignore
+                && current.body_json == next.body_json
+        }
+        _ => false,
+    }
+}
+
+fn redact_configs_equal(current: Option<&RedactConfig>, next: Option<&RedactConfig>) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(current), Some(next)) => {
+            current.headers == next.headers
+                && current.body_json == next.body_json
+                && current.placeholder == next.placeholder
+        }
+        _ => false,
+    }
+}
+
+fn format_route_indices(route_indices: &[usize]) -> String {
+    if route_indices.is_empty() {
+        return "none".to_owned();
+    }
+
+    route_indices
+        .iter()
+        .map(|idx| format!("routes[{idx}]"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl ConfigReloader {
     async fn reload(&self) -> anyhow::Result<AdminConfigReloadResponse> {
         let _reload_guard = self.reload_lock.lock().await;
@@ -857,17 +953,19 @@ impl ConfigReloader {
         })?;
         let next_runtime = ProxyRuntimeConfig::from_config(&config)?;
 
-        let (routes_before, max_body_bytes_before, routes_after, max_body_bytes_after) = {
+        let (route_diff, routes_before, max_body_bytes_before, routes_after, max_body_bytes_after) = {
             let mut runtime_config = self
                 .runtime_config
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let route_diff = summarize_route_diff(&runtime_config, &next_runtime);
             let routes_before = runtime_config.routes.len();
             let max_body_bytes_before = runtime_config.max_body_bytes;
             let routes_after = next_runtime.routes.len();
             let max_body_bytes_after = next_runtime.max_body_bytes;
             *runtime_config = next_runtime;
             (
+                route_diff,
                 routes_before,
                 max_body_bytes_before,
                 routes_after,
@@ -875,15 +973,32 @@ impl ConfigReloader {
             )
         };
 
+        let changed = route_diff.has_changes() || max_body_bytes_before != max_body_bytes_after;
         self.status.set_routes_configured(routes_after);
+        tracing::info!(
+            source = %self.source_path.display(),
+            changed,
+            routes_added = route_diff.added.len(),
+            routes_removed = route_diff.removed.len(),
+            routes_changed = route_diff.changed.len(),
+            route_ids_added = %format_route_indices(&route_diff.added),
+            route_ids_removed = %format_route_indices(&route_diff.removed),
+            route_ids_changed = %format_route_indices(&route_diff.changed),
+            max_body_bytes_before,
+            max_body_bytes_after,
+            "applied config reload diff"
+        );
 
         Ok(AdminConfigReloadResponse {
             source: self.source_path.display().to_string(),
             routes_before,
             routes_after,
+            routes_added: route_diff.added.len(),
+            routes_removed: route_diff.removed.len(),
+            routes_changed: route_diff.changed.len(),
             max_body_bytes_before,
             max_body_bytes_after,
-            changed: routes_before != routes_after || max_body_bytes_before != max_body_bytes_after,
+            changed,
         })
     }
 }
@@ -944,17 +1059,7 @@ fn spawn_config_watcher(
                         _ = tokio::time::sleep_until(deadline) => {
                             debounce_deadline = None;
                             match config_reloader.reload().await {
-                                Ok(summary) => {
-                                    tracing::info!(
-                                        source = %summary.source,
-                                        routes_before = summary.routes_before,
-                                        routes_after = summary.routes_after,
-                                        max_body_bytes_before = summary.max_body_bytes_before,
-                                        max_body_bytes_after = summary.max_body_bytes_after,
-                                        changed = summary.changed,
-                                        "reloaded config after filesystem change"
-                                    );
-                                }
+                                Ok(_) => {}
                                 Err(err) => {
                                     tracing::warn!(
                                         source = %config_reloader.source_path.display(),
@@ -1096,19 +1201,12 @@ impl ProxyState {
         }
     }
 
-    fn route_for(&self, path: &str) -> Option<ProxyRoute> {
+    fn request_runtime_config(&self, path: &str) -> RequestRuntimeConfig {
         let runtime_config = self
             .runtime_config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        select_route(&runtime_config.routes, path).cloned()
-    }
-
-    fn max_body_bytes(&self) -> usize {
-        self.runtime_config
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .max_body_bytes
+        request_runtime_config_for_path(&runtime_config, path)
     }
 
     fn active_session_snapshot(&self) -> ActiveSessionRuntime {
@@ -1116,6 +1214,22 @@ impl ProxyState {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestRuntimeConfig {
+    route: Option<ProxyRoute>,
+    max_body_bytes: usize,
+}
+
+fn request_runtime_config_for_path(
+    runtime_config: &ProxyRuntimeConfig,
+    path: &str,
+) -> RequestRuntimeConfig {
+    RequestRuntimeConfig {
+        route: select_route(&runtime_config.routes, path).cloned(),
+        max_body_bytes: runtime_config.max_body_bytes,
     }
 }
 
@@ -1302,7 +1416,8 @@ async fn proxy_handler(
     let mut mode: Option<RouteMode> = None;
     let mut cache_outcome = CacheLogOutcome::Bypass;
     let mut replay_latency: Option<Duration> = None;
-    let max_body_bytes = state.max_body_bytes();
+    let request_runtime_config = state.request_runtime_config(req.uri().path());
+    let max_body_bytes = request_runtime_config.max_body_bytes;
 
     macro_rules! respond {
         ($upstream_latency:expr, $response:expr) => {{
@@ -1323,7 +1438,7 @@ async fn proxy_handler(
         }};
     }
 
-    let Some(route) = state.route_for(req.uri().path()) else {
+    let Some(route) = request_runtime_config.route else {
         respond!(
             None,
             proxy_simple_response(StatusCode::NOT_FOUND, "no matching route")
@@ -3134,7 +3249,8 @@ mod tests {
     use super::{
         CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, emit_proxy_request_log,
         format_route_ref, lookup_recording_for_request_with_subset_limit, mode_log_label,
-        redact_recording_body_json, redact_recording_headers, sanitize_match_key, select_route,
+        redact_recording_body_json, redact_recording_headers, request_runtime_config_for_path,
+        sanitize_match_key, select_route, summarize_route_diff,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
@@ -3213,6 +3329,74 @@ mod tests {
 
         let selected = select_route(&routes, "/api/users").expect("expected route");
         assert!(std::ptr::eq(selected, &routes[0]));
+    }
+
+    #[test]
+    fn request_runtime_config_snapshot_keeps_route_and_limit_together() {
+        let runtime_config = super::ProxyRuntimeConfig {
+            routes: vec![test_route(Some("/v2/snapshot"), None, None)],
+            max_body_bytes: 256,
+        };
+
+        let snapshot = request_runtime_config_for_path(&runtime_config, "/v2/snapshot");
+        let route = snapshot.route.expect("expected matching route");
+
+        assert_eq!(snapshot.max_body_bytes, 256);
+        assert_eq!(route.path_exact.as_deref(), Some("/v2/snapshot"));
+    }
+
+    #[test]
+    fn summarize_route_diff_detects_added_removed_and_changed_routes() {
+        let current = super::ProxyRuntimeConfig {
+            routes: vec![
+                test_route(Some("/v1/stable"), None, None),
+                test_route(Some("/v1/removed"), None, None),
+                test_route(Some("/v1/redacted"), None, None),
+            ],
+            max_body_bytes: 64,
+        };
+        let mut changed_redaction_route = test_route(Some("/v1/redacted"), None, None);
+        changed_redaction_route.redact = Some(RedactConfig {
+            headers: vec!["authorization".to_owned()],
+            body_json: vec!["$.token".to_owned()],
+            placeholder: None,
+        });
+        let next = super::ProxyRuntimeConfig {
+            routes: vec![
+                test_route(Some("/v1/stable"), None, None),
+                changed_redaction_route,
+                test_route(Some("/v1/new"), None, None),
+                test_route(Some("/v1/added"), None, None),
+            ],
+            max_body_bytes: 64,
+        };
+
+        let summary = summarize_route_diff(&current, &next);
+        assert_eq!(summary.changed, vec![1, 2]);
+        assert_eq!(summary.added, vec![3]);
+        assert!(summary.removed.is_empty());
+        assert!(summary.has_changes());
+    }
+
+    #[test]
+    fn summarize_route_diff_detects_removed_routes() {
+        let current = super::ProxyRuntimeConfig {
+            routes: vec![
+                test_route(Some("/v1/keep"), None, None),
+                test_route(Some("/v1/removed"), None, None),
+            ],
+            max_body_bytes: 64,
+        };
+        let next = super::ProxyRuntimeConfig {
+            routes: vec![test_route(Some("/v1/keep"), None, None)],
+            max_body_bytes: 64,
+        };
+
+        let summary = summarize_route_diff(&current, &next);
+        assert_eq!(summary.removed, vec![1]);
+        assert!(summary.changed.is_empty());
+        assert!(summary.added.is_empty());
+        assert!(summary.has_changes());
     }
 
     #[test]

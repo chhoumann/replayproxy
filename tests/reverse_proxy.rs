@@ -849,6 +849,9 @@ upstream = "http://{upstream_addr}"
     assert_eq!(body["source"].as_str(), Some(config_source.as_str()));
     assert_eq!(body["routes_before"].as_u64(), Some(1));
     assert_eq!(body["routes_after"].as_u64(), Some(1));
+    assert_eq!(body["routes_added"].as_u64(), Some(0));
+    assert_eq!(body["routes_removed"].as_u64(), Some(0));
+    assert_eq!(body["routes_changed"].as_u64(), Some(1));
     assert_eq!(body["max_body_bytes_before"].as_u64(), Some(64));
     assert_eq!(body["max_body_bytes_after"].as_u64(), Some(128));
     assert_eq!(body["changed"].as_bool(), Some(true));
@@ -869,6 +872,97 @@ upstream = "http://{upstream_addr}"
             .await
             .is_err()
     );
+
+    let reloaded_route_uri: Uri = format!("http://{}/v2/after-reload", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(reloaded_route_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/v2/after-reload");
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_config_reload_endpoint_reports_route_diff_without_key_setting_changes() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("replayproxy.toml");
+    let config_source = config_path.display().to_string();
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+max_body_bytes = 64
+
+[[routes]]
+path_prefix = "/v1"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let config = replayproxy::config::Config::from_path(&config_path).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+max_body_bytes = 64
+
+[[routes]]
+path_prefix = "/v2"
+upstream = "http://{upstream_addr}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let reload_uri: Uri = format!("http://{admin_addr}/_admin/config/reload")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(reload_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["source"].as_str(), Some(config_source.as_str()));
+    assert_eq!(body["routes_before"].as_u64(), Some(1));
+    assert_eq!(body["routes_after"].as_u64(), Some(1));
+    assert_eq!(body["routes_added"].as_u64(), Some(0));
+    assert_eq!(body["routes_removed"].as_u64(), Some(0));
+    assert_eq!(body["routes_changed"].as_u64(), Some(1));
+    assert_eq!(body["max_body_bytes_before"].as_u64(), Some(64));
+    assert_eq!(body["max_body_bytes_after"].as_u64(), Some(64));
+    assert_eq!(body["changed"].as_bool(), Some(true));
 
     let reloaded_route_uri: Uri = format!("http://{}/v2/after-reload", proxy.listen_addr)
         .parse()

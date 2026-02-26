@@ -44,6 +44,19 @@ Config discovery (if `--config` is omitted):
 - `./replayproxy.toml`
 - `~/.replayproxy/config.toml`
 
+## Example configs
+
+Sample configs are included in [`examples/`](examples):
+- [`examples/replayproxy.minimal.toml`](examples/replayproxy.minimal.toml): minimal reverse-proxy setup.
+- [`examples/replayproxy.llm-redacted.toml`](examples/replayproxy.llm-redacted.toml): LLM-focused setup with route matching and redaction.
+
+Try one directly:
+
+```bash
+cp ./examples/replayproxy.llm-redacted.toml ./replayproxy.toml
+./target/release/replayproxy serve --config ./replayproxy.toml
+```
+
 ## Admin API safety
 
 If `proxy.admin_port` is configured, the admin listener binds to loopback by default

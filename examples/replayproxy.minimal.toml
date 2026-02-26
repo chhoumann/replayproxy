@@ -1,0 +1,14 @@
+# Minimal reverse-proxy setup.
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+mode = "record"
+
+[storage]
+path = "./.replayproxy-data"
+active_session = "default"
+
+[[routes]]
+name = "httpbin"
+path_prefix = "/api"
+upstream = "https://httpbin.org"

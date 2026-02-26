@@ -1,0 +1,48 @@
+# LLM-focused sample that demonstrates request matching + redaction.
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+mode = "passthrough-cache"
+admin_api_token = "replace-me"
+
+[storage]
+path = "./.replayproxy-data"
+active_session = "llm-dev"
+
+[defaults.redact]
+headers = ["authorization", "x-api-key"]
+placeholder = "<REDACTED>"
+
+[[routes]]
+name = "openai-chat"
+path_prefix = "/v1/chat/completions"
+upstream = "https://api.openai.com"
+mode = "passthrough-cache"
+cache_miss = "forward"
+
+[routes.match]
+method = true
+path = true
+query = "ignore"
+headers = ["authorization"]
+body_json = ["$.model", "$.messages", "$.temperature"]
+
+[routes.redact]
+headers = ["authorization"]
+body_json = ["$.api_key", "$.messages[*].content"]
+
+[[routes]]
+name = "anthropic-messages"
+path_prefix = "/v1/messages"
+upstream = "https://api.anthropic.com"
+mode = "record"
+
+[routes.match]
+method = true
+path = true
+headers = ["x-api-key"]
+body_json = ["$.model", "$.messages", "$.max_tokens"]
+
+[routes.redact]
+headers = ["x-api-key"]
+body_json = ["$.messages[*].content"]

@@ -24,6 +24,8 @@ const DIR_MODE_RESTRICTED: u32 = 0o700;
 const FILE_MODE_RESTRICTED: u32 = 0o600;
 const FILE_MODE_READABLE: u32 = 0o644;
 const LINUX_SYSTEM_CERT_INSTALL_PATH: &str = "/usr/local/share/ca-certificates/replayproxy-ca.crt";
+#[cfg(target_os = "macos")]
+const MACOS_SYSTEM_KEYCHAIN_PATH: &str = "/Library/Keychains/System.keychain";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaMaterialPaths {
@@ -398,7 +400,8 @@ fn set_dir_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn install_ca_macos(cert_path: &Path) -> anyhow::Result<CaInstallResult> {
     let command = format!(
-        "security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db {}",
+        "sudo security add-trusted-cert -d -r trustRoot -k {} {}",
+        MACOS_SYSTEM_KEYCHAIN_PATH,
         cert_path.display()
     );
     if !command_exists("security") {
@@ -407,20 +410,13 @@ fn install_ca_macos(cert_path: &Path) -> anyhow::Result<CaInstallResult> {
         });
     }
 
-    let Some(home) = env::var_os("HOME") else {
-        return Ok(CaInstallResult::Manual {
-            details: format!("HOME is not set. Run manually:\n{command}"),
-        });
-    };
-    let keychain_path = Path::new(&home).join("Library/Keychains/login.keychain-db");
-
     let output = Command::new("security")
         .arg("add-trusted-cert")
         .arg("-d")
         .arg("-r")
         .arg("trustRoot")
         .arg("-k")
-        .arg(&keychain_path)
+        .arg(MACOS_SYSTEM_KEYCHAIN_PATH)
         .arg(cert_path)
         .output()
         .context("run `security add-trusted-cert`")?;
@@ -429,18 +425,59 @@ fn install_ca_macos(cert_path: &Path) -> anyhow::Result<CaInstallResult> {
         return Ok(CaInstallResult::Installed {
             method: "security",
             details: format!(
-                "installed CA into login keychain using `security` from {}",
+                "installed CA into macOS system keychain using `security` from {}",
                 cert_path.display()
             ),
         });
     }
 
+    let mut failures = vec![format!(
+        "`security add-trusted-cert` failed ({})",
+        command_failure_summary(&output)
+    )];
+    if command_exists("sudo") {
+        let status = Command::new("sudo")
+            .arg("security")
+            .arg("add-trusted-cert")
+            .arg("-d")
+            .arg("-r")
+            .arg("trustRoot")
+            .arg("-k")
+            .arg(MACOS_SYSTEM_KEYCHAIN_PATH)
+            .arg(cert_path)
+            .status()
+            .context("run `sudo security add-trusted-cert`")?;
+        if status.success() {
+            return Ok(CaInstallResult::Installed {
+                method: "sudo security",
+                details: format!(
+                    "installed CA into macOS system keychain using `sudo security` from {}",
+                    cert_path.display()
+                ),
+            });
+        }
+        failures.push(format!(
+            "`sudo security add-trusted-cert` failed ({})",
+            exit_status_summary(status)
+        ));
+    } else {
+        failures.push("`sudo` command not found".to_owned());
+    }
+
     Ok(CaInstallResult::Manual {
         details: format!(
-            "`security add-trusted-cert` failed ({}). Run manually:\n{command}",
-            command_failure_summary(&output)
+            "automatic macOS CA install was not successful: {}.\nRun manually:\n{command}",
+            failures.join("; ")
         ),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn exit_status_summary(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_owned(),
+    }
 }
 
 #[cfg(target_os = "linux")]

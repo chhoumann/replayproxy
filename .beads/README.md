@@ -29,9 +29,6 @@ bd update <issue-id> --status done
 # Sync Beads (Dolt-backed repos)
 bd dolt pull
 bd dolt push
-
-# Local-only fallback (no Dolt store configured)
-bd export
 ```
 
 ### Working with Issues

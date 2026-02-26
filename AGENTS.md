@@ -11,7 +11,6 @@ bd update <id> --status in_progress  # Claim work
 bd close <id>         # Complete work
 bd dolt pull          # Pull beads updates from remote
 bd dolt push          # Push beads updates to remote
-bd export             # Fallback when no Dolt store is configured
 ```
 
 ## Landing the Plane (Session Completion)
@@ -26,8 +25,8 @@ bd export             # Fallback when no Dolt store is configured
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt pull        # If this errors with "no store available", run `bd export` instead
-   bd dolt push        # Skip in local-only mode (no Dolt store)
+   bd dolt pull        # Skip this and next line if repo reports "no store available"
+   bd dolt push
    git push
    git status  # MUST show "up to date with origin"
    ```

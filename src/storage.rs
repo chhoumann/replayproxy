@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{config::Config, matching, session};
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const SQLITE_MAX_BIND_PARAMS: usize = 999;
 const QUERY_SUBSET_CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMS - 1;
 
@@ -57,6 +57,13 @@ pub struct Recording {
     pub response_headers: Vec<(String, Vec<u8>)>,
     pub response_body: Vec<u8>,
     pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseChunk {
+    pub chunk_index: u32,
+    pub offset_ms: u64,
+    pub chunk_body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +160,23 @@ impl Storage {
             .context("join insert_recording task")?
     }
 
+    pub async fn insert_response_chunks(
+        &self,
+        recording_id: i64,
+        chunks: Vec<ResponseChunk>,
+    ) -> anyhow::Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            insert_response_chunks_blocking(&db_path, recording_id, chunks)
+        })
+        .await
+        .context("join insert_response_chunks task")?
+    }
+
     pub async fn get_recording_by_match_key(
         &self,
         match_key: &str,
@@ -187,6 +211,16 @@ impl Storage {
         tokio::task::spawn_blocking(move || get_recording_by_id_blocking(&db_path, recording_id))
             .await
             .context("join get_recording_by_id task")?
+    }
+
+    pub async fn get_response_chunks(
+        &self,
+        recording_id: i64,
+    ) -> anyhow::Result<Vec<ResponseChunk>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || get_response_chunks_blocking(&db_path, recording_id))
+            .await
+            .context("join get_response_chunks task")?
     }
 
     pub async fn get_latest_recording_by_match_key_and_query_subset(
@@ -404,15 +438,31 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS recordings_match_key_idx ON recordings(match_key);
                 CREATE INDEX IF NOT EXISTS recordings_match_key_query_norm_idx
                   ON recordings(match_key, request_query_norm, id DESC);
+
+                CREATE TABLE IF NOT EXISTS recording_response_chunks (
+                  recording_id INTEGER NOT NULL,
+                  chunk_index INTEGER NOT NULL,
+                  offset_ms INTEGER NOT NULL,
+                  chunk_body BLOB NOT NULL,
+                  PRIMARY KEY (recording_id, chunk_index),
+                  FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS recording_response_chunks_replay_idx
+                  ON recording_response_chunks(recording_id, chunk_index);
                 "#,
             )
-            .context("create sqlite schema v2")?;
+            .context("create sqlite schema v3")?;
 
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-                .context("set PRAGMA user_version=2")?;
+                .context("set PRAGMA user_version=3")?;
             Ok(())
         }
-        1 => migrate_v1_to_v2(conn),
+        1 => {
+            migrate_v1_to_v2(conn)?;
+            migrate_v2_to_v3(conn)
+        }
+        2 => migrate_v2_to_v3(conn),
         SCHEMA_VERSION => Ok(()),
         _ => anyhow::bail!(
             "unsupported recordings.db schema version {user_version} (expected {SCHEMA_VERSION})"
@@ -434,8 +484,31 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> anyhow::Result<()> {
 
     backfill_request_query_norm(conn)?;
 
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+    conn.pragma_update(None, "user_version", 2)
         .context("set PRAGMA user_version=2")?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(conn: &mut Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS recording_response_chunks (
+          recording_id INTEGER NOT NULL,
+          chunk_index INTEGER NOT NULL,
+          offset_ms INTEGER NOT NULL,
+          chunk_body BLOB NOT NULL,
+          PRIMARY KEY (recording_id, chunk_index),
+          FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS recording_response_chunks_replay_idx
+          ON recording_response_chunks(recording_id, chunk_index);
+        "#,
+    )
+    .context("migrate sqlite schema v2 -> v3")?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("set PRAGMA user_version=3")?;
     Ok(())
 }
 
@@ -633,6 +706,95 @@ fn insert_recording_blocking(path: &Path, recording: Recording) -> anyhow::Resul
     .context("insert recording")?;
 
     Ok(conn.last_insert_rowid())
+}
+
+fn insert_response_chunks_blocking(
+    path: &Path,
+    recording_id: i64,
+    chunks: Vec<ResponseChunk>,
+) -> anyhow::Result<()> {
+    let mut conn = open_connection(path)?;
+    let tx = conn
+        .transaction()
+        .context("open response chunk transaction")?;
+    {
+        let mut stmt = tx
+            .prepare(
+                r#"
+                INSERT INTO recording_response_chunks (
+                  recording_id,
+                  chunk_index,
+                  offset_ms,
+                  chunk_body
+                ) VALUES (?1, ?2, ?3, ?4)
+                "#,
+            )
+            .context("prepare insert response chunk")?;
+
+        for chunk in chunks {
+            let offset_ms = i64::try_from(chunk.offset_ms)
+                .context("response chunk offset_ms exceeds sqlite integer range")?;
+            stmt.execute(params![
+                recording_id,
+                i64::from(chunk.chunk_index),
+                offset_ms,
+                chunk.chunk_body
+            ])
+            .context("insert recording response chunk")?;
+        }
+    }
+    tx.commit().context("commit response chunk transaction")?;
+    Ok(())
+}
+
+fn get_response_chunks_blocking(
+    path: &Path,
+    recording_id: i64,
+) -> anyhow::Result<Vec<ResponseChunk>> {
+    let conn = open_connection(path)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+              chunk_index,
+              offset_ms,
+              chunk_body
+            FROM recording_response_chunks
+            WHERE recording_id = ?1
+            ORDER BY chunk_index ASC
+            "#,
+        )
+        .context("prepare select response chunks by recording id")?;
+
+    let mut rows = stmt
+        .query(params![recording_id])
+        .context("query response chunks by recording id")?;
+
+    let mut chunks = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .context("iterate response chunks by recording id")?
+    {
+        let chunk_index = row
+            .get::<_, i64>(0)
+            .context("deserialize response chunk index")?;
+        let offset_ms = row
+            .get::<_, i64>(1)
+            .context("deserialize response chunk offset_ms")?;
+        let chunk_body = row
+            .get::<_, Vec<u8>>(2)
+            .context("deserialize response chunk body")?;
+
+        chunks.push(ResponseChunk {
+            chunk_index: u32::try_from(chunk_index)
+                .context("response chunk index cannot be negative or exceed u32")?,
+            offset_ms: u64::try_from(offset_ms)
+                .context("response chunk offset_ms cannot be negative")?,
+            chunk_body,
+        });
+    }
+
+    Ok(chunks)
 }
 
 fn recording_query_from_uri(uri: &str) -> Option<&str> {
@@ -1108,7 +1270,9 @@ fn count_recordings_blocking(path: &Path) -> anyhow::Result<u64> {
 mod tests {
     use rusqlite::params;
 
-    use super::{Recording, RecordingSearch, SessionManager, SessionManagerError, Storage};
+    use super::{
+        Recording, RecordingSearch, ResponseChunk, SessionManager, SessionManagerError, Storage,
+    };
     use crate::{config::Config, matching, session};
 
     #[test]
@@ -1187,6 +1351,94 @@ active_session = "default"
             .unwrap();
 
         assert_eq!(fetched, Some(recording));
+    }
+
+    #[tokio::test]
+    async fn insert_and_fetch_response_chunks_orders_by_chunk_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let recording = Recording {
+            match_key: "stream-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/v1/chat/completions?stream=true".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: Vec::new(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let recording_id = storage.insert_recording(recording).await.unwrap();
+
+        storage
+            .insert_response_chunks(
+                recording_id,
+                vec![
+                    ResponseChunk {
+                        chunk_index: 2,
+                        offset_ms: 40,
+                        chunk_body: b"third".to_vec(),
+                    },
+                    ResponseChunk {
+                        chunk_index: 0,
+                        offset_ms: 5,
+                        chunk_body: b"first".to_vec(),
+                    },
+                    ResponseChunk {
+                        chunk_index: 1,
+                        offset_ms: 15,
+                        chunk_body: b"second".to_vec(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let chunks = storage.get_response_chunks(recording_id).await.unwrap();
+        assert_eq!(
+            chunks,
+            vec![
+                ResponseChunk {
+                    chunk_index: 0,
+                    offset_ms: 5,
+                    chunk_body: b"first".to_vec(),
+                },
+                ResponseChunk {
+                    chunk_index: 1,
+                    offset_ms: 15,
+                    chunk_body: b"second".to_vec(),
+                },
+                ResponseChunk {
+                    chunk_index: 2,
+                    offset_ms: 40,
+                    chunk_body: b"third".to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_response_chunks_requires_existing_recording() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let err = storage
+            .insert_response_chunks(
+                42,
+                vec![ResponseChunk {
+                    chunk_index: 0,
+                    offset_ms: 0,
+                    chunk_body: b"missing-parent".to_vec(),
+                }],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("insert recording response chunk"),
+            "err: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1458,6 +1710,47 @@ active_session = "default"
     }
 
     #[tokio::test]
+    async fn delete_recording_cascades_response_chunks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let recording = Recording {
+            match_key: "cascade-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/stream".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: Vec::new(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        let recording_id = storage.insert_recording(recording).await.unwrap();
+        storage
+            .insert_response_chunks(
+                recording_id,
+                vec![
+                    ResponseChunk {
+                        chunk_index: 0,
+                        offset_ms: 0,
+                        chunk_body: b"hello".to_vec(),
+                    },
+                    ResponseChunk {
+                        chunk_index: 1,
+                        offset_ms: 10,
+                        chunk_body: b"world".to_vec(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(storage.delete_recording(recording_id).await.unwrap());
+        let chunks = storage.get_response_chunks(recording_id).await.unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[tokio::test]
     async fn count_recordings_returns_total_rows() {
         let temp_dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
@@ -1684,6 +1977,11 @@ active_session = "default"
 
         let storage = Storage::open(db_path).unwrap();
         let conn = rusqlite::Connection::open(storage.db_path()).unwrap();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 3);
+
         let query_norm: String = conn
             .query_row(
                 "SELECT request_query_norm FROM recordings WHERE match_key = 'legacy-key'",
@@ -1692,6 +1990,15 @@ active_session = "default"
             )
             .unwrap();
         assert_eq!(query_norm, "a=1&b=2");
+
+        let chunk_table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'recording_response_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_table_exists, 1);
 
         let subset_query_norms = matching::subset_query_candidate_normalizations_with_limit(
             Some("a=1&b=2&c=3"),
@@ -1703,6 +2010,54 @@ active_session = "default"
             .await
             .unwrap();
         assert!(fetched.is_some());
+    }
+
+    #[tokio::test]
+    async fn open_migrates_v2_schema_to_v3_streaming_chunk_table() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("recordings.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE recordings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              match_key TEXT NOT NULL,
+              request_method TEXT NOT NULL,
+              request_uri TEXT NOT NULL,
+              request_query_norm TEXT NOT NULL DEFAULT '',
+              request_headers_json TEXT NOT NULL,
+              request_body BLOB NOT NULL,
+              response_status INTEGER NOT NULL,
+              response_headers_json TEXT NOT NULL,
+              response_body BLOB NOT NULL,
+              created_at_unix_ms INTEGER NOT NULL
+            );
+
+            CREATE INDEX recordings_match_key_idx ON recordings(match_key);
+            CREATE INDEX recordings_match_key_query_norm_idx
+              ON recordings(match_key, request_query_norm, id DESC);
+            PRAGMA user_version = 2;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = Storage::open(db_path).unwrap();
+        let conn = rusqlite::Connection::open(storage.db_path()).unwrap();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 3);
+
+        let chunk_table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'recording_response_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_table_exists, 1);
     }
 
     #[tokio::test]

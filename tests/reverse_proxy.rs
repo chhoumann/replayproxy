@@ -15,7 +15,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::{Frame, Incoming},
-    client::conn::http1,
+    client::conn::{http1, http2},
     header::{self, HeaderValue},
     service::service_fn,
 };
@@ -44,6 +44,7 @@ const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
 #[derive(Debug)]
 struct CapturedRequest {
     uri: Uri,
+    version: hyper::Version,
     headers: hyper::HeaderMap,
     body: Bytes,
 }
@@ -140,6 +141,85 @@ upstream = "http://{upstream_addr}"
     assert!(captured.headers.get(header::CONNECTION).is_none());
     assert_eq!(&captured.body[..], b"");
 
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn forward_proxy_connect_tunnels_grpc_over_http2_passthrough() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
+
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/"
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let connect_request = format!(
+        "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(connect_request.as_bytes()).await.unwrap();
+    let response_head = read_http_response_head(&mut stream).await;
+    assert!(
+        response_head.starts_with(b"HTTP/1.1 200"),
+        "unexpected CONNECT response: {}",
+        String::from_utf8_lossy(&response_head)
+    );
+
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let grpc_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let req = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{upstream_addr}/helloworld.Greeter/SayHello"
+        ))
+        .header(header::HOST, upstream_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(grpc_payload.clone()))
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    assert_eq!(res.version(), hyper::Version::HTTP_2);
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        res.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"\x00\x00\x00\x00\x00");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.version, hyper::Version::HTTP_2);
+    assert_eq!(captured.uri.path(), "/helloworld.Greeter/SayHello");
+    assert_eq!(
+        captured.headers.get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        captured.headers.get("te").unwrap(),
+        &HeaderValue::from_static("trailers")
+    );
+    assert_eq!(captured.body, grpc_payload);
+
+    drop(sender);
+    let _ = connection_task.await;
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
 }
@@ -5431,6 +5511,7 @@ async fn spawn_upstream() -> (
                 let body_bytes = body.collect().await.unwrap().to_bytes();
                 tx.send(CapturedRequest {
                     uri: parts.uri,
+                    version: parts.version,
                     headers: parts.headers,
                     body: body_bytes,
                 })
@@ -5451,6 +5532,53 @@ async fn spawn_upstream() -> (
                     "x-resp-binary",
                     HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
                 );
+                Ok::<_, hyper::Error>(res)
+            }
+        });
+
+        let builder = ConnectionBuilder::new(TokioExecutor::new());
+        builder.serve_connection(io, service).await.unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn spawn_grpc_upstream() -> (
+    SocketAddr,
+    mpsc::Receiver<CapturedRequest>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = mpsc::channel::<CapturedRequest>(1);
+
+    let join = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+        let tx = Arc::new(tx);
+        let service = service_fn(move |req: Request<Incoming>| {
+            let tx = Arc::clone(&tx);
+            async move {
+                let (parts, body) = req.into_parts();
+                let body_bytes = body.collect().await.unwrap().to_bytes();
+                tx.send(CapturedRequest {
+                    uri: parts.uri,
+                    version: parts.version,
+                    headers: parts.headers,
+                    body: body_bytes,
+                })
+                .await
+                .unwrap();
+
+                let mut res = Response::new(Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x00")));
+                *res.status_mut() = StatusCode::OK;
+                res.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/grpc"),
+                );
+                res.headers_mut()
+                    .insert("grpc-status", HeaderValue::from_static("0"));
                 Ok::<_, hyper::Error>(res)
             }
         });
@@ -5492,6 +5620,7 @@ async fn spawn_upstream_with_responses(
                     let body_bytes = body.collect().await.unwrap().to_bytes();
                     tx.send(CapturedRequest {
                         uri: parts.uri,
+                        version: parts.version,
                         headers: parts.headers,
                         body: body_bytes,
                     })
@@ -5550,6 +5679,7 @@ async fn spawn_upstream_with_response_chunks(
                 let body_bytes = body.collect().await.unwrap().to_bytes();
                 tx.send(CapturedRequest {
                     uri: parts.uri,
+                    version: parts.version,
                     headers: parts.headers,
                     body: body_bytes,
                 })

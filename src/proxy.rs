@@ -2143,11 +2143,20 @@ async fn proxy_handler(
     let request_known_oversize = request_content_length
         .map(|len| len > bytes_limit_u64(max_body_bytes))
         .unwrap_or(false);
+    // on_request transforms require a fully buffered body, so oversized requests cannot
+    // use bypass-cache streaming when this hook is configured.
     let allow_oversize_bypass_cache = route.body_oversize == BodyOversizePolicy::BypassCache
         && route.mode != RouteMode::Replay
         && !has_on_request_transform;
     let bypass_request_buffering = request_known_oversize && allow_oversize_bypass_cache;
     if request_known_oversize && !bypass_request_buffering {
+        if has_on_request_transform && route.body_oversize == BodyOversizePolicy::BypassCache {
+            tracing::debug!(
+                route = %route.route_ref,
+                limit_bytes = max_body_bytes,
+                "rejecting oversized request body because on_request transform requires buffering"
+            );
+        }
         respond!(
             None,
             proxy_simple_response(
@@ -2284,6 +2293,13 @@ async fn proxy_handler(
                 respond!(
                     Some(upstream_latency),
                     Response::from_parts(upstream_parts, boxed_incoming(upstream_body))
+                );
+            }
+            if has_on_request_transform && route.body_oversize == BodyOversizePolicy::BypassCache {
+                tracing::debug!(
+                    route = %route.route_ref,
+                    limit_bytes,
+                    "rejecting oversized request body because on_request transform requires buffering"
                 );
             }
             tracing::debug!("request body exceeded configured limit of {limit_bytes} bytes");

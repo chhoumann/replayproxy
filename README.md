@@ -261,6 +261,16 @@ Common fixes:
 - Ensure method/path/query/body/header matching config has not drifted from recorded traffic.
 - For replay fallback behavior, set route `cache_miss = "forward"` instead of returning `502`.
 
+### Oversized requests with `on_request` transforms
+
+If a route config sets both:
+- `body_oversize = "bypass-cache"`
+- `routes.transform.on_request = "..."`
+
+then oversized request bodies still return `413` (`request body exceeds configured proxy.max_body_bytes`).
+This is intentional: `on_request` requires a fully buffered request body, so replayproxy cannot switch
+that request to bypass-cache streaming mode.
+
 ### TLS/CA trust and cert/key errors
 
 If TLS is enabled but CA paths are missing, startup fails fast with config errors:

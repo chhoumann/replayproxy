@@ -921,6 +921,146 @@ body_oversize = "bypass-cache"
     let _ = join.await;
 }
 
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn oversized_request_body_with_on_request_transform_returns_413() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let script_path = temp_dir.path().join("on_request.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(request)
+  request.headers["x-from-script"] = "1"
+  return request
+end
+"#,
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+
+[routes.transform]
+on_request = "{}"
+"#,
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::from_static(b"request-body-is-too-large")))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body_bytes[..],
+        b"request body exceeds configured proxy.max_body_bytes"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), upstream_rx.recv())
+            .await
+            .is_err(),
+        "upstream should not receive oversized requests when on_request transform is configured"
+    );
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn oversized_chunked_request_body_with_on_request_transform_returns_413() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let script_path = temp_dir.path().join("on_request.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(request)
+  request.headers["x-from-script"] = "1"
+  return request
+end
+"#,
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+
+[routes.transform]
+on_request = "{}"
+"#,
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, ChunkedBody> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(ChunkedBody::from_slices(&[b"12345", b"67890"]))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body_bytes[..],
+        b"request body exceeds configured proxy.max_body_bytes"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), upstream_rx.recv())
+            .await
+            .is_err(),
+        "upstream should not receive oversized chunked requests when on_request transform is configured"
+    );
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
 #[tokio::test]
 async fn oversized_chunked_request_body_replay_mode_still_returns_413() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;

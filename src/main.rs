@@ -163,8 +163,15 @@ enum SessionCommand {
         #[arg(long = "in")]
         input: PathBuf,
     },
-    /// Trigger retention pruning for a session immediately.
-    Prune { name: String },
+    /// Trigger retention pruning for one session or all sessions immediately.
+    Prune {
+        /// Session name to prune.
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
+        /// Prune retention across every existing session.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -275,6 +282,13 @@ struct PresetMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPruneReport {
+    name: String,
+    deleted: u64,
+    remaining: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionCommandOutcome {
     Listed {
         sessions: Vec<String>,
@@ -297,9 +311,8 @@ enum SessionCommandOutcome {
         result: SessionImportResult,
     },
     Pruned {
-        name: String,
-        deleted: u64,
-        remaining: u64,
+        reports: Vec<SessionPruneReport>,
+        total_deleted: u64,
     },
 }
 
@@ -956,17 +969,38 @@ async fn run_session_command(
             .map_err(|err| anyhow::anyhow!("{err}"))?;
             Ok(SessionCommandOutcome::Imported { result })
         }
-        SessionCommand::Prune { name } => {
-            let storage = session_manager
-                .open_session_storage(&name)
-                .await
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
-            let deleted = storage.prune_retention().await?;
-            let remaining = storage.count_recordings().await?;
+        SessionCommand::Prune { name, all } => {
+            let session_names = if all {
+                session_manager
+                    .list_sessions()
+                    .await
+                    .map_err(|err| anyhow::anyhow!("{err}"))?
+            } else {
+                vec![name.ok_or_else(|| {
+                    anyhow::anyhow!("session name is required unless `--all` is provided")
+                })?]
+            };
+
+            let mut reports = Vec::with_capacity(session_names.len());
+            let mut total_deleted = 0_u64;
+            for session_name in session_names {
+                let storage = session_manager
+                    .open_session_storage(&session_name)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
+                let deleted = storage.prune_retention().await?;
+                let remaining = storage.count_recordings().await?;
+                total_deleted = total_deleted.saturating_add(deleted);
+                reports.push(SessionPruneReport {
+                    name: session_name,
+                    deleted,
+                    remaining,
+                });
+            }
+
             Ok(SessionCommandOutcome::Pruned {
-                name,
-                deleted,
-                remaining,
+                reports,
+                total_deleted,
             })
         }
     }
@@ -1221,13 +1255,32 @@ fn print_session_command_outcome(outcome: SessionCommandOutcome) {
             );
         }
         SessionCommandOutcome::Pruned {
-            name,
-            deleted,
-            remaining,
+            reports,
+            total_deleted,
         } => {
-            println!(
-                "pruned retention for session `{name}`: deleted {deleted} recordings; {remaining} remain"
-            );
+            if reports.is_empty() {
+                println!(
+                    "pruned retention across all sessions: no sessions found; deleted 0 recordings"
+                );
+            } else if reports.len() == 1 {
+                let report = &reports[0];
+                println!(
+                    "pruned retention for session `{}`: deleted {} recordings; {} remain",
+                    report.name, report.deleted, report.remaining
+                );
+            } else {
+                println!(
+                    "pruned retention across {} sessions: deleted {} recordings total",
+                    reports.len(),
+                    total_deleted
+                );
+                for report in reports {
+                    println!(
+                        "session `{}`: deleted {} recordings; {} remain",
+                        report.name, report.deleted, report.remaining
+                    );
+                }
+            }
         }
     }
 }
@@ -1551,10 +1604,10 @@ mod tests {
     use super::{
         CaCommand, Cli, Command, InitConfigAction, ModeCommand, ModeCommandOutcome, PresetCommand,
         RecordingCommand, RecordingCommandOutcome, SessionCommand, SessionCommandOutcome,
-        encode_uri_path_segment, parse_recording_search_query, redact_active_session,
-        redact_if_present, resolve_admin_addr_for_mode, resolve_admin_addr_for_switch,
-        run_init_command, run_mode_command, run_recording_command, run_session_command,
-        startup_summary, update_proxy_mode_in_toml,
+        SessionPruneReport, encode_uri_path_segment, parse_recording_search_query,
+        redact_active_session, redact_if_present, resolve_admin_addr_for_mode,
+        resolve_admin_addr_for_switch, run_init_command, run_mode_command, run_recording_command,
+        run_session_command, startup_summary, update_proxy_mode_in_toml,
     };
     use clap::Parser;
     use replayproxy::{
@@ -2170,7 +2223,26 @@ active_session = "{active_session}"
         assert_eq!(
             action,
             SessionCommand::Prune {
-                name: "staging".to_owned(),
+                name: Some("staging".to_owned()),
+                all: false,
+            }
+        );
+    }
+
+    #[test]
+    fn session_prune_all_parses() {
+        let cli = Cli::try_parse_from(["replayproxy", "session", "prune", "--all"])
+            .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Session { config, action } => (config, action),
+            other => panic!("expected session command, got {other:?}"),
+        };
+        assert_eq!(config, None);
+        assert_eq!(
+            action,
+            SessionCommand::Prune {
+                name: None,
+                all: true
             }
         );
     }
@@ -3571,7 +3643,8 @@ max_age_hours = 1
         let outcome = run_session_command(
             &config,
             SessionCommand::Prune {
-                name: "default".to_owned(),
+                name: Some("default".to_owned()),
+                all: false,
             },
         )
         .await
@@ -3580,9 +3653,12 @@ max_age_hours = 1
         assert_eq!(
             outcome,
             SessionCommandOutcome::Pruned {
-                name: "default".to_owned(),
-                deleted: 1,
-                remaining: 1,
+                reports: vec![SessionPruneReport {
+                    name: "default".to_owned(),
+                    deleted: 1,
+                    remaining: 1,
+                }],
+                total_deleted: 1,
             }
         );
 
@@ -3592,6 +3668,133 @@ max_age_hours = 1
             .expect("list after prune should succeed");
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].request_uri, "/fresh");
+    }
+
+    #[tokio::test]
+    async fn session_prune_all_applies_retention_policy_to_each_session() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:8080"
+
+[storage]
+path = "{}"
+active_session = "default"
+max_age_hours = 1
+"#,
+            temp_dir.path().display()
+        ))
+        .expect("config should parse");
+
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager should initialize")
+            .expect("storage should be configured");
+        manager
+            .create_session("default")
+            .await
+            .expect("default session should be created");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should be created");
+
+        let now_unix_ms = Recording::now_unix_ms().expect("timestamp should be available");
+        let stale_default = recording_fixture(
+            "default-stale-recording",
+            "GET",
+            "/default/stale",
+            now_unix_ms - (2 * 60 * 60 * 1_000),
+        );
+        let fresh_default = recording_fixture(
+            "default-fresh-recording",
+            "GET",
+            "/default/fresh",
+            now_unix_ms - (5 * 60 * 1_000),
+        );
+        let stale_staging = recording_fixture(
+            "staging-stale-recording",
+            "GET",
+            "/staging/stale",
+            now_unix_ms - (2 * 60 * 60 * 1_000),
+        );
+        let fresh_staging = recording_fixture(
+            "staging-fresh-recording",
+            "GET",
+            "/staging/fresh",
+            now_unix_ms - (5 * 60 * 1_000),
+        );
+
+        let default_db_path =
+            replayproxy::session::resolve_session_db_path(temp_dir.path(), "default")
+                .expect("default session path should resolve");
+        let default_seed_storage =
+            Storage::open(default_db_path).expect("default seed storage should open");
+        default_seed_storage
+            .insert_recording(stale_default)
+            .await
+            .expect("default stale insert should succeed");
+        default_seed_storage
+            .insert_recording(fresh_default)
+            .await
+            .expect("default fresh insert should succeed");
+
+        let staging_db_path =
+            replayproxy::session::resolve_session_db_path(temp_dir.path(), "staging")
+                .expect("staging session path should resolve");
+        let staging_seed_storage =
+            Storage::open(staging_db_path).expect("staging seed storage should open");
+        staging_seed_storage
+            .insert_recording(stale_staging)
+            .await
+            .expect("staging stale insert should succeed");
+        staging_seed_storage
+            .insert_recording(fresh_staging)
+            .await
+            .expect("staging fresh insert should succeed");
+
+        let outcome = run_session_command(
+            &config,
+            SessionCommand::Prune {
+                name: None,
+                all: true,
+            },
+        )
+        .await
+        .expect("session prune all should succeed");
+
+        assert_eq!(
+            outcome,
+            SessionCommandOutcome::Pruned {
+                reports: vec![
+                    SessionPruneReport {
+                        name: "default".to_owned(),
+                        deleted: 1,
+                        remaining: 1,
+                    },
+                    SessionPruneReport {
+                        name: "staging".to_owned(),
+                        deleted: 1,
+                        remaining: 1,
+                    },
+                ],
+                total_deleted: 2,
+            }
+        );
+
+        let default_summaries = default_seed_storage
+            .list_recordings(0, 10)
+            .await
+            .expect("default list after prune should succeed");
+        assert_eq!(default_summaries.len(), 1);
+        assert_eq!(default_summaries[0].request_uri, "/default/fresh");
+
+        let staging_summaries = staging_seed_storage
+            .list_recordings(0, 10)
+            .await
+            .expect("staging list after prune should succeed");
+        assert_eq!(staging_summaries.len(), 1);
+        assert_eq!(staging_summaries[0].request_uri, "/staging/fresh");
     }
 
     #[tokio::test]

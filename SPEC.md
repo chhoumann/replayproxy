@@ -284,7 +284,7 @@ A companion CLI (`replayproxy`) with subcommands:
 | `replayproxy session delete <name>` | Delete a session and its recordings |
 | `replayproxy session export <name> --format <json\|yaml> --out ./dir` | Export session to files |
 | `replayproxy session import <name> --in ./dir` | Import files into an existing session |
-| `replayproxy session prune <name>` | Trigger retention pruning now and report deleted counts |
+| `replayproxy session prune <name>` / `replayproxy session prune --all` | Trigger retention pruning now for one or all sessions and report deleted counts |
 | `replayproxy recording list [--session <name>]` | List recordings in a session |
 | `replayproxy recording search <query>` | Search recordings by URL, method, body content |
 | `replayproxy recording delete <id>` | Delete a specific recording |

@@ -377,6 +377,7 @@ replayproxy session --config ./replayproxy.toml list
 replayproxy session --config ./replayproxy.toml create test-session
 replayproxy session --config ./replayproxy.toml switch test-session --admin-addr 127.0.0.1:8081
 replayproxy session --config ./replayproxy.toml prune test-session
+replayproxy session --config ./replayproxy.toml prune --all
 replayproxy session --config ./replayproxy.toml delete old-session
 ```
 
@@ -402,7 +403,7 @@ Operational notes:
 - Active session cannot be deleted.
 - Optional `storage.max_recordings = <N>` keeps only the newest `N` recordings per session by evicting oldest rows during writes/imports.
 - Optional `storage.max_age_days = <N>` or `storage.max_age_hours = <N>` prunes recordings older than that window during writes/imports (`max_age_days` and `max_age_hours` are mutually exclusive).
-- Use `replayproxy session ... prune <name>` to force retention pruning immediately for low-write or idle sessions and report deleted counts.
+- Use `replayproxy session ... prune <name>` (single session) or `replayproxy session ... prune --all` (all sessions) to force retention pruning immediately for low-write or idle sessions and report deleted counts.
 
 ## Admin API and runtime operations
 
@@ -575,7 +576,7 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 ## Known limitations (current)
 
 - gRPC proto-aware matching (`routes.grpc.match_fields`) requires a build with `--features grpc`; without it, matching falls back to opaque request-body behavior.
-- Time-based retention is enforced during writes/imports; for idle sessions trigger pruning manually with `replayproxy session ... prune <name>` or `POST /_admin/sessions/:name/prune`.
+- Time-based retention is enforced during writes/imports; for idle sessions trigger pruning manually with `replayproxy session ... prune --all`, `replayproxy session ... prune <name>`, or `POST /_admin/sessions/:name/prune`.
 - Query `subset` matching fallback uses a per-param inverted index, but extremely broad buckets can still trigger additional candidate scanning.
 
 ## Additional docs

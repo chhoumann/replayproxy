@@ -124,6 +124,71 @@ curl -i http://127.0.0.1:8080/api/get?demo=1
 
 The response should now come from local storage (no upstream call). If no recording matches, replay mode returns `502 Gateway Not Recorded`.
 
+## Troubleshooting
+
+### `502 Gateway Not Recorded` in replay mode
+
+Replay misses return `502` and include JSON fields like `error`, `route`, `session`, and `match_key`.
+
+Quick checks:
+
+```bash
+# Verify current runtime mode (requires admin API)
+replayproxy mode show --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
+
+# Inspect recordings in the active session
+replayproxy recording list --config ./replayproxy.toml
+replayproxy recording search "GET /api/get?demo=1" --config ./replayproxy.toml
+
+# Inspect runtime counters (cache_misses_total, active_session, etc.)
+curl -sS http://127.0.0.1:8081/_admin/status
+```
+
+Common fixes:
+- Record seed traffic first (`record` or `passthrough-cache`) so replay has matching entries.
+- Confirm you are querying the expected session (`storage.active_session` or `session switch`).
+- Ensure method/path/query/body/header matching config has not drifted from recorded traffic.
+- For replay fallback behavior, set route `cache_miss = "forward"` instead of returning `502`.
+
+### TLS/CA trust and cert/key errors
+
+If TLS is enabled but CA paths are missing, startup fails fast with config errors:
+- `proxy.tls.ca_cert` is required when `proxy.tls.enabled = true`
+- `proxy.tls.ca_key` is required when `proxy.tls.enabled = true`
+
+Use an explicit TLS block and verify files exist/readable:
+
+```toml
+[proxy.tls]
+enabled = true
+ca_cert = "~/.replayproxy/ca/cert.pem"
+ca_key = "~/.replayproxy/ca/key.pem"
+```
+
+```bash
+ls -l ~/.replayproxy/ca/cert.pem ~/.replayproxy/ca/key.pem
+```
+
+If clients report trust failures (for example, unknown authority), make sure the client trusts the configured CA certificate. For quick local checks with `curl`, you can point directly at the CA:
+
+```bash
+curl --cacert ~/.replayproxy/ca/cert.pem https://example.test
+```
+
+### Config reload not applying
+
+Manual reload endpoint:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
+```
+
+Notes:
+- `409` + `config reload unavailable` means proxy was not started from a config file path. Start with `serve --config ./replayproxy.toml`.
+- `400` parse errors indicate invalid TOML/route parsing in the updated config file.
+- Reload response includes `changed`, `routes_before/routes_after`, and route diff counts; use it to confirm whether anything was actually applied.
+- Automatic file watching is enabled in default builds and reloads are debounced (~250ms), so rapid edits may apply as a single update.
+
 ## Common commands
 
 ```bash

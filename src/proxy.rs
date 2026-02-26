@@ -3428,12 +3428,8 @@ async fn maybe_reject_for_replay_rate_limit(
     if route.mode != RouteMode::Replay {
         return None;
     }
-    let Some(rate_limit) = route.rate_limit.as_ref() else {
-        return None;
-    };
-    let Some(upstream_authority) = upstream_authority_for_rate_limit_scope(upstream_uri) else {
-        return None;
-    };
+    let rate_limit = route.rate_limit.as_ref()?;
+    let upstream_authority = upstream_authority_for_rate_limit_scope(upstream_uri)?;
 
     let limiter = state.record_rate_limiters.limiter(
         RecordRateLimitKey {

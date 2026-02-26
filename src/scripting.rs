@@ -1,13 +1,19 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail};
 use hyper::{
     Method, Uri,
     header::{HeaderName, HeaderValue},
 };
-use mlua::{Function, Lua, String as LuaString, Table, Value};
+use mlua::{Function, Lua, String as LuaString, Table, Value, VmState};
 
 pub const TRANSFORM_FUNCTION_NAME: &str = "transform";
+const LUA_SCRIPT_TIMEOUT: Duration = Duration::from_millis(50);
+const LUA_SCRIPT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const DISABLED_SCRIPT_GLOBALS: &[&str] = &["require", "os", "dofile", "loadfile"];
 
 #[derive(Clone, Copy)]
 struct ScriptHook {
@@ -170,7 +176,7 @@ fn run_message_script<T>(
     to_lua_table: fn(&Lua, &T) -> mlua::Result<Table>,
     from_lua_table: fn(Table) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let lua = Lua::new();
+    let lua = prepare_script_runtime(route_ref, hook.hook_name, script_label)?;
     let globals = lua.globals();
     let message_table = to_lua_table(&lua, message).map_err(|err| {
         script_context_error(
@@ -253,6 +259,47 @@ fn run_message_script<T>(
             err,
         )
     })
+}
+
+fn prepare_script_runtime(
+    route_ref: &str,
+    hook_name: &str,
+    script_label: &str,
+) -> anyhow::Result<Lua> {
+    let lua = Lua::new();
+    let globals = lua.globals();
+    for global_name in DISABLED_SCRIPT_GLOBALS {
+        globals.raw_set(*global_name, Value::Nil).map_err(|err| {
+            script_context_error(route_ref, hook_name, script_label, "restrict globals", err)
+        })?;
+    }
+
+    lua.sandbox(true).map_err(|err| {
+        script_context_error(route_ref, hook_name, script_label, "enable sandbox", err)
+    })?;
+    lua.set_memory_limit(LUA_SCRIPT_MEMORY_LIMIT_BYTES)
+        .map_err(|err| {
+            script_context_error(
+                route_ref,
+                hook_name,
+                script_label,
+                "apply memory limit",
+                err,
+            )
+        })?;
+
+    let timeout_deadline = Instant::now() + LUA_SCRIPT_TIMEOUT;
+    lua.set_interrupt(move |_| {
+        if Instant::now() >= timeout_deadline {
+            return Err(mlua::Error::runtime(format!(
+                "script exceeded {}ms execution limit",
+                LUA_SCRIPT_TIMEOUT.as_millis()
+            )));
+        }
+        Ok(VmState::Continue)
+    });
+
+    Ok(lua)
 }
 
 fn request_to_lua_table(lua: &Lua, request: &ScriptRequest) -> mlua::Result<Table> {
@@ -414,8 +461,8 @@ fn script_context_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScriptRecording, ScriptRequest, ScriptResponse, run_on_record_script, run_on_replay_script,
-        run_on_request_script, run_on_response_script,
+        LUA_SCRIPT_MEMORY_LIMIT_BYTES, ScriptRecording, ScriptRequest, ScriptResponse,
+        run_on_record_script, run_on_replay_script, run_on_request_script, run_on_response_script,
     };
     use std::collections::BTreeMap;
 
@@ -572,5 +619,64 @@ response.body = "transformed-cache"
         assert_eq!(response.status, 202);
         assert_eq!(response.headers.get("x-replayed"), Some(&"1".to_string()));
         assert_eq!(response.body, b"transformed-cache");
+    }
+
+    #[test]
+    fn scripts_run_with_require_and_os_disabled() {
+        let mut request = ScriptRequest::new("GET", "/v1", BTreeMap::new(), Vec::new());
+        let script = r#"
+if require ~= nil then
+  error("require should be disabled")
+end
+if os ~= nil then
+  error("os should be disabled")
+end
+request.headers["x-sandbox"] = "1"
+"#;
+
+        run_on_request_script(
+            "routes[5] (sandbox)",
+            "scripts/sandbox.lua",
+            script,
+            &mut request,
+        )
+        .unwrap();
+
+        assert_eq!(request.headers.get("x-sandbox"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn script_execution_timeout_is_enforced() {
+        let mut request = ScriptRequest::new("GET", "/v1", BTreeMap::new(), Vec::new());
+        let err = run_on_request_script(
+            "routes[6] (timeout)",
+            "scripts/timeout.lua",
+            "while true do end",
+            &mut request,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("execution limit"), "err: {message}");
+    }
+
+    #[test]
+    fn script_memory_limit_is_enforced() {
+        let mut request = ScriptRequest::new("GET", "/v1", BTreeMap::new(), Vec::new());
+        let script = format!(
+            "request.body = string.rep(\"x\", {})",
+            LUA_SCRIPT_MEMORY_LIMIT_BYTES * 4
+        );
+        let err = run_on_request_script(
+            "routes[7] (memory)",
+            "scripts/memory.lua",
+            &script,
+            &mut request,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.to_ascii_lowercase().contains("memory"),
+            "err: {message}"
+        );
     }
 }

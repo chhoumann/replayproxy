@@ -14,6 +14,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::{Frame, Incoming},
+    client::conn::http1,
     header::{self, HeaderValue},
     service::service_fn,
 };
@@ -26,7 +27,7 @@ use replayproxy::storage::{Recording, Storage};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::mpsc,
     time::{sleep, timeout},
 };
@@ -133,6 +134,68 @@ upstream = "http://{upstream_addr}"
     assert!(captured.headers.get(header::CONNECTION).is_none());
     assert_eq!(&captured.body[..], b"");
 
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn forward_proxy_forwards_absolute_form_request_without_configured_upstream() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/"
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http1::handshake(io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let absolute_uri: Uri = format!("http://{upstream_addr}/forward/hello?x=1")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(absolute_uri)
+        .header(header::HOST, upstream_addr.to_string())
+        .header(header::CONNECTION, "close, x-hop")
+        .header("x-hop", "secret")
+        .header("x-end", "kept")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/forward/hello");
+    assert_eq!(captured.uri.query(), Some("x=1"));
+    assert_eq!(
+        captured.headers.get(header::HOST).unwrap(),
+        &HeaderValue::from_str(&upstream_addr.to_string()).unwrap()
+    );
+    assert_eq!(
+        captured.headers.get("x-end").unwrap(),
+        &HeaderValue::from_static("kept")
+    );
+    assert!(captured.headers.get("x-hop").is_none());
+    assert!(captured.headers.get(header::CONNECTION).is_none());
+    assert_eq!(&captured.body[..], b"");
+
+    drop(sender);
+    let _ = connection_task.await;
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
 }

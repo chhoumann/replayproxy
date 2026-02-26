@@ -1528,22 +1528,27 @@ async fn proxy_handler(
     route_ref = Some(route.route_ref.as_str());
     mode = Some(route.mode);
 
-    let Some(upstream_base) = route.upstream.as_ref() else {
+    let upstream_uri = if let Some(upstream_base) = route.upstream.as_ref() {
+        match build_upstream_uri(upstream_base, req.uri()) {
+            Ok(uri) => uri,
+            Err(err) => {
+                tracing::debug!("failed to build upstream uri: {err}");
+                respond!(
+                    None,
+                    proxy_simple_response(
+                        StatusCode::BAD_GATEWAY,
+                        "failed to build upstream request",
+                    )
+                );
+            }
+        }
+    } else if let Some(uri) = forward_proxy_upstream_uri(req.uri()) {
+        uri
+    } else {
         respond!(
             None,
             proxy_simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
         );
-    };
-
-    let upstream_uri = match build_upstream_uri(upstream_base, req.uri()) {
-        Ok(uri) => uri,
-        Err(err) => {
-            tracing::debug!("failed to build upstream uri: {err}");
-            respond!(
-                None,
-                proxy_simple_response(StatusCode::BAD_GATEWAY, "failed to build upstream request",)
-            );
-        }
     };
 
     let request_content_length = parse_content_length(req.headers());
@@ -2144,6 +2149,16 @@ fn build_upstream_uri(upstream_base: &Uri, original: &Uri) -> anyhow::Result<Uri
     parts.scheme = upstream_base.scheme().cloned();
     parts.authority = upstream_base.authority().cloned();
     Uri::from_parts(parts).map_err(|err| anyhow::anyhow!("construct upstream uri: {err}"))
+}
+
+fn forward_proxy_upstream_uri(original: &Uri) -> Option<Uri> {
+    if !matches!(original.scheme_str(), Some("http" | "https")) {
+        return None;
+    }
+    if original.authority().is_none() {
+        return None;
+    }
+    Some(original.clone())
 }
 
 fn set_host_header(headers: &mut hyper::HeaderMap, uri: &Uri) {
@@ -3402,9 +3417,10 @@ mod tests {
 
     use super::{
         CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, emit_proxy_request_log,
-        format_route_ref, lookup_recording_for_request_with_subset_limit, mode_log_label,
-        redact_recording_body_json, redact_recording_headers, request_runtime_config_for_path,
-        sanitize_match_key, select_route, summarize_route_diff,
+        format_route_ref, forward_proxy_upstream_uri,
+        lookup_recording_for_request_with_subset_limit, mode_log_label, redact_recording_body_json,
+        redact_recording_headers, request_runtime_config_for_path, sanitize_match_key,
+        select_route, summarize_route_diff,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
@@ -3497,6 +3513,22 @@ mod tests {
 
         assert_eq!(snapshot.max_body_bytes, 256);
         assert_eq!(route.path_exact.as_deref(), Some("/v2/snapshot"));
+    }
+
+    #[test]
+    fn forward_proxy_upstream_uri_accepts_absolute_http_request_target() {
+        let request_uri: hyper::Uri = "http://example.test/api/hello?x=1".parse().unwrap();
+        let upstream_uri =
+            forward_proxy_upstream_uri(&request_uri).expect("absolute-form uri should resolve");
+
+        assert_eq!(upstream_uri, request_uri);
+    }
+
+    #[test]
+    fn forward_proxy_upstream_uri_rejects_origin_form_request_target() {
+        let request_uri: hyper::Uri = "/api/hello?x=1".parse().unwrap();
+
+        assert!(forward_proxy_upstream_uri(&request_uri).is_none());
     }
 
     #[test]

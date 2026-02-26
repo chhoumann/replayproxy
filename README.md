@@ -68,6 +68,18 @@ Example configs:
 - [`examples/replayproxy.minimal.toml`](examples/replayproxy.minimal.toml)
 - [`examples/replayproxy.llm-redacted.toml`](examples/replayproxy.llm-redacted.toml)
 
+Lua transform examples:
+
+- [`examples/scripts/llm_on_request.lua`](examples/scripts/llm_on_request.lua)
+- [`examples/scripts/llm_on_response.lua`](examples/scripts/llm_on_response.lua)
+
+`examples/replayproxy.llm-redacted.toml` wires those files via `[routes.transform]`.
+Lua hooks require a build with scripting enabled:
+
+```bash
+cargo run --features scripting -- serve --config ./examples/replayproxy.llm-redacted.toml
+```
+
 ## Quickstart: record then replay (reverse proxy)
 
 Use this minimal config (`replayproxy.toml`):

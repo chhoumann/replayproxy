@@ -31,6 +31,10 @@ body_json = ["$.model", "$.messages", "$.temperature"]
 headers = ["authorization"]
 body_json = ["$.api_key", "$.messages[*].content"]
 
+[routes.transform]
+on_request = "scripts/llm_on_request.lua"
+on_response = "scripts/llm_on_response.lua"
+
 [[routes]]
 name = "anthropic-messages"
 path_prefix = "/v1/messages"

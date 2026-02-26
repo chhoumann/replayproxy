@@ -26,8 +26,12 @@ bd show <issue-id>
 bd update <issue-id> --status in_progress
 bd update <issue-id> --status done
 
-# Sync with git remote
-bd sync
+# Sync Beads (Dolt-backed repos)
+bd dolt pull
+bd dolt push
+
+# Local-only fallback (no Dolt store configured)
+bd export
 ```
 
 ### Working with Issues

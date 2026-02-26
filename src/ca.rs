@@ -1,11 +1,13 @@
 use std::{
     collections::HashMap,
     env, fs,
-    io::{ErrorKind, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::{Arc, Mutex},
 };
+#[cfg(target_os = "linux")]
+use std::io::ErrorKind;
 
 use anyhow::{Context, bail};
 use rcgen::{
@@ -23,6 +25,7 @@ const ROOT_CA_COMMON_NAME: &str = "replayproxy Local Root CA";
 const DIR_MODE_RESTRICTED: u32 = 0o700;
 const FILE_MODE_RESTRICTED: u32 = 0o600;
 const FILE_MODE_READABLE: u32 = 0o644;
+#[cfg(target_os = "linux")]
 const LINUX_SYSTEM_CERT_INSTALL_PATH: &str = "/usr/local/share/ca-certificates/replayproxy-ca.crt";
 #[cfg(target_os = "macos")]
 const MACOS_SYSTEM_KEYCHAIN_PATH: &str = "/Library/Keychains/System.keychain";

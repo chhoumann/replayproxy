@@ -423,6 +423,8 @@ pub struct RedactConfig {
     #[serde(default)]
     pub body_json: Vec<String>,
     #[serde(default)]
+    pub query_params: Vec<String>,
+    #[serde(default)]
     pub placeholder: Option<String>,
 }
 
@@ -442,6 +444,11 @@ impl RedactConfig {
             route_name,
             &format!("{config_path}.body_json"),
         )?;
+        normalize_redact_query_params(
+            &mut self.query_params,
+            route_name,
+            &format!("{config_path}.query_params"),
+        )?;
         normalize_redact_placeholder(
             &mut self.placeholder,
             route_name,
@@ -453,6 +460,7 @@ impl RedactConfig {
     fn merge(defaults: Option<&Self>, route: Option<&Self>) -> Option<Self> {
         let mut headers = Vec::new();
         let mut body_json = Vec::new();
+        let mut query_params = Vec::new();
         let placeholder = route
             .and_then(|config| config.placeholder.as_ref())
             .or_else(|| defaults.and_then(|config| config.placeholder.as_ref()))
@@ -461,18 +469,21 @@ impl RedactConfig {
         if let Some(defaults) = defaults {
             append_unique_header_names(&mut headers, &defaults.headers);
             append_unique_strings(&mut body_json, &defaults.body_json);
+            append_unique_query_param_names(&mut query_params, &defaults.query_params);
         }
         if let Some(route) = route {
             append_unique_header_names(&mut headers, &route.headers);
             append_unique_strings(&mut body_json, &route.body_json);
+            append_unique_query_param_names(&mut query_params, &route.query_params);
         }
 
-        if headers.is_empty() && body_json.is_empty() {
+        if headers.is_empty() && body_json.is_empty() && query_params.is_empty() {
             None
         } else {
             Some(Self {
                 headers,
                 body_json,
+                query_params,
                 placeholder,
             })
         }
@@ -765,6 +776,30 @@ fn normalize_redact_body_json(
     Ok(())
 }
 
+fn normalize_redact_query_params(
+    query_params: &mut Vec<String>,
+    route_name: Option<&str>,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    let mut normalized = Vec::new();
+    for name in query_params.drain(..) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(redact_error(
+                route_name,
+                format!("`{config_path}` entries must not be empty"),
+            ));
+        }
+
+        let canonical = trimmed.to_ascii_lowercase();
+        if !normalized.iter().any(|existing| existing == &canonical) {
+            normalized.push(canonical);
+        }
+    }
+    *query_params = normalized;
+    Ok(())
+}
+
 fn normalize_redact_placeholder(
     placeholder: &mut Option<String>,
     route_name: Option<&str>,
@@ -795,6 +830,14 @@ fn append_unique_header_names(target: &mut Vec<String>, values: &[String]) {
 }
 
 fn append_unique_strings(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !target.iter().any(|existing| existing == value) {
+            target.push(value.clone());
+        }
+    }
+}
+
+fn append_unique_query_param_names(target: &mut Vec<String>, values: &[String]) {
     for value in values {
         if !target.iter().any(|existing| existing == value) {
             target.push(value.clone());
@@ -1006,6 +1049,7 @@ enabled = true
 
 [defaults.redact]
 headers = ["Authorization", "X-Api-Key", "Cookie"]
+query_params = ["api_key", "token"]
 placeholder = "<REDACTED>"
 
 [[routes]]
@@ -1026,6 +1070,7 @@ body_json = ["$.model", "$.messages", "$.temperature"]
 [routes.redact]
 headers = ["Authorization"]
 body_json = ["$.api_key"]
+query_params = ["api_key"]
 
 [routes.streaming]
 preserve_timing = true
@@ -1132,6 +1177,10 @@ recording_mode = "server-only"
         );
         assert_eq!(openai.redact.as_ref().unwrap().body_json, vec!["$.api_key"]);
         assert_eq!(
+            openai.redact.as_ref().unwrap().query_params,
+            vec!["api_key", "token"]
+        );
+        assert_eq!(
             openai.redact.as_ref().unwrap().placeholder.as_deref(),
             Some("<REDACTED>")
         );
@@ -1147,6 +1196,10 @@ recording_mode = "server-only"
             vec!["authorization", "x-api-key", "cookie"]
         );
         assert!(anthropic.redact.as_ref().unwrap().body_json.is_empty());
+        assert_eq!(
+            anthropic.redact.as_ref().unwrap().query_params,
+            vec!["api_key", "token"]
+        );
         assert_eq!(
             anthropic.redact.as_ref().unwrap().placeholder.as_deref(),
             Some("<REDACTED>")
@@ -1341,6 +1394,7 @@ listen = "127.0.0.1:0"
 [defaults.redact]
 headers = ["Authorization", "X-Api-Key"]
 body_json = ["$.api_key"]
+query_params = ["API_KEY", "token"]
 placeholder = "<DEFAULT-MASK>"
 
 [[routes]]
@@ -1354,6 +1408,7 @@ upstream = "https://api.example.com"
 [routes.redact]
 headers = ["Cookie", "authorization"]
 body_json = ["$.token", "$.api_key"]
+query_params = ["tenant", "api_key"]
 placeholder = "<ROUTE-MASK>"
 "#,
         )
@@ -1365,6 +1420,7 @@ placeholder = "<ROUTE-MASK>"
             .expect("inherited route redaction should be present");
         assert_eq!(inherited.headers, vec!["authorization", "x-api-key"]);
         assert_eq!(inherited.body_json, vec!["$.api_key"]);
+        assert_eq!(inherited.query_params, vec!["api_key", "token"]);
         assert_eq!(inherited.placeholder.as_deref(), Some("<DEFAULT-MASK>"));
 
         let override_route = config.routes[1]
@@ -1376,6 +1432,10 @@ placeholder = "<ROUTE-MASK>"
             vec!["authorization", "x-api-key", "cookie"]
         );
         assert_eq!(override_route.body_json, vec!["$.api_key", "$.token"]);
+        assert_eq!(
+            override_route.query_params,
+            vec!["api_key", "token", "tenant"]
+        );
         assert_eq!(override_route.placeholder.as_deref(), Some("<ROUTE-MASK>"));
     }
 
@@ -1398,6 +1458,28 @@ placeholder = "   "
         assert!(
             err.to_string()
                 .contains("`routes.redact.placeholder` must not be empty"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_redaction_query_param_name_fails_fast() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+
+[routes.redact]
+query_params = ["token", "   "]
+"#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`routes.redact.query_params` entries must not be empty"),
             "err: {err}"
         );
     }

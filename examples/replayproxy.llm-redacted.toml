@@ -11,6 +11,7 @@ active_session = "llm-dev"
 
 [defaults.redact]
 headers = ["authorization", "x-api-key"]
+query_params = ["api_key", "token"]
 placeholder = "<REDACTED>"
 
 [[routes]]
@@ -30,6 +31,7 @@ body_json = ["$.model", "$.messages", "$.temperature"]
 [routes.redact]
 headers = ["authorization"]
 body_json = ["$.api_key", "$.messages[*].content"]
+query_params = ["api_key"]
 
 [routes.transform]
 on_request = "scripts/llm_on_request.lua"
@@ -50,3 +52,4 @@ body_json = ["$.model", "$.messages", "$.max_tokens"]
 [routes.redact]
 headers = ["x-api-key"]
 body_json = ["$.messages[*].content"]
+query_params = ["api_key"]

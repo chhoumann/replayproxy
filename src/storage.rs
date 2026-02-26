@@ -189,10 +189,20 @@ impl Storage {
     }
 
     pub async fn insert_recording(&self, recording: Recording) -> anyhow::Result<i64> {
+        self.insert_recording_with_query_norm(recording, None).await
+    }
+
+    pub async fn insert_recording_with_query_norm(
+        &self,
+        recording: Recording,
+        request_query_norm: Option<String>,
+    ) -> anyhow::Result<i64> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || insert_recording_blocking(&db_path, recording))
-            .await
-            .context("join insert_recording task")?
+        tokio::task::spawn_blocking(move || {
+            insert_recording_blocking(&db_path, recording, request_query_norm)
+        })
+        .await
+        .context("join insert_recording task")?
     }
 
     pub async fn insert_response_chunks(
@@ -814,9 +824,14 @@ fn backfill_request_query_norm(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn insert_recording_blocking(path: &Path, recording: Recording) -> anyhow::Result<i64> {
+fn insert_recording_blocking(
+    path: &Path,
+    recording: Recording,
+    request_query_norm: Option<String>,
+) -> anyhow::Result<i64> {
     let conn = open_connection(path)?;
-    let request_query_norm = normalized_query_from_request_uri(&recording.request_uri);
+    let request_query_norm = request_query_norm
+        .unwrap_or_else(|| normalized_query_from_request_uri(&recording.request_uri));
     let request_headers_json =
         serde_json::to_string(&recording.request_headers).context("serialize request headers")?;
     let response_headers_json =

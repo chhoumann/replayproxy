@@ -11,6 +11,7 @@ active_session = "openai"
 [defaults.redact]
 headers = ["authorization"]
 body_json = ["$.api_key", "$.messages[*].content"]
+query_params = ["api_key", "token"]
 placeholder = "<REDACTED>"
 
 [[routes]]

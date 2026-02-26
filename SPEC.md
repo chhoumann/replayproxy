@@ -172,6 +172,7 @@ Bidirectional rate control:
 Configurable sanitization of sensitive data **before** storing to the database:
 
 - **Headers**: Strip or replace specific request/response headers (e.g., `Authorization`, `X-Api-Key`).
+- **Query parameters**: Redact configured query-string keys (case-insensitive key matching) before URI persistence and full-URL logging.
 - **JSON body fields**: Redact specific fields using JSONPath expressions (e.g., `$.api_key`).
 - Redacted values are replaced with a configurable placeholder (default: `"[REDACTED]"`).
 - Redaction rules are defined per route in the TOML config.
@@ -180,13 +181,13 @@ Configurable sanitization of sensitive data **before** storing to the database:
 
 1. Compute an effective redaction config per route by merging `[defaults.redact]` with `[routes.redact]`.
 2. For each request, run `on_request` transforms first, then compute the match key from the transformed, non-redacted request according to `[routes.match]`.
-3. Before writing to SQLite, create redacted copies of request/response headers and bodies using the effective redaction config and placeholder.
+3. Before writing to SQLite, create redacted copies of request URI/query, request/response headers, and bodies using the effective redaction config and placeholder.
 4. Persist the redacted copies and the already-computed match key.
 
 Acceptance expectations:
 
 - If two requests differ only in a matched sensitive field (for example `Authorization`), they produce different match keys.
-- Stored recordings redact that field in headers/body according to policy.
+- Stored recordings redact that field in URI/headers/body according to policy.
 - Logs and error messages do not emit raw matched sensitive values.
 
 ---
@@ -375,6 +376,7 @@ enabled = true
 # Default redaction applied to all routes
 [defaults.redact]
 headers = ["Authorization", "X-Api-Key", "Cookie"]
+query_params = ["api_key", "token"]
 
 # Route-specific configuration
 [[routes]]
@@ -392,6 +394,7 @@ body_json = ["$.model", "$.messages", "$.temperature"]
 [routes.redact]
 headers = ["Authorization"]
 body_json = ["$.api_key"]
+query_params = ["api_key"]
 
 [routes.streaming]
 preserve_timing = true

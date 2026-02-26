@@ -7173,6 +7173,173 @@ body_json = ["$.auth.token", "$.messages[*].content"]
 }
 
 #[tokio::test]
+async fn record_mode_redacts_query_params_and_subset_replay_stays_correct() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.match]
+query = "subset"
+
+[routes.redact]
+query_params = ["token", "api_key"]
+"#,
+        storage_dir.path().display()
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let record_uri: Uri = format!(
+        "http://{}/api/hello?b=2&token=secret-1&token=secret-2&api%5Fkey=abc&a=1",
+        record_proxy.listen_addr
+    )
+    .parse()
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(record_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let _captured = upstream_rx.recv().await.unwrap();
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let stored_request_uri: String = conn
+        .query_row("SELECT request_uri FROM recordings LIMIT 1;", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        stored_request_uri.contains("token=%5BREDACTED%5D&token=%5BREDACTED%5D"),
+        "stored_request_uri={stored_request_uri}"
+    );
+    assert!(
+        stored_request_uri.contains("api%5Fkey=%5BREDACTED%5D"),
+        "stored_request_uri={stored_request_uri}"
+    );
+    assert!(
+        !stored_request_uri.contains("secret-1")
+            && !stored_request_uri.contains("secret-2")
+            && !stored_request_uri.contains("api%5Fkey=abc"),
+        "stored_request_uri={stored_request_uri}"
+    );
+
+    let session_manager = SessionManager::new(storage_dir.path().to_path_buf());
+    let export_dir = storage_dir.path().join("export");
+    let export_result = replayproxy::session_export::export_session(
+        &session_manager,
+        replayproxy::session_export::SessionExportRequest {
+            session_name: session.to_owned(),
+            out_dir: Some(export_dir),
+            format: replayproxy::session_export::SessionExportFormat::Json,
+        },
+    )
+    .await
+    .unwrap();
+    let manifest_bytes = fs::read(export_result.manifest_path).unwrap();
+    let manifest_json: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let exported_uri = manifest_json
+        .pointer("/recordings/0/request_uri")
+        .and_then(Value::as_str)
+        .expect("manifest should contain exported request URI");
+    assert!(
+        exported_uri.contains("token=%5BREDACTED%5D")
+            && exported_uri.contains("api%5Fkey=%5BREDACTED%5D"),
+        "exported_uri={exported_uri}"
+    );
+    assert!(
+        !exported_uri.contains("secret-1")
+            && !exported_uri.contains("secret-2")
+            && !exported_uri.contains("api%5Fkey=abc"),
+        "exported_uri={exported_uri}"
+    );
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "replay"
+cache_miss = "error"
+
+[routes.match]
+query = "subset"
+
+[routes.redact]
+query_params = ["token", "api_key"]
+"#,
+        storage_dir.path().display()
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let replay_hit_uri: Uri = format!(
+        "http://{}/api/hello?a=1&api%5Fkey=abc&token=secret-1&b=2&extra=1&token=secret-2",
+        replay_proxy.listen_addr
+    )
+    .parse()
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(replay_hit_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let replay_miss_uri: Uri = format!(
+        "http://{}/api/hello?a=1&api%5Fkey=abc&token=rotated&b=2&token=secret-2",
+        replay_proxy.listen_addr
+    )
+    .parse()
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(replay_miss_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn record_mode_uses_global_redaction_placeholder_in_storage() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 

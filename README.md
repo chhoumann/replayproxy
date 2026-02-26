@@ -442,7 +442,7 @@ Matching:
 Redaction:
 
 - Redaction runs before persistence.
-- Supports header redaction and JSONPath body redaction.
+- Supports header, query-parameter, and JSONPath body redaction.
 - Matching still uses pre-redaction request values.
 
 Replay miss behavior:

@@ -1769,6 +1769,7 @@ fn redact_configs_equal(current: Option<&RedactConfig>, next: Option<&RedactConf
         (Some(current), Some(next)) => {
             current.headers == next.headers
                 && current.body_json == next.body_json
+                && current.query_params == next.query_params
                 && current.placeholder == next.placeholder
         }
         _ => false,
@@ -2656,7 +2657,21 @@ async fn proxy_handler(
         .fetch_add(1, Ordering::Relaxed);
 
     let request_method = req.method().to_string();
-    let request_url = format_request_url_for_logging(req.uri(), state.request_url_log_mode);
+    let route_lookup_path = if req.method() == Method::CONNECT && req.uri().path().is_empty() {
+        "/"
+    } else {
+        req.uri().path()
+    };
+    let request_runtime_config = state.request_runtime_config(route_lookup_path);
+    let max_body_bytes = request_runtime_config.max_body_bytes;
+    let request_url = format_request_url_for_logging(
+        req.uri(),
+        state.request_url_log_mode,
+        request_runtime_config
+            .route
+            .as_ref()
+            .and_then(|route| route.redact.as_ref()),
+    );
     let request_span = tracing::info_span!(
         "proxy.request",
         method = %request_method,
@@ -2668,13 +2683,6 @@ async fn proxy_handler(
     let mut mode: Option<RouteMode> = None;
     let mut cache_outcome = CacheLogOutcome::Bypass;
     let mut replay_latency: Option<Duration> = None;
-    let route_lookup_path = if req.method() == Method::CONNECT && req.uri().path().is_empty() {
-        "/"
-    } else {
-        req.uri().path()
-    };
-    let request_runtime_config = state.request_runtime_config(route_lookup_path);
-    let max_body_bytes = request_runtime_config.max_body_bytes;
 
     macro_rules! respond {
         ($upstream_latency:expr, $response:expr) => {{
@@ -3036,6 +3044,12 @@ async fn proxy_handler(
                         response_body: Vec::new(),
                         created_at_unix_ms,
                     };
+                    let request_query_norm =
+                        normalized_query_from_request_uri(recording.request_uri.as_str());
+                    recording.request_uri = redact_recording_request_uri(
+                        recording.request_uri.as_str(),
+                        route.redact.as_ref(),
+                    );
                     recording.request_headers =
                         redact_recording_headers(recording.request_headers, route.redact.as_ref());
                     recording.response_headers =
@@ -3051,7 +3065,7 @@ async fn proxy_handler(
 
                     match pending_websocket_recording
                         .storage
-                        .insert_recording(recording)
+                        .insert_recording_with_query_norm(recording, Some(request_query_norm))
                         .await
                     {
                         Ok(recording_id) => {
@@ -3776,7 +3790,10 @@ async fn proxy_handler(
             );
         }
 
+        let request_query_norm = normalized_query_from_request_uri(recording.request_uri.as_str());
         let pre_redaction_response_body = recording.response_body.clone();
+        recording.request_uri =
+            redact_recording_request_uri(recording.request_uri.as_str(), route.redact.as_ref());
         recording.request_headers =
             redact_recording_headers(recording.request_headers, route.redact.as_ref());
         recording.response_headers =
@@ -3791,7 +3808,10 @@ async fn proxy_handler(
             response_chunks,
         );
 
-        match storage.insert_recording(recording).await {
+        match storage
+            .insert_recording_with_query_norm(recording, Some(request_query_norm))
+            .await
+        {
             Ok(recording_id) => {
                 state.status.increment_active_session_recordings_total();
                 if let Err(err) = storage
@@ -3891,9 +3911,16 @@ struct RequestObservation<'a> {
     upstream_latency: Option<Duration>,
 }
 
-fn format_request_url_for_logging(uri: &Uri, mode: RequestUrlLogMode) -> String {
+fn format_request_url_for_logging(
+    uri: &Uri,
+    mode: RequestUrlLogMode,
+    redact: Option<&RedactConfig>,
+) -> String {
     match mode {
-        RequestUrlLogMode::Full => uri.to_string(),
+        RequestUrlLogMode::Full => {
+            let full_uri = uri.to_string();
+            redact_query_params_in_uri(full_uri.as_str(), redact)
+        }
         RequestUrlLogMode::Path => {
             let path = uri.path();
             if path.is_empty() {
@@ -6463,6 +6490,137 @@ fn request_uri_for_recording(uri: &Uri) -> String {
         .unwrap_or_else(|| uri.path().to_owned())
 }
 
+fn recording_query_from_uri(uri: &str) -> Option<&str> {
+    uri.split_once('?').map(|(_, query)| query)
+}
+
+fn normalized_query_from_request_uri(uri: &str) -> String {
+    matching::normalized_query(recording_query_from_uri(uri))
+}
+
+fn redact_recording_request_uri(uri: &str, redact: Option<&RedactConfig>) -> String {
+    redact_query_params_in_uri(uri, redact)
+}
+
+fn redact_query_params_in_uri(uri: &str, redact: Option<&RedactConfig>) -> String {
+    let Some(redact) = redact else {
+        return uri.to_owned();
+    };
+    if redact.query_params.is_empty() {
+        return uri.to_owned();
+    }
+
+    let Some((prefix, query_and_fragment)) = uri.split_once('?') else {
+        return uri.to_owned();
+    };
+    let (query, fragment) = query_and_fragment
+        .split_once('#')
+        .map_or((query_and_fragment, None), |(query, fragment)| {
+            (query, Some(fragment))
+        });
+
+    let Some(redacted_query) = redact_query_params_in_query_string(query, redact) else {
+        return uri.to_owned();
+    };
+
+    if let Some(fragment) = fragment {
+        format!("{prefix}?{redacted_query}#{fragment}")
+    } else {
+        format!("{prefix}?{redacted_query}")
+    }
+}
+
+fn redact_query_params_in_query_string(query: &str, redact: &RedactConfig) -> Option<String> {
+    if query.is_empty() || redact.query_params.is_empty() {
+        return None;
+    }
+
+    let placeholder = encode_query_component(redaction_placeholder(redact));
+    let mut changed = false;
+    let mut redacted = String::with_capacity(query.len());
+
+    for (idx, segment) in query.split('&').enumerate() {
+        if idx > 0 {
+            redacted.push('&');
+        }
+        if segment.is_empty() {
+            continue;
+        }
+
+        let (raw_key, has_equals) = segment
+            .split_once('=')
+            .map_or((segment, false), |(raw_key, _)| (raw_key, true));
+        let canonical_key = decode_query_component(raw_key).to_ascii_lowercase();
+        let should_redact = redact
+            .query_params
+            .iter()
+            .any(|configured| configured == &canonical_key);
+
+        if should_redact && has_equals {
+            redacted.push_str(raw_key);
+            redacted.push('=');
+            redacted.push_str(placeholder.as_str());
+            changed = true;
+        } else {
+            redacted.push_str(segment);
+        }
+    }
+
+    changed.then_some(redacted)
+}
+
+fn decode_query_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'%' if idx + 2 < bytes.len() => {
+                let high = hex_nibble(bytes[idx + 1]);
+                let low = hex_nibble(bytes[idx + 2]);
+                if let (Some(high), Some(low)) = (high, low) {
+                    decoded.push((high << 4) | low);
+                    idx += 3;
+                } else {
+                    decoded.push(bytes[idx]);
+                    idx += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                idx += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+            continue;
+        }
+
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        encoded.push('%');
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+        encoded.push(char::from(HEX[(byte & 0x0F) as usize]));
+    }
+    encoded
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn header_map_to_vec(headers: &hyper::HeaderMap) -> Vec<(String, Vec<u8>)> {
     headers
         .iter()
@@ -6581,9 +6739,9 @@ mod tests {
         emit_proxy_request_log, format_request_url_for_logging, format_route_ref,
         forward_proxy_upstream_uri, lookup_recording_for_request_with_subset_limit, mode_log_label,
         normalize_tunneled_https_request_uri, redact_recording_body_json, redact_recording_headers,
-        request_runtime_config_for_path, reserve_delay_for_bucket_with_limits,
-        resolve_request_url_log_mode, response_chunks_for_storage, sanitize_match_key,
-        select_route, summarize_route_diff,
+        redact_recording_request_uri, request_runtime_config_for_path,
+        reserve_delay_for_bucket_with_limits, resolve_request_url_log_mode,
+        response_chunks_for_storage, sanitize_match_key, select_route, summarize_route_diff,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RequestUrlLogMode, RouteConfig,
@@ -6952,6 +7110,7 @@ mod tests {
         changed_redaction_route.redact = Some(RedactConfig {
             headers: vec!["authorization".to_owned()],
             body_json: vec!["$.token".to_owned()],
+            query_params: Vec::new(),
             placeholder: None,
         });
         let next = super::ProxyRuntimeConfig {
@@ -7474,6 +7633,7 @@ ca_key = "{}"
         let redact = RedactConfig {
             headers: vec!["authorization".to_owned(), "X-API-KEY".to_owned()],
             body_json: Vec::new(),
+            query_params: Vec::new(),
             placeholder: None,
         };
 
@@ -7502,6 +7662,7 @@ ca_key = "{}"
         let redact = RedactConfig {
             headers: vec!["authorization".to_owned()],
             body_json: vec!["$.secret".to_owned()],
+            query_params: Vec::new(),
             placeholder: Some("<MASKED>".to_owned()),
         };
 
@@ -7523,6 +7684,25 @@ ca_key = "{}"
     }
 
     #[test]
+    fn redact_recording_request_uri_masks_configured_query_params() {
+        let redact = RedactConfig {
+            headers: Vec::new(),
+            body_json: Vec::new(),
+            query_params: vec!["token".to_owned(), "api_key".to_owned()],
+            placeholder: None,
+        };
+
+        let request_uri =
+            "/api/hello?token=secret-1&keep=ok&TOKEN=secret-2&api%5Fkey=abc&empty=&flag";
+        let redacted = redact_recording_request_uri(request_uri, Some(&redact));
+
+        assert_eq!(
+            redacted,
+            "/api/hello?token=%5BREDACTED%5D&keep=ok&TOKEN=%5BREDACTED%5D&api%5Fkey=%5BREDACTED%5D&empty=&flag"
+        );
+    }
+
+    #[test]
     fn redact_recording_body_json_masks_nested_object_and_array_fields() {
         let redact = RedactConfig {
             headers: Vec::new(),
@@ -7530,6 +7710,7 @@ ca_key = "{}"
                 "$.auth.token".to_owned(),
                 "$.messages[*].content".to_owned(),
             ],
+            query_params: Vec::new(),
             placeholder: None,
         };
         let body = br#"{"auth":{"token":"super-secret","keep":"ok"},"messages":[{"content":"first"},{"content":"second"}]}"#;
@@ -7564,6 +7745,7 @@ ca_key = "{}"
         let redact = RedactConfig {
             headers: Vec::new(),
             body_json: vec!["$.secret".to_owned()],
+            query_params: Vec::new(),
             placeholder: None,
         };
         let body = b"plain-text-body";
@@ -7578,6 +7760,7 @@ ca_key = "{}"
         let redact = RedactConfig {
             headers: Vec::new(),
             body_json: vec!["$.secret".to_owned()],
+            query_params: Vec::new(),
             placeholder: None,
         };
         let secret = "sk-live-super-secret";
@@ -7604,6 +7787,7 @@ ca_key = "{}"
         let redact = RedactConfig {
             headers: Vec::new(),
             body_json: vec![expression.clone()],
+            query_params: Vec::new(),
             placeholder: None,
         };
         let body = format!(r#"{{"secret":"{secret}"}}"#);
@@ -7736,16 +7920,34 @@ request_url = "redacted"
             .parse()
             .expect("URI should parse");
         assert_eq!(
-            format_request_url_for_logging(&uri, RequestUrlLogMode::Full),
+            format_request_url_for_logging(&uri, RequestUrlLogMode::Full, None),
             "http://proxy.local/api/hello?token=super-secret"
         );
         assert_eq!(
-            format_request_url_for_logging(&uri, RequestUrlLogMode::Path),
+            format_request_url_for_logging(&uri, RequestUrlLogMode::Path, None),
             "/api/hello"
         );
         assert_eq!(
-            format_request_url_for_logging(&uri, RequestUrlLogMode::Redacted),
+            format_request_url_for_logging(&uri, RequestUrlLogMode::Redacted, None),
             REDACTION_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn format_request_url_for_logging_full_mode_redacts_configured_query_params() {
+        let uri: hyper::Uri = "http://proxy.local/api/hello?token=super-secret&x=1&api%5Fkey=abc"
+            .parse()
+            .expect("URI should parse");
+        let redact = RedactConfig {
+            headers: Vec::new(),
+            body_json: Vec::new(),
+            query_params: vec!["token".to_owned(), "api_key".to_owned()],
+            placeholder: Some("<MASKED>".to_owned()),
+        };
+
+        assert_eq!(
+            format_request_url_for_logging(&uri, RequestUrlLogMode::Full, Some(&redact)),
+            "http://proxy.local/api/hello?token=%3CMASKED%3E&x=1&api%5Fkey=%3CMASKED%3E"
         );
     }
 

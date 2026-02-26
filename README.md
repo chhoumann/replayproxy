@@ -128,6 +128,18 @@ Lua hooks require a build with scripting enabled:
 cargo run --features scripting -- serve --config ./examples/replayproxy.llm-redacted.toml
 ```
 
+When `body_oversize = "bypass-cache"` is configured, transform hooks still default to strict
+buffering behavior for safety. To allow oversized requests/responses to bypass cache instead of
+returning `413`/`502`, set:
+
+```toml
+[routes.transform]
+oversize_behavior = "skip"
+```
+
+With `oversize_behavior = "skip"`, oversized bypassed traffic skips `on_request`/`on_response`
+hooks and is streamed upstream/downstream without recording.
+
 Proto-aware gRPC matching via `[routes.grpc]` requires the `grpc` feature:
 
 ```bash
@@ -560,7 +572,6 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 - gRPC proto-aware matching (`routes.grpc.match_fields`) requires a build with `--features grpc`; without it, matching falls back to opaque request-body behavior.
 - No built-in TTL/retention/eviction policy for stored recordings.
 - Query `subset` matching can fall back to scan-heavy behavior on very large candidate sets.
-- `body_oversize = "bypass-cache"` does not bypass when `on_request` or `on_response` transforms are configured.
 
 ## Additional docs
 

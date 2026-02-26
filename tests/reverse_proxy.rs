@@ -3657,6 +3657,174 @@ on_request = "{}"
     let _ = join.await;
 }
 
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn oversized_request_body_with_on_request_transform_can_bypass_cache_when_oversize_behavior_skip()
+ {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let script_path = temp_dir.path().join("on_request.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(request)
+  request.headers["x-from-script"] = "1"
+  return request
+end
+"#,
+    )
+    .unwrap();
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+
+[routes.transform]
+on_request = "{}"
+oversize_behavior = "skip"
+"#,
+        storage_dir.path().display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::from_static(b"request-body-is-too-large")))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(&captured.body[..], b"request-body-is-too-large");
+    assert!(
+        !captured.headers.contains_key("x-from-script"),
+        "on_request transform should be skipped for oversized bypass-cache requests"
+    );
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn oversized_chunked_request_body_with_on_request_transform_can_bypass_cache_when_oversize_behavior_skip()
+ {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let script_path = temp_dir.path().join("on_request.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(request)
+  request.headers["x-from-script"] = "1"
+  return request
+end
+"#,
+    )
+    .unwrap();
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 8
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+
+[routes.transform]
+on_request = "{}"
+oversize_behavior = "skip"
+"#,
+        storage_dir.path().display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, ChunkedBody> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .body(ChunkedBody::from_slices(&[b"12345", b"67890"]))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(&captured.body[..], b"1234567890");
+    assert!(
+        !captured.headers.contains_key("x-from-script"),
+        "on_request transform should be skipped for oversized bypass-cache requests"
+    );
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
 #[tokio::test]
 async fn oversized_chunked_request_body_replay_mode_can_bypass_cache() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
@@ -4045,6 +4213,241 @@ body_oversize = "bypass-cache"
         .unwrap();
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"abcdef");
+
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn oversized_response_body_with_on_response_transform_returns_502_without_oversize_skip() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let script_path = temp_dir.path().join("on_response.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(response)
+  response.headers["x-from-script"] = "1"
+  return response
+end
+"#,
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 4
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+
+[routes.transform]
+on_response = "{}"
+"#,
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body_bytes[..],
+        b"upstream response body exceeds configured proxy.max_body_bytes"
+    );
+
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn oversized_response_body_with_on_response_transform_can_bypass_cache_when_oversize_behavior_skip()
+ {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let script_path = temp_dir.path().join("on_response.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(response)
+  response.status = 202
+  response.headers["x-from-script"] = "1"
+  response.body = "transformed"
+  return response
+end
+"#,
+    )
+    .unwrap();
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 4
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+
+[routes.transform]
+on_response = "{}"
+oversize_behavior = "skip"
+"#,
+        storage_dir.path().display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(
+        !res.headers().contains_key("x-from-script"),
+        "on_response transform should be skipped for oversized bypass-cache responses"
+    );
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let _captured = upstream_rx.recv().await.unwrap();
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn oversized_chunked_response_body_with_on_response_transform_can_bypass_cache_when_oversize_behavior_skip()
+ {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_with_response_chunks(vec![
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"def"),
+        ])
+        .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let script_path = temp_dir.path().join("on_response.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(response)
+  response.status = 202
+  response.headers["x-from-script"] = "1"
+  response.body = "transformed"
+  return response
+end
+"#,
+    )
+    .unwrap();
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+max_body_bytes = 4
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+body_oversize = "bypass-cache"
+
+[routes.transform]
+on_response = "{}"
+oversize_behavior = "skip"
+"#,
+        storage_dir.path().display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/hello", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(
+        !res.headers().contains_key("x-from-script"),
+        "on_response transform should be skipped for oversized bypass-cache responses"
+    );
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body_bytes[..], b"abcdef");
 

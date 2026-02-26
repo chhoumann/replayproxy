@@ -532,6 +532,14 @@ pub enum BodyOversizePolicy {
     BypassCache,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransformOversizeBehavior {
+    #[default]
+    Reject,
+    Skip,
+}
+
 impl RouteConfig {
     fn normalize_and_validate(&mut self, idx: usize) -> anyhow::Result<()> {
         let route_name = self.display_name(idx);
@@ -985,6 +993,8 @@ pub struct TransformConfig {
     pub on_record: Option<String>,
     #[serde(default)]
     pub on_replay: Option<String>,
+    #[serde(default)]
+    pub oversize_behavior: TransformOversizeBehavior,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1019,7 +1029,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Config, LogFormat, RequestUrlLogMode, RouteMode, WebSocketRecordingMode};
+    use super::{
+        Config, LogFormat, RequestUrlLogMode, RouteMode, TransformOversizeBehavior,
+        WebSocketRecordingMode,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -1094,6 +1107,7 @@ body_json = ["$.model", "$.messages", "$.max_tokens"]
 
 [routes.transform]
 on_request = "scripts/anthropic_auth.lua"
+oversize_behavior = "skip"
 
 [[routes]]
 name = "grpc-inference"
@@ -1207,6 +1221,10 @@ recording_mode = "server-only"
         assert_eq!(
             anthropic.transform.as_ref().unwrap().on_request.as_deref(),
             Some("scripts/anthropic_auth.lua")
+        );
+        assert_eq!(
+            anthropic.transform.as_ref().unwrap().oversize_behavior,
+            TransformOversizeBehavior::Skip
         );
 
         let grpc = &config.routes[2];

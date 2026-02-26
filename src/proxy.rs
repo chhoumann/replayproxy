@@ -63,7 +63,8 @@ use crate::{
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, GrpcConfig, QueryMatchMode, RateLimitConfig,
         RedactConfig, RequestUrlLogMode, RouteMatchConfig, RouteMode, StreamingConfig,
-        TransformConfig, WebSocketConfig, WebSocketRecordingMode, grpc_match_field_to_json_path,
+        TransformConfig, TransformOversizeBehavior, WebSocketConfig, WebSocketRecordingMode,
+        grpc_match_field_to_json_path,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
@@ -499,6 +500,7 @@ struct RouteTransformScripts {
     on_response: Option<LoadedScript>,
     on_record: Option<LoadedScript>,
     on_replay: Option<LoadedScript>,
+    oversize_behavior: TransformOversizeBehavior,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -814,6 +816,7 @@ fn load_route_transform_scripts(
             transform.on_replay.as_deref(),
             config_source_path,
         )?,
+        oversize_behavior: transform.oversize_behavior,
     })
 }
 
@@ -3126,17 +3129,17 @@ async fn proxy_handler(
     let request_known_oversize = request_content_length
         .map(|len| len > bytes_limit_u64(max_body_bytes))
         .unwrap_or(false);
-    // on_request transforms require a fully buffered body, so oversized requests cannot
-    // use bypass-cache streaming when this hook is configured.
-    let allow_oversize_bypass_cache =
-        route.body_oversize == BodyOversizePolicy::BypassCache && !has_on_request_transform;
+    let skip_oversize_request_transform = has_on_request_transform
+        && route.transform.oversize_behavior == TransformOversizeBehavior::Skip;
+    let allow_oversize_bypass_cache = route.body_oversize == BodyOversizePolicy::BypassCache
+        && (!has_on_request_transform || skip_oversize_request_transform);
     let bypass_request_buffering = request_known_oversize && allow_oversize_bypass_cache;
     if request_known_oversize && !bypass_request_buffering {
         if has_on_request_transform && route.body_oversize == BodyOversizePolicy::BypassCache {
             tracing::debug!(
                 route = %route.route_ref,
                 limit_bytes = max_body_bytes,
-                "rejecting oversized request body because on_request transform requires buffering"
+                "rejecting oversized request body because on_request transform requires buffering; set routes.transform.oversize_behavior=\"skip\" to bypass cache and skip transform"
             );
         }
         respond!(
@@ -3311,7 +3314,7 @@ async fn proxy_handler(
                 tracing::debug!(
                     route = %route.route_ref,
                     limit_bytes,
-                    "rejecting oversized request body because on_request transform requires buffering"
+                    "rejecting oversized request body because on_request transform requires buffering; set routes.transform.oversize_behavior=\"skip\" to bypass cache and skip transform"
                 );
             }
             tracing::debug!("request body exceeded configured limit of {limit_bytes} bytes");
@@ -3598,8 +3601,11 @@ async fn proxy_handler(
     strip_hop_by_hop_headers(&mut parts.headers);
     let has_on_response_transform = route.transform.on_response.is_some();
     let should_buffer_response = should_record || has_on_response_transform;
-    let allow_response_oversize_bypass_cache =
-        route.body_oversize == BodyOversizePolicy::BypassCache && !has_on_response_transform;
+    let skip_oversize_response_transform = has_on_response_transform
+        && route.transform.oversize_behavior == TransformOversizeBehavior::Skip;
+    let allow_response_oversize_bypass_cache = route.body_oversize
+        == BodyOversizePolicy::BypassCache
+        && (!has_on_response_transform || skip_oversize_response_transform);
 
     #[cfg(not(feature = "scripting"))]
     if route.transform.on_response.is_some() {
@@ -3641,7 +3647,7 @@ async fn proxy_handler(
             tracing::debug!(
                 route = %route.route_ref,
                 limit_bytes = max_body_bytes,
-                "rejecting oversized upstream response body because on_response transform requires buffering"
+                "rejecting oversized upstream response body because on_response transform requires buffering; set routes.transform.oversize_behavior=\"skip\" to bypass cache and skip transform"
             );
         }
         respond!(
@@ -3679,7 +3685,7 @@ async fn proxy_handler(
                 tracing::debug!(
                     route = %route.route_ref,
                     limit_bytes,
-                    "rejecting oversized upstream response body because on_response transform requires buffering"
+                    "rejecting oversized upstream response body because on_response transform requires buffering; set routes.transform.oversize_behavior=\"skip\" to bypass cache and skip transform"
                 );
             }
             tracing::debug!(

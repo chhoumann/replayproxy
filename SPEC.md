@@ -210,10 +210,13 @@ Acceptance expectations:
   transform.on_request = "scripts/add_auth.lua"
   transform.on_response = "scripts/strip_debug.lua"
   ```
-- Oversized request handling contract: when `routes.transform.on_request` is configured, request
-  bodies must be fully buffered before forwarding/matching. If body size exceeds
-  `proxy.max_body_bytes`, replayproxy returns `413` and does **not** apply `body_oversize = "bypass-cache"`
-  passthrough behavior for that request.
+- Oversized body handling contract:
+  - With `on_request`/`on_response` hooks configured, default `routes.transform.oversize_behavior = "reject"`
+    preserves strict buffering semantics and returns `413` (request) or `502` (response) when
+    `proxy.max_body_bytes` is exceeded.
+  - Set `routes.transform.oversize_behavior = "skip"` with `body_oversize = "bypass-cache"` to
+    stream oversized traffic without recording and skip `on_request`/`on_response` for that
+    oversized exchange.
 
 ---
 

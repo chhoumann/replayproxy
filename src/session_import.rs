@@ -232,6 +232,7 @@ fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError
         }
         validate_recording_file_extension(&entry.file, manifest.format)?;
         let recording_path = resolve_recording_path(in_dir, &entry.file)?;
+        ensure_recording_path_is_within_input_dir(in_dir, &recording_path, &entry.file)?;
         let mut document = read_recording_document(&recording_path, entry, manifest.format)?;
         validate_unique_stream_indices(
             &recording_path,
@@ -446,6 +447,40 @@ fn resolve_recording_path(
     Ok(in_dir.join(relative))
 }
 
+fn ensure_recording_path_is_within_input_dir(
+    in_dir: &Path,
+    recording_path: &Path,
+    relative_path: &str,
+) -> Result<(), SessionImportError> {
+    let canonical_in_dir = fs::canonicalize(in_dir).map_err(|err| {
+        SessionImportError::Io(format!(
+            "canonicalize import input directory `{}`: {err}",
+            in_dir.display()
+        ))
+    })?;
+
+    let canonical_recording_path = fs::canonicalize(recording_path).map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            SessionImportError::InvalidRequest(format!(
+                "recording file `{relative_path}` does not exist"
+            ))
+        } else {
+            SessionImportError::Io(format!(
+                "canonicalize recording file `{}`: {err}",
+                recording_path.display()
+            ))
+        }
+    })?;
+
+    if canonical_recording_path.starts_with(&canonical_in_dir) {
+        return Ok(());
+    }
+
+    Err(SessionImportError::InvalidRequest(format!(
+        "recording file `{relative_path}` resolves outside import input directory"
+    )))
+}
+
 fn resolve_manifest_path(in_dir: &Path) -> Result<PathBuf, SessionImportError> {
     let json_path = in_dir.join(SessionExportFormat::Json.manifest_file_name());
     let yaml_path = in_dir.join(SessionExportFormat::Yaml.manifest_file_name());
@@ -545,6 +580,11 @@ mod tests {
         EXPORT_MANIFEST_VERSION_V2, SessionImportError, SessionImportRequest, import_session,
         resolve_manifest_path, resolve_recording_path,
     };
+
+    #[cfg(unix)]
+    fn symlink_dir(target: &Path, link_path: &Path) {
+        std::os::unix::fs::symlink(target, link_path).expect("symlink should be created");
+    }
 
     #[derive(Debug, Serialize)]
     struct TestImportManifest {
@@ -659,6 +699,83 @@ mod tests {
         let err = resolve_recording_path(Path::new("/tmp/export"), "recordings/../../evil.json")
             .unwrap_err();
         assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_session_rejects_recording_symlink_escape_without_side_effects() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let manager = SessionManager::new(temp_dir.path().join("sessions"));
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should exist");
+
+        let import_dir = temp_dir.path().join("bundle-symlink-escape");
+        let escaped_recordings_dir = temp_dir.path().join("escaped-recordings");
+        fs::create_dir_all(&import_dir).expect("import dir should be created");
+        fs::create_dir_all(&escaped_recordings_dir).expect("escaped dir should be created");
+        symlink_dir(
+            &escaped_recordings_dir,
+            &import_dir.join("recordings"),
+        );
+
+        let recording = recording_fixture("symlink-escape", "/v1/chat/completions", 42);
+        let request_method = recording.request_method.clone();
+        let request_uri = recording.request_uri.clone();
+        let response_status = recording.response_status;
+        let created_at_unix_ms = recording.created_at_unix_ms;
+        let recording_document = TestImportRecording {
+            id: 1,
+            recording,
+            response_chunks: Vec::new(),
+            websocket_frames: Vec::new(),
+        };
+        fs::write(
+            escaped_recordings_dir.join("1.json"),
+            serde_json::to_vec_pretty(&recording_document)
+                .expect("recording document should serialize"),
+        )
+        .expect("recording document should write");
+
+        let manifest = TestImportManifest {
+            version: EXPORT_MANIFEST_VERSION_V2,
+            session: "source".to_owned(),
+            format: SessionExportFormat::Json,
+            exported_at_unix_ms: 0,
+            recordings: vec![TestImportManifestEntry {
+                id: 1,
+                file: "recordings/1.json".to_owned(),
+                request_method,
+                request_uri,
+                response_status,
+                created_at_unix_ms,
+            }],
+        };
+        fs::write(
+            import_dir.join(SessionExportFormat::Json.manifest_file_name()),
+            serde_json::to_vec_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("manifest should write");
+
+        assert_eq!(recording_count(&manager, "staging").await, 0);
+        let err = import_session(
+            &manager,
+            SessionImportRequest {
+                session_name: "staging".to_owned(),
+                in_dir: import_dir,
+            },
+        )
+        .await
+        .expect_err("symlink escape should fail");
+
+        match err {
+            SessionImportError::InvalidRequest(message) => {
+                assert!(message.contains("resolves outside import input directory"));
+            }
+            other => panic!("expected invalid request, got {other:?}"),
+        }
+        assert_eq!(recording_count(&manager, "staging").await, 0);
     }
 
     #[test]

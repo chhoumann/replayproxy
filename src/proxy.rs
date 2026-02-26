@@ -3128,9 +3128,8 @@ async fn proxy_handler(
         .unwrap_or(false);
     // on_request transforms require a fully buffered body, so oversized requests cannot
     // use bypass-cache streaming when this hook is configured.
-    let allow_oversize_bypass_cache = route.body_oversize == BodyOversizePolicy::BypassCache
-        && route.mode != RouteMode::Replay
-        && !has_on_request_transform;
+    let allow_oversize_bypass_cache =
+        route.body_oversize == BodyOversizePolicy::BypassCache && !has_on_request_transform;
     let bypass_request_buffering = request_known_oversize && allow_oversize_bypass_cache;
     if request_known_oversize && !bypass_request_buffering {
         if has_on_request_transform && route.body_oversize == BodyOversizePolicy::BypassCache {
@@ -3178,6 +3177,11 @@ async fn proxy_handler(
                 );
             }
         };
+        if let Some(required_delay) =
+            maybe_reject_for_replay_rate_limit(state.as_ref(), &route, &upstream_uri).await
+        {
+            respond!(None, replay_rate_limit_rejection_response(required_delay));
+        }
         if let Err(err) =
             maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await
         {
@@ -3254,6 +3258,11 @@ async fn proxy_handler(
                         );
                     }
                 };
+                if let Some(required_delay) =
+                    maybe_reject_for_replay_rate_limit(state.as_ref(), &route, &upstream_uri).await
+                {
+                    respond!(None, replay_rate_limit_rejection_response(required_delay));
+                }
                 if let Err(err) =
                     maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await
                 {

@@ -3658,7 +3658,7 @@ on_request = "{}"
 }
 
 #[tokio::test]
-async fn oversized_chunked_request_body_replay_mode_still_returns_413() {
+async fn oversized_chunked_request_body_replay_mode_can_bypass_cache() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
     let config_toml = format!(
@@ -3692,18 +3692,12 @@ body_oversize = "bypass-cache"
         .body(ChunkedBody::from_slices(&[b"12345", b"67890"]))
         .unwrap();
     let res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(res.status(), StatusCode::CREATED);
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(
-        &body_bytes[..],
-        b"request body exceeds configured proxy.max_body_bytes"
-    );
-    assert!(
-        timeout(Duration::from_millis(150), upstream_rx.recv())
-            .await
-            .is_err(),
-        "upstream should not receive oversized replay-mode requests"
-    );
+    assert_eq!(&body_bytes[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(&captured.body[..], b"1234567890");
 
     proxy.shutdown().await;
     let join = upstream_shutdown();

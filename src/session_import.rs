@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     legacy_redaction, session,
     session_export::{EXPORT_MANIFEST_VERSION_V1, EXPORT_MANIFEST_VERSION_V2, SessionExportFormat},
-    storage::{Recording, ResponseChunk, SessionManager, SessionManagerError, WebSocketFrame},
+    storage::{
+        Recording, ResponseChunk, SessionManager, SessionManagerError, Storage, WebSocketFrame,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -127,36 +129,43 @@ pub async fn import_session(
 
     let recordings_imported = parsed_import.recordings.len();
     for parsed_recording in parsed_import.recordings {
+        let source = parsed_recording.source;
         let recording_id = storage
             .insert_recording(parsed_recording.recording)
             .await
             .map_err(|err| {
                 SessionImportError::Internal(format!(
                     "insert recording from `{}` into session `{}`: {err}",
-                    parsed_recording.source, session_name
+                    source, session_name
                 ))
             })?;
-        if !parsed_recording.response_chunks.is_empty() {
-            storage
-                .insert_response_chunks(recording_id, parsed_recording.response_chunks)
-                .await
-                .map_err(|err| {
-                    SessionImportError::Internal(format!(
-                        "insert response chunks from `{}` into session `{}`: {err}",
-                        parsed_recording.source, session_name
-                    ))
-                })?;
+        if let Err(err) = storage
+            .insert_response_chunks(recording_id, parsed_recording.response_chunks)
+            .await
+        {
+            return Err(rollback_import_error(
+                &storage,
+                recording_id,
+                "response chunks",
+                &source,
+                &session_name,
+                err,
+            )
+            .await);
         }
-        if !parsed_recording.websocket_frames.is_empty() {
-            storage
-                .insert_websocket_frames(recording_id, parsed_recording.websocket_frames)
-                .await
-                .map_err(|err| {
-                    SessionImportError::Internal(format!(
-                        "insert websocket frames from `{}` into session `{}`: {err}",
-                        parsed_recording.source, session_name
-                    ))
-                })?;
+        if let Err(err) = storage
+            .insert_websocket_frames(recording_id, parsed_recording.websocket_frames)
+            .await
+        {
+            return Err(rollback_import_error(
+                &storage,
+                recording_id,
+                "websocket frames",
+                &source,
+                &session_name,
+                err,
+            )
+            .await);
         }
     }
 
@@ -168,6 +177,28 @@ pub async fn import_session(
         manifest_path: parsed_import.manifest_path,
         recordings_imported,
     })
+}
+
+async fn rollback_import_error(
+    storage: &Storage,
+    recording_id: i64,
+    stage: &str,
+    source: &str,
+    session_name: &str,
+    stage_err: anyhow::Error,
+) -> SessionImportError {
+    let base = format!("insert {stage} from `{source}` into session `{session_name}`: {stage_err}");
+    match storage.delete_recording(recording_id).await {
+        Ok(true) => SessionImportError::Internal(format!(
+            "{base}; rolled back recording id `{recording_id}`"
+        )),
+        Ok(false) => SessionImportError::Internal(format!(
+            "{base}; rollback could not find recording id `{recording_id}`"
+        )),
+        Err(rollback_err) => SessionImportError::Internal(format!(
+            "{base}; rollback failed for recording id `{recording_id}`: {rollback_err}"
+        )),
+    }
 }
 
 fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError> {
@@ -188,6 +219,11 @@ fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError
         validate_recording_file_extension(&entry.file, manifest.format)?;
         let recording_path = resolve_recording_path(in_dir, &entry.file)?;
         let mut document = read_recording_document(&recording_path, entry, manifest.format)?;
+        validate_unique_stream_indices(
+            &recording_path,
+            &document.response_chunks,
+            &document.websocket_frames,
+        )?;
         legacy_redaction::scrub_recording_for_legacy_redaction(&mut document.recording);
         let response_chunks = document.response_chunks;
         let websocket_frames = document.websocket_frames;
@@ -204,6 +240,36 @@ fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError
         format: manifest.format,
         recordings,
     })
+}
+
+fn validate_unique_stream_indices(
+    recording_path: &Path,
+    response_chunks: &[ResponseChunk],
+    websocket_frames: &[WebSocketFrame],
+) -> Result<(), SessionImportError> {
+    let mut seen_chunk_indices = HashSet::new();
+    for chunk in response_chunks {
+        if !seen_chunk_indices.insert(chunk.chunk_index) {
+            return Err(SessionImportError::InvalidRequest(format!(
+                "recording `{}` has duplicate response_chunks chunk_index `{}`",
+                recording_path.display(),
+                chunk.chunk_index
+            )));
+        }
+    }
+
+    let mut seen_frame_indices = HashSet::new();
+    for frame in websocket_frames {
+        if !seen_frame_indices.insert(frame.frame_index) {
+            return Err(SessionImportError::InvalidRequest(format!(
+                "recording `{}` has duplicate websocket_frames frame_index `{}`",
+                recording_path.display(),
+                frame.frame_index
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_input_dir(in_dir: &Path) -> Result<(), SessionImportError> {
@@ -447,10 +513,125 @@ fn read_bundle_file(path: &Path, label: &str) -> Result<Vec<u8>, SessionImportEr
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
-    use super::{resolve_manifest_path, resolve_recording_path};
+    use serde::Serialize;
     use tempfile::tempdir;
+
+    use crate::{
+        session_export::SessionExportFormat,
+        storage::{
+            Recording, ResponseChunk, SessionManager, WebSocketFrame, WebSocketFrameDirection,
+            WebSocketMessageType,
+        },
+    };
+
+    use super::{
+        EXPORT_MANIFEST_VERSION_V2, SessionImportError, SessionImportRequest, import_session,
+        resolve_manifest_path, resolve_recording_path,
+    };
+
+    #[derive(Debug, Serialize)]
+    struct TestImportManifest {
+        version: u32,
+        session: String,
+        format: SessionExportFormat,
+        exported_at_unix_ms: i64,
+        recordings: Vec<TestImportManifestEntry>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TestImportManifestEntry {
+        id: i64,
+        file: String,
+        request_method: String,
+        request_uri: String,
+        response_status: u16,
+        created_at_unix_ms: i64,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TestImportRecording {
+        id: i64,
+        #[serde(flatten)]
+        recording: Recording,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        response_chunks: Vec<ResponseChunk>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        websocket_frames: Vec<WebSocketFrame>,
+    }
+
+    fn recording_fixture(match_key: &str, uri: &str, created_at_unix_ms: i64) -> Recording {
+        Recording {
+            match_key: match_key.to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: uri.to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"ok".to_vec(),
+            created_at_unix_ms,
+        }
+    }
+
+    fn write_json_import_bundle(
+        import_dir: &Path,
+        recording_id: i64,
+        recording: Recording,
+        response_chunks: Vec<ResponseChunk>,
+        websocket_frames: Vec<WebSocketFrame>,
+    ) {
+        let request_method = recording.request_method.clone();
+        let request_uri = recording.request_uri.clone();
+        let response_status = recording.response_status;
+        let created_at_unix_ms = recording.created_at_unix_ms;
+        let relative_recording_path = format!("recordings/{recording_id}.json");
+
+        fs::create_dir_all(import_dir.join("recordings")).expect("recordings dir should exist");
+
+        let document = TestImportRecording {
+            id: recording_id,
+            recording,
+            response_chunks,
+            websocket_frames,
+        };
+        fs::write(
+            import_dir.join(&relative_recording_path),
+            serde_json::to_vec_pretty(&document).expect("recording doc should serialize"),
+        )
+        .expect("recording doc should write");
+
+        let manifest = TestImportManifest {
+            version: EXPORT_MANIFEST_VERSION_V2,
+            session: "source".to_owned(),
+            format: SessionExportFormat::Json,
+            exported_at_unix_ms: 0,
+            recordings: vec![TestImportManifestEntry {
+                id: recording_id,
+                file: relative_recording_path,
+                request_method,
+                request_uri,
+                response_status,
+                created_at_unix_ms,
+            }],
+        };
+        fs::write(
+            import_dir.join(SessionExportFormat::Json.manifest_file_name()),
+            serde_json::to_vec_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("manifest should write");
+    }
+
+    async fn recording_count(manager: &SessionManager, session_name: &str) -> u64 {
+        manager
+            .open_session_storage(session_name)
+            .await
+            .expect("session storage should open")
+            .count_recordings()
+            .await
+            .expect("recording count should load")
+    }
 
     #[test]
     fn resolve_recording_path_rejects_non_recordings_prefix() {
@@ -485,5 +666,154 @@ mod tests {
 
         let err = resolve_manifest_path(dir.path()).expect_err("ambiguous manifests should fail");
         assert!(err.to_string().contains("contains both"));
+    }
+
+    #[tokio::test]
+    async fn import_session_rejects_duplicate_response_chunk_indices_without_side_effects() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let manager = SessionManager::new(temp_dir.path().join("sessions"));
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should exist");
+
+        let import_dir = temp_dir.path().join("bundle-duplicate-chunks");
+        let chunks = vec![
+            ResponseChunk {
+                chunk_index: 0,
+                offset_ms: 0,
+                chunk_body: b"first".to_vec(),
+            },
+            ResponseChunk {
+                chunk_index: 0,
+                offset_ms: 5,
+                chunk_body: b"duplicate".to_vec(),
+            },
+        ];
+        write_json_import_bundle(
+            &import_dir,
+            1,
+            recording_fixture("chunk-dup", "/v1/stream", 10),
+            chunks,
+            Vec::new(),
+        );
+
+        assert_eq!(recording_count(&manager, "staging").await, 0);
+        let err = import_session(
+            &manager,
+            SessionImportRequest {
+                session_name: "staging".to_owned(),
+                in_dir: import_dir,
+            },
+        )
+        .await
+        .expect_err("duplicate chunk indices should fail");
+
+        match err {
+            SessionImportError::InvalidRequest(message) => {
+                assert!(message.contains("duplicate response_chunks chunk_index `0`"));
+            }
+            other => panic!("expected invalid request, got {other:?}"),
+        }
+        assert_eq!(recording_count(&manager, "staging").await, 0);
+    }
+
+    #[tokio::test]
+    async fn import_session_rejects_duplicate_websocket_frame_indices_without_side_effects() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let manager = SessionManager::new(temp_dir.path().join("sessions"));
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should exist");
+
+        let import_dir = temp_dir.path().join("bundle-duplicate-frames");
+        let frames = vec![
+            WebSocketFrame {
+                frame_index: 0,
+                offset_ms: 0,
+                direction: WebSocketFrameDirection::ServerToClient,
+                message_type: WebSocketMessageType::Text,
+                payload: b"hello".to_vec(),
+            },
+            WebSocketFrame {
+                frame_index: 0,
+                offset_ms: 2,
+                direction: WebSocketFrameDirection::ClientToServer,
+                message_type: WebSocketMessageType::Text,
+                payload: b"dup".to_vec(),
+            },
+        ];
+        write_json_import_bundle(
+            &import_dir,
+            2,
+            recording_fixture("frame-dup", "/ws", 11),
+            Vec::new(),
+            frames,
+        );
+
+        assert_eq!(recording_count(&manager, "staging").await, 0);
+        let err = import_session(
+            &manager,
+            SessionImportRequest {
+                session_name: "staging".to_owned(),
+                in_dir: import_dir,
+            },
+        )
+        .await
+        .expect_err("duplicate websocket frame indices should fail");
+
+        match err {
+            SessionImportError::InvalidRequest(message) => {
+                assert!(message.contains("duplicate websocket_frames frame_index `0`"));
+            }
+            other => panic!("expected invalid request, got {other:?}"),
+        }
+        assert_eq!(recording_count(&manager, "staging").await, 0);
+    }
+
+    #[tokio::test]
+    async fn import_session_rolls_back_recording_when_websocket_frame_insert_fails() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let manager = SessionManager::new(temp_dir.path().join("sessions"));
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should exist");
+
+        let import_dir = temp_dir.path().join("bundle-rollback");
+        let frames = vec![WebSocketFrame {
+            frame_index: 0,
+            offset_ms: u64::MAX,
+            direction: WebSocketFrameDirection::ServerToClient,
+            message_type: WebSocketMessageType::Binary,
+            payload: b"overflow".to_vec(),
+        }];
+        write_json_import_bundle(
+            &import_dir,
+            3,
+            recording_fixture("rollback", "/ws", 12),
+            Vec::new(),
+            frames,
+        );
+
+        let err = import_session(
+            &manager,
+            SessionImportRequest {
+                session_name: "staging".to_owned(),
+                in_dir: import_dir,
+            },
+        )
+        .await
+        .expect_err("oversized websocket offset should fail");
+
+        match err {
+            SessionImportError::Internal(message) => {
+                assert!(message.contains("insert websocket frames"));
+                assert!(message.contains("rolled back recording id"));
+            }
+            other => panic!("expected internal import error, got {other:?}"),
+        }
+        assert_eq!(recording_count(&manager, "staging").await, 0);
     }
 }

@@ -592,6 +592,9 @@ impl RouteConfig {
         if let Some(redact) = self.redact.as_mut() {
             redact.normalize_and_validate(Some(route_name.as_str()), "routes.redact")?;
         }
+        if let Some(rate_limit) = self.rate_limit.as_ref() {
+            rate_limit.validate(&route_name)?;
+        }
 
         Ok(())
     }
@@ -859,6 +862,35 @@ pub struct RateLimitConfig {
     pub requests_per_second: u64,
     #[serde(default)]
     pub burst: Option<u64>,
+    #[serde(default)]
+    pub queue_depth: Option<usize>,
+    #[serde(default, alias = "timeout")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl RateLimitConfig {
+    fn validate(&self, route_name: &str) -> anyhow::Result<()> {
+        if self.requests_per_second == 0 {
+            bail!("{route_name}: `routes.rate_limit.requests_per_second` must be greater than 0");
+        }
+        if let Some(burst) = self.burst
+            && burst == 0
+        {
+            bail!("{route_name}: `routes.rate_limit.burst` must be greater than 0");
+        }
+        if let Some(queue_depth) = self.queue_depth
+            && queue_depth == 0
+        {
+            bail!("{route_name}: `routes.rate_limit.queue_depth` must be greater than 0");
+        }
+        if let Some(timeout_ms) = self.timeout_ms
+            && timeout_ms == 0
+        {
+            bail!("{route_name}: `routes.rate_limit.timeout_ms` must be greater than 0");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -962,6 +994,8 @@ preserve_timing = true
 [routes.rate_limit]
 requests_per_second = 10
 burst = 20
+queue_depth = 64
+timeout_ms = 1500
 
 [[routes]]
 name = "anthropic-messages"
@@ -1063,6 +1097,9 @@ recording_mode = "server-only"
         );
         assert!(openai.streaming.as_ref().unwrap().preserve_timing);
         assert_eq!(openai.rate_limit.as_ref().unwrap().requests_per_second, 10);
+        assert_eq!(openai.rate_limit.as_ref().unwrap().burst, Some(20));
+        assert_eq!(openai.rate_limit.as_ref().unwrap().queue_depth, Some(64));
+        assert_eq!(openai.rate_limit.as_ref().unwrap().timeout_ms, Some(1500));
 
         let anthropic = &config.routes[1];
         assert_eq!(
@@ -1274,6 +1311,72 @@ headers_ignore = ["authorization"]
                 .contains("`routes.match.headers` and `routes.match.headers_ignore` overlap"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn rate_limit_values_must_be_positive() {
+        for (snippet, expected_error) in [
+            (
+                "requests_per_second = 0",
+                "`routes.rate_limit.requests_per_second` must be greater than 0",
+            ),
+            (
+                "requests_per_second = 10\nburst = 0",
+                "`routes.rate_limit.burst` must be greater than 0",
+            ),
+            (
+                "requests_per_second = 10\nqueue_depth = 0",
+                "`routes.rate_limit.queue_depth` must be greater than 0",
+            ),
+            (
+                "requests_per_second = 10\ntimeout_ms = 0",
+                "`routes.rate_limit.timeout_ms` must be greater than 0",
+            ),
+        ] {
+            let toml = format!(
+                r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+
+[routes.rate_limit]
+{snippet}
+"#
+            );
+            let err = Config::from_toml_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains(expected_error),
+                "snippet `{snippet}` error did not include `{expected_error}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_timeout_alias_is_supported() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+
+[routes.rate_limit]
+requests_per_second = 10
+timeout = 250
+"#,
+        )
+        .unwrap();
+
+        let rate_limit = config.routes[0]
+            .rate_limit
+            .as_ref()
+            .expect("route rate limit should be present");
+        assert_eq!(rate_limit.timeout_ms, Some(250));
     }
 
     #[test]

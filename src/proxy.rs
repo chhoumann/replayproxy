@@ -3344,10 +3344,14 @@ fn apply_on_request_script(
     parts: &mut hyper::http::request::Parts,
     body_bytes: &mut Bytes,
 ) -> anyhow::Result<()> {
+    let ScriptHeaderProjection {
+        utf8_headers: request_utf8_headers,
+        binary_headers: request_binary_headers,
+    } = script_headers_from_http(&parts.headers);
     let mut request = ScriptRequest::new(
         parts.method.to_string(),
         parts.uri.to_string(),
-        script_headers_from_http(&parts.headers, "on_request")?,
+        request_utf8_headers,
         body_bytes.to_vec(),
     );
     run_on_request_script(
@@ -3363,7 +3367,7 @@ fn apply_on_request_script(
     parts.uri = request.url.parse::<Uri>().map_err(|err| {
         anyhow::anyhow!("apply transformed request URL for route `{route_ref}`: {err}")
     })?;
-    parts.headers = script_headers_to_http(request.headers)?;
+    parts.headers = script_headers_to_http(request.headers, request_binary_headers)?;
     strip_hop_by_hop_headers(&mut parts.headers);
     let content_length = HeaderValue::from_str(&request.body.len().to_string()).map_err(|err| {
         anyhow::anyhow!("set transformed request content-length for route `{route_ref}`: {err}")
@@ -3380,9 +3384,13 @@ fn apply_on_response_script(
     parts: &mut hyper::http::response::Parts,
     body_bytes: &mut Bytes,
 ) -> anyhow::Result<()> {
+    let ScriptHeaderProjection {
+        utf8_headers: response_utf8_headers,
+        binary_headers: response_binary_headers,
+    } = script_headers_from_http(&parts.headers);
     let mut response = ScriptResponse::new(
         parts.status.as_u16(),
-        script_headers_from_http(&parts.headers, "on_response")?,
+        response_utf8_headers,
         body_bytes.to_vec(),
     );
     run_on_response_script(
@@ -3395,7 +3403,7 @@ fn apply_on_response_script(
     parts.status = StatusCode::from_u16(response.status).map_err(|err| {
         anyhow::anyhow!("apply transformed response status for route `{route_ref}`: {err}")
     })?;
-    parts.headers = script_headers_to_http(response.headers)?;
+    parts.headers = script_headers_to_http(response.headers, response_binary_headers)?;
     strip_hop_by_hop_headers(&mut parts.headers);
     let content_length =
         HeaderValue::from_str(&response.body.len().to_string()).map_err(|err| {
@@ -3414,24 +3422,24 @@ fn apply_on_record_script(
     script: &LoadedScript,
     recording: &mut Recording,
 ) -> anyhow::Result<()> {
+    let ScriptHeaderProjection {
+        utf8_headers: request_utf8_headers,
+        binary_headers: request_binary_headers,
+    } = script_headers_from_recording_headers(&recording.request_headers);
+    let ScriptHeaderProjection {
+        utf8_headers: response_utf8_headers,
+        binary_headers: response_binary_headers,
+    } = script_headers_from_recording_headers(&recording.response_headers);
     let mut script_recording = ScriptRecording::new(
         ScriptRequest::new(
             recording.request_method.clone(),
             recording.request_uri.clone(),
-            script_headers_from_recording_headers(
-                &recording.request_headers,
-                "on_record",
-                "request.headers",
-            )?,
+            request_utf8_headers,
             recording.request_body.clone(),
         ),
         ScriptResponse::new(
             recording.response_status,
-            script_headers_from_recording_headers(
-                &recording.response_headers,
-                "on_record",
-                "response.headers",
-            )?,
+            response_utf8_headers,
             recording.response_body.clone(),
         ),
     );
@@ -3444,12 +3452,16 @@ fn apply_on_record_script(
 
     recording.request_method = script_recording.request.method;
     recording.request_uri = script_recording.request.url;
-    recording.request_headers =
-        script_headers_to_recording_headers(script_recording.request.headers)?;
+    recording.request_headers = script_headers_to_recording_headers(
+        script_recording.request.headers,
+        request_binary_headers,
+    )?;
     recording.request_body = script_recording.request.body;
     recording.response_status = script_recording.response.status;
-    recording.response_headers =
-        script_headers_to_recording_headers(script_recording.response.headers)?;
+    recording.response_headers = script_headers_to_recording_headers(
+        script_recording.response.headers,
+        response_binary_headers,
+    )?;
     recording.response_body = script_recording.response.body;
     Ok(())
 }
@@ -3462,13 +3474,13 @@ fn apply_on_replay_script(
     response_chunks: &mut Option<Vec<ResponseChunk>>,
 ) -> anyhow::Result<()> {
     let original_body = recording.response_body.clone();
+    let ScriptHeaderProjection {
+        utf8_headers: response_utf8_headers,
+        binary_headers: response_binary_headers,
+    } = script_headers_from_recording_headers(&recording.response_headers);
     let mut response = ScriptResponse::new(
         recording.response_status,
-        script_headers_from_recording_headers(
-            &recording.response_headers,
-            "on_replay",
-            "response.headers",
-        )?,
+        response_utf8_headers,
         recording.response_body.clone(),
     );
     run_on_replay_script(
@@ -3479,7 +3491,8 @@ fn apply_on_replay_script(
     )?;
 
     recording.response_status = response.status;
-    recording.response_headers = script_headers_to_recording_headers(response.headers)?;
+    recording.response_headers =
+        script_headers_to_recording_headers(response.headers, response_binary_headers)?;
     recording.response_body = response.body;
 
     if let Some(chunks) = response_chunks.take() {
@@ -3494,44 +3507,86 @@ fn apply_on_replay_script(
 }
 
 #[cfg(feature = "scripting")]
-fn script_headers_from_http(
-    headers: &hyper::HeaderMap,
-    hook_name: &str,
-) -> anyhow::Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    for (name, value) in headers {
-        let value = value.to_str().map_err(|err| {
-            anyhow::anyhow!(
-                "cannot run {hook_name} script with non-UTF-8 value for `{}`: {err}",
-                name.as_str(),
-            )
-        })?;
-        out.insert(name.as_str().to_owned(), value.to_owned());
-    }
-    Ok(out)
+#[derive(Debug, Default)]
+struct ScriptHeaderProjection {
+    utf8_headers: BTreeMap<String, String>,
+    binary_headers: BTreeMap<String, Vec<u8>>,
 }
 
 #[cfg(feature = "scripting")]
-fn script_headers_from_recording_headers(
-    headers: &[(String, Vec<u8>)],
-    hook_name: &str,
-    field_name: &str,
-) -> anyhow::Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    for (name, value) in headers {
-        let value = std::str::from_utf8(value).map_err(|err| {
-            anyhow::anyhow!(
-                "cannot run {hook_name} script with non-UTF-8 value for `{field_name}.{name}`: {err}",
-            )
-        })?;
-        out.insert(name.clone(), value.to_owned());
+impl ScriptHeaderProjection {
+    fn insert_utf8(&mut self, name: String, value: String) {
+        remove_header_case_insensitive(&mut self.binary_headers, &name);
+        remove_header_case_insensitive(&mut self.utf8_headers, &name);
+        self.utf8_headers.insert(name, value);
     }
-    Ok(out)
+
+    fn insert_binary(&mut self, name: String, value: Vec<u8>) {
+        remove_header_case_insensitive(&mut self.utf8_headers, &name);
+        remove_header_case_insensitive(&mut self.binary_headers, &name);
+        self.binary_headers.insert(name, value);
+    }
 }
 
 #[cfg(feature = "scripting")]
-fn script_headers_to_http(headers: BTreeMap<String, String>) -> anyhow::Result<hyper::HeaderMap> {
+fn remove_header_case_insensitive<T>(headers: &mut BTreeMap<String, T>, name: &str) {
+    if let Some(existing_name) = headers
+        .keys()
+        .find(|existing_name| existing_name.eq_ignore_ascii_case(name))
+        .cloned()
+    {
+        headers.remove(&existing_name);
+    }
+}
+
+#[cfg(feature = "scripting")]
+fn has_header_case_insensitive<T>(headers: &BTreeMap<String, T>, name: &str) -> bool {
+    headers
+        .keys()
+        .any(|existing_name| existing_name.eq_ignore_ascii_case(name))
+}
+
+#[cfg(feature = "scripting")]
+fn script_headers_from_http(headers: &hyper::HeaderMap) -> ScriptHeaderProjection {
+    let mut out = ScriptHeaderProjection::default();
+    for (name, value) in headers {
+        let name = name.as_str().to_owned();
+        match value.to_str() {
+            Ok(value) => out.insert_utf8(name, value.to_owned()),
+            Err(_) => out.insert_binary(name, value.as_bytes().to_vec()),
+        }
+    }
+    out
+}
+
+#[cfg(feature = "scripting")]
+fn script_headers_from_recording_headers(headers: &[(String, Vec<u8>)]) -> ScriptHeaderProjection {
+    let mut out = ScriptHeaderProjection::default();
+    for (name, value) in headers {
+        match std::str::from_utf8(value) {
+            Ok(value) => out.insert_utf8(name.clone(), value.to_owned()),
+            Err(_) => out.insert_binary(name.clone(), value.clone()),
+        }
+    }
+    out
+}
+
+#[cfg(feature = "scripting")]
+fn script_headers_to_http(
+    headers: BTreeMap<String, String>,
+    preserved_binary_headers: BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<hyper::HeaderMap> {
     let mut out = hyper::HeaderMap::new();
+    for (name, value) in preserved_binary_headers {
+        if has_header_case_insensitive(&headers, &name) {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid preserved header name `{name}`: {err}"))?;
+        let header_value = HeaderValue::from_bytes(&value)
+            .map_err(|err| anyhow::anyhow!("invalid preserved header value for `{name}`: {err}"))?;
+        out.insert(header_name, header_value);
+    }
     for (name, value) in headers {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|err| anyhow::anyhow!("invalid transformed header name `{name}`: {err}"))?;
@@ -3546,8 +3601,9 @@ fn script_headers_to_http(headers: BTreeMap<String, String>) -> anyhow::Result<h
 #[cfg(feature = "scripting")]
 fn script_headers_to_recording_headers(
     headers: BTreeMap<String, String>,
+    preserved_binary_headers: BTreeMap<String, Vec<u8>>,
 ) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let mut out = Vec::with_capacity(headers.len());
+    let mut out = Vec::with_capacity(headers.len() + preserved_binary_headers.len());
     for (name, value) in headers {
         HeaderName::from_bytes(name.as_bytes())
             .map_err(|err| anyhow::anyhow!("invalid transformed header name `{name}`: {err}"))?;
@@ -3555,6 +3611,19 @@ fn script_headers_to_recording_headers(
             anyhow::anyhow!("invalid transformed header value for `{name}`: {err}")
         })?;
         out.push((name, value.into_bytes()));
+    }
+    for (name, value) in preserved_binary_headers {
+        if out
+            .iter()
+            .any(|(existing_name, _)| existing_name.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid preserved header name `{name}`: {err}"))?;
+        HeaderValue::from_bytes(&value)
+            .map_err(|err| anyhow::anyhow!("invalid preserved header value for `{name}`: {err}"))?;
+        out.push((name, value));
     }
     Ok(out)
 }

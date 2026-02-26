@@ -196,12 +196,16 @@ on_request = "{}"
         .parse()
         .unwrap();
 
-    let first_req = Request::builder()
+    let mut first_req = Request::builder()
         .method(Method::POST)
         .uri(proxy_uri.clone())
         .header("x-cache-key", "first")
         .body(Full::new(Bytes::from_static(b"client-body-a")))
         .unwrap();
+    first_req.headers_mut().insert(
+        "x-binary",
+        HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
+    );
     let first_res = client.request(first_req).await.unwrap();
     assert_eq!(first_res.status(), StatusCode::CREATED);
     let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
@@ -213,14 +217,22 @@ on_request = "{}"
         captured.headers.get("x-cache-key").unwrap(),
         &HeaderValue::from_static("canonical")
     );
+    assert_eq!(
+        captured.headers.get("x-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     assert_eq!(&captured.body[..], b"normalized-body");
 
-    let second_req = Request::builder()
+    let mut second_req = Request::builder()
         .method(Method::POST)
         .uri(proxy_uri)
         .header("x-cache-key", "second")
         .body(Full::new(Bytes::from_static(b"client-body-b")))
         .unwrap();
+    second_req.headers_mut().insert(
+        "x-binary",
+        HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
+    );
     let second_res = client.request(second_req).await.unwrap();
     assert_eq!(second_res.status(), StatusCode::CREATED);
     let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
@@ -238,8 +250,7 @@ on_request = "{}"
 #[cfg(feature = "scripting")]
 #[tokio::test]
 async fn on_response_script_mutates_upstream_response_before_return_and_cache() {
-    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
-        spawn_upstream_without_binary_header().await;
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_dir = temp_dir.path().join("storage");
     fs::create_dir_all(&storage_dir).unwrap();
@@ -305,6 +316,10 @@ on_response = "{}"
         first_res.headers().get("x-resp-end").unwrap(),
         &HeaderValue::from_static("scripted")
     );
+    assert_eq!(
+        first_res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&first_body[..], b"scripted-response");
 
@@ -326,6 +341,14 @@ on_response = "{}"
     assert_eq!(
         second_res.headers().get("x-resp-end").unwrap(),
         &HeaderValue::from_static("scripted")
+    );
+    assert_eq!(
+        second_res
+            .headers()
+            .get("x-resp-binary")
+            .unwrap()
+            .as_bytes(),
+        BINARY_HEADER_VALUE
     );
     let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&second_body[..], b"scripted-response");
@@ -360,6 +383,13 @@ on_response = "{}"
             .map(|(_, value)| value.as_slice()),
         Some(b"scripted".as_slice())
     );
+    assert_eq!(
+        stored_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-binary"))
+            .map(|(_, value)| value.as_slice()),
+        Some(BINARY_HEADER_VALUE)
+    );
     assert_eq!(&stored_body[..], b"scripted-response");
 
     proxy.shutdown().await;
@@ -369,8 +399,7 @@ on_response = "{}"
 #[cfg(feature = "scripting")]
 #[tokio::test]
 async fn on_record_script_mutates_persisted_recording_without_changing_live_response() {
-    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
-        spawn_upstream_without_binary_header().await;
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_dir = temp_dir.path().join("storage");
     fs::create_dir_all(&storage_dir).unwrap();
@@ -431,6 +460,10 @@ on_record = "{}"
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     assert!(res.headers().get("x-recorded").is_none());
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"upstream-body");
 
@@ -470,6 +503,13 @@ on_record = "{}"
             .map(|(_, value)| value.as_slice()),
         Some(b"1".as_slice())
     );
+    assert_eq!(
+        response_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-binary"))
+            .map(|(_, value)| value.as_slice()),
+        Some(BINARY_HEADER_VALUE)
+    );
     assert_eq!(request_body.as_slice(), br#"{"stored":true}"#);
     assert_eq!(response_body.as_slice(), b"stored-response");
 
@@ -480,8 +520,7 @@ on_record = "{}"
 #[cfg(feature = "scripting")]
 #[tokio::test]
 async fn on_replay_script_mutates_cached_response_without_changing_stored_recording() {
-    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
-        spawn_upstream_without_binary_header().await;
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_dir = temp_dir.path().join("storage");
     fs::create_dir_all(&storage_dir).unwrap();
@@ -539,6 +578,10 @@ on_replay = "{}"
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     assert!(res.headers().get("x-replayed").is_none());
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let first_body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(first_body.as_ref(), b"upstream-body");
 
@@ -556,6 +599,10 @@ on_replay = "{}"
         res.headers().get("x-replayed"),
         Some(&HeaderValue::from_static("1"))
     );
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
+    );
     let second_body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(second_body.as_ref(), b"upstream-body::replayed");
 
@@ -569,6 +616,10 @@ on_replay = "{}"
     assert_eq!(
         res.headers().get("x-replayed"),
         Some(&HeaderValue::from_static("1"))
+    );
+    assert_eq!(
+        res.headers().get("x-resp-binary").unwrap().as_bytes(),
+        BINARY_HEADER_VALUE
     );
     let third_body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(third_body.as_ref(), b"upstream-body::replayed");
@@ -595,6 +646,13 @@ on_replay = "{}"
             .iter()
             .all(|(name, _)| !name.eq_ignore_ascii_case("x-replayed")),
         "stored recording should not be modified by on_replay"
+    );
+    assert_eq!(
+        response_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-binary"))
+            .map(|(_, value)| value.as_slice()),
+        Some(BINARY_HEADER_VALUE)
     );
 
     proxy.shutdown().await;
@@ -5393,54 +5451,6 @@ async fn spawn_upstream() -> (
                     "x-resp-binary",
                     HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
                 );
-                Ok::<_, hyper::Error>(res)
-            }
-        });
-
-        let builder = ConnectionBuilder::new(TokioExecutor::new());
-        builder.serve_connection(io, service).await.unwrap();
-    });
-
-    (addr, rx, move || join)
-}
-
-async fn spawn_upstream_without_binary_header() -> (
-    SocketAddr,
-    mpsc::Receiver<CapturedRequest>,
-    impl FnOnce() -> tokio::task::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let (tx, rx) = mpsc::channel::<CapturedRequest>(1);
-
-    let join = tokio::spawn(async move {
-        let (stream, _peer) = listener.accept().await.unwrap();
-        let io = TokioIo::new(stream);
-        let tx = Arc::new(tx);
-        let service = service_fn(move |req: Request<Incoming>| {
-            let tx = Arc::clone(&tx);
-            async move {
-                let (parts, body) = req.into_parts();
-                let body_bytes = body.collect().await.unwrap().to_bytes();
-                tx.send(CapturedRequest {
-                    uri: parts.uri,
-                    headers: parts.headers,
-                    body: body_bytes,
-                })
-                .await
-                .unwrap();
-
-                let mut res = Response::new(Full::new(Bytes::from_static(b"upstream-body")));
-                *res.status_mut() = StatusCode::CREATED;
-                res.headers_mut().insert(
-                    header::CONNECTION,
-                    HeaderValue::from_static("close, x-resp-hop"),
-                );
-                res.headers_mut()
-                    .insert("x-resp-hop", HeaderValue::from_static("yes"));
-                res.headers_mut()
-                    .insert("x-resp-end", HeaderValue::from_static("ok"));
                 Ok::<_, hyper::Error>(res)
             }
         });

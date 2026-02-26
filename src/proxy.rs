@@ -153,12 +153,14 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let mut connector = HttpConnector::new();
     connector.enforce_http(false);
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(connector);
+    let runtime_mode_override = Arc::new(RwLock::new(None));
 
     let state = Arc::new(ProxyState::new(
         Arc::clone(&runtime_config),
         client,
         Arc::clone(&runtime_status),
         Arc::clone(&session_runtime),
+        Arc::clone(&runtime_mode_override),
     ));
     let config_reloader = config.source_path().map(|source_path| {
         Arc::new(ConfigReloader {
@@ -206,11 +208,14 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         let (admin_shutdown_tx, mut admin_shutdown_rx) = oneshot::channel::<()>();
         let admin_state = Arc::new(AdminState {
             status: Arc::clone(&runtime_status),
+            runtime_config: Arc::clone(&runtime_config),
             session_manager,
             session_runtime,
             metrics_enabled,
             config_reloader,
             admin_api_token: config.proxy.admin_api_token.clone(),
+            config_default_mode: config.proxy.mode.unwrap_or(RouteMode::PassthroughCache),
+            runtime_mode_override: Arc::clone(&runtime_mode_override),
         });
         let admin_join = tokio::spawn(async move {
             loop {
@@ -413,11 +418,14 @@ struct RuntimeStatus {
 #[derive(Debug)]
 struct AdminState {
     status: Arc<RuntimeStatus>,
+    runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
     session_manager: Option<SessionManager>,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     metrics_enabled: bool,
     config_reloader: Option<Arc<ConfigReloader>>,
     admin_api_token: Option<String>,
+    config_default_mode: RouteMode,
+    runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
 }
 
 #[derive(Debug)]
@@ -463,6 +471,17 @@ struct CreateSessionRequest {
 #[derive(Debug, Serialize)]
 struct SessionResponse {
     name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminModeResponse {
+    runtime_override_mode: Option<RouteMode>,
+    default_mode: RouteMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminSetModeRequest {
+    mode: RouteMode,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1184,6 +1203,7 @@ struct ProxyState {
     client: HttpClient,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     status: Arc<RuntimeStatus>,
+    runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
 }
 
 impl ProxyState {
@@ -1192,12 +1212,14 @@ impl ProxyState {
         client: HttpClient,
         status: Arc<RuntimeStatus>,
         session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
+        runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
     ) -> Self {
         Self {
             runtime_config,
             client,
             session_runtime,
             status,
+            runtime_mode_override,
         }
     }
 
@@ -1206,7 +1228,19 @@ impl ProxyState {
             .runtime_config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        request_runtime_config_for_path(&runtime_config, path)
+        let mut request_config = request_runtime_config_for_path(&runtime_config, path);
+        let runtime_mode_override = *self
+            .runtime_mode_override
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let (Some(mode), Some(route)) = (runtime_mode_override, request_config.route.as_mut()) {
+            route.mode = mode;
+            route.cache_miss = match mode {
+                RouteMode::Replay => CacheMissPolicy::Error,
+                RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
+            };
+        }
+        request_config
     }
 
     fn active_session_snapshot(&self) -> ActiveSessionRuntime {
@@ -2192,6 +2226,18 @@ fn admin_status_response(status: &RuntimeStatus) -> Response<Full<Bytes>> {
     }
 }
 
+fn admin_mode_response(state: &AdminState) -> Response<Full<Bytes>> {
+    let runtime_override_mode = *state
+        .runtime_mode_override
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let payload = AdminModeResponse {
+        runtime_override_mode,
+        default_mode: state.config_default_mode,
+    };
+    admin_json_response(StatusCode::OK, &payload)
+}
+
 fn duration_to_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -2660,6 +2706,63 @@ async fn admin_handler(
             ));
         }
         return Ok(admin_status_response(&state.status));
+    }
+
+    if path == "/_admin/mode" {
+        return match method {
+            hyper::Method::GET => Ok(admin_mode_response(state.as_ref())),
+            hyper::Method::POST => {
+                let body_bytes = match req.into_body().collect().await {
+                    Ok(body) => body.to_bytes(),
+                    Err(err) => {
+                        return Ok(admin_error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("failed to read request body: {err}"),
+                        ));
+                    }
+                };
+                let mode_request = match serde_json::from_slice::<AdminSetModeRequest>(&body_bytes)
+                {
+                    Ok(request) => request,
+                    Err(err) => {
+                        return Ok(admin_error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid JSON body: {err}"),
+                        ));
+                    }
+                };
+
+                let payload = {
+                    let mut runtime_mode = state
+                        .runtime_mode_override
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *runtime_mode = Some(mode_request.mode);
+                    let mut runtime_config = state
+                        .runtime_config
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for route in &mut runtime_config.routes {
+                        route.mode = mode_request.mode;
+                        route.cache_miss = match mode_request.mode {
+                            RouteMode::Replay => CacheMissPolicy::Error,
+                            RouteMode::Record | RouteMode::PassthroughCache => {
+                                CacheMissPolicy::Forward
+                            }
+                        };
+                    }
+                    AdminModeResponse {
+                        runtime_override_mode: *runtime_mode,
+                        default_mode: state.config_default_mode,
+                    }
+                };
+                Ok(admin_json_response(StatusCode::OK, &payload))
+            }
+            _ => Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            )),
+        };
     }
 
     if path == "/_admin/config/reload" {

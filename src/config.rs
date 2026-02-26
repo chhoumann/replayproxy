@@ -10,7 +10,7 @@ use std::{
 use anyhow::bail;
 use hyper::{Uri, header::HeaderName};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json_path::JsonPath;
 
 use crate::session;
@@ -777,7 +777,7 @@ fn redact_error(route_name: Option<&str>, message: String) -> anyhow::Error {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteMode {
     Record,
@@ -793,6 +793,19 @@ impl std::fmt::Display for RouteMode {
             RouteMode::PassthroughCache => "passthrough-cache",
         };
         f.write_str(s)
+    }
+}
+
+impl FromStr for RouteMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "record" => Ok(Self::Record),
+            "replay" => Ok(Self::Replay),
+            "passthrough-cache" => Ok(Self::PassthroughCache),
+            _ => bail!("invalid mode `{s}`; expected one of: record, replay, passthrough-cache"),
+        }
     }
 }
 

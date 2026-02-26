@@ -118,10 +118,18 @@ The response should now come from local storage (no upstream call). If no record
 replayproxy session list --config ./replayproxy.toml
 replayproxy session create test-session --config ./replayproxy.toml
 
+# mode (requires admin API to be enabled)
+replayproxy mode show --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
+replayproxy mode set replay --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
+replayproxy mode set record --config ./replayproxy.toml --admin-addr 127.0.0.1:8081 --persist
+
 # recordings
 replayproxy recording list --config ./replayproxy.toml
 replayproxy recording search "GET /api/get" --config ./replayproxy.toml
 ```
+
+`mode set` changes the running proxy immediately through `/_admin/mode`; `--persist` also writes
+`proxy.mode` back to the loaded config file.
 
 ## Session export format
 

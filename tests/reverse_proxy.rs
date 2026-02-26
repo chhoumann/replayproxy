@@ -246,7 +246,9 @@ body_oversize = "bypass-cache"
     assert_eq!(count, 0);
 
     proxy.shutdown().await;
-    let _ = upstream_shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
 }
 
 #[tokio::test]
@@ -305,7 +307,9 @@ body_oversize = "bypass-cache"
     assert_eq!(count, 0);
 
     proxy.shutdown().await;
-    let _ = upstream_shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
 }
 
 #[tokio::test]
@@ -419,7 +423,9 @@ mode = "record"
     assert_eq!(count, 0);
 
     proxy.shutdown().await;
-    let _ = upstream_shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
 }
 
 #[tokio::test]
@@ -781,6 +787,164 @@ mode = "passthrough-cache"
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_mode_endpoint_switches_runtime_mode_without_restart() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+mode = "record"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+cache_miss = "error"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let mode_uri: Uri = format!("http://{admin_addr}/_admin/mode").parse().unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(mode_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert!(body["runtime_override_mode"].is_null());
+    assert_eq!(body["default_mode"].as_str(), Some("record"));
+
+    let mode_payload = serde_json::json!({
+        "mode": "replay",
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(mode_uri.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&mode_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["runtime_override_mode"].as_str(), Some("replay"));
+    assert_eq!(body["default_mode"].as_str(), Some("record"));
+
+    let replay_miss_uri: Uri = format!("http://{}/api/after-switch?mode=miss", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(replay_miss_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["error"].as_str(), Some("Gateway Not Recorded"));
+    assert!(
+        timeout(Duration::from_millis(150), upstream_rx.recv())
+            .await
+            .is_err(),
+        "replay-mode cache miss should not call upstream"
+    );
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[tokio::test]
+async fn admin_mode_endpoint_returns_informative_errors() {
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let mode_uri: Uri = format!("http://{admin_addr}/_admin/mode").parse().unwrap();
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri(mode_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("method not allowed")
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(mode_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(b"{\"mode\":\"invalid\"}")))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(res).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON body")
+    );
+
+    proxy.shutdown().await;
 }
 
 #[tokio::test]

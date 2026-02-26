@@ -1,4 +1,9 @@
-use std::{fmt::Write as _, net::SocketAddr, path::PathBuf};
+use std::{
+    fmt::Write as _,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::bail;
 use bytes::Bytes;
@@ -10,12 +15,13 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use replayproxy::{
-    config::Config,
+    config::{Config, RouteMode},
     logging, session,
     session_export::{self, SessionExportFormat, SessionExportRequest, SessionExportResult},
     session_import::{self, SessionImportRequest, SessionImportResult},
     storage::{RecordingSearch, RecordingSummary, SessionManager, Storage},
 };
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_RECORDING_PAGE_LIMIT: usize = 100;
 const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
@@ -56,6 +62,14 @@ enum Command {
         config: Option<PathBuf>,
         #[command(subcommand)]
         action: RecordingCommand,
+    },
+    /// Show or change runtime proxy mode.
+    Mode {
+        /// Optional path to config TOML. If omitted, default discovery is used.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: ModeCommand,
     },
 }
 
@@ -130,6 +144,27 @@ enum RecordingCommand {
     },
 }
 
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum ModeCommand {
+    /// Show current runtime/default mode from the running admin API.
+    Show {
+        /// Explicit admin listen address (`host:port`), required when config uses `admin_port = 0`.
+        #[arg(long)]
+        admin_addr: Option<SocketAddr>,
+    },
+    /// Set runtime mode on a running proxy process.
+    Set {
+        /// Mode value (`record`, `replay`, or `passthrough-cache`).
+        mode: RouteMode,
+        /// Explicit admin listen address (`host:port`), required when config uses `admin_port = 0`.
+        #[arg(long)]
+        admin_addr: Option<SocketAddr>,
+        /// Persist `proxy.mode` back to the loaded config file.
+        #[arg(long)]
+        persist: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionCommandOutcome {
     Listed {
@@ -171,6 +206,25 @@ enum RecordingCommandOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdminModeState {
+    runtime_override_mode: Option<RouteMode>,
+    default_mode: RouteMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModeCommandOutcome {
+    Shown {
+        admin_addr: SocketAddr,
+        state: AdminModeState,
+    },
+    Set {
+        admin_addr: SocketAddr,
+        state: AdminModeState,
+        persisted_path: Option<PathBuf>,
+    },
+}
+
 fn require_session_manager(config: &Config) -> anyhow::Result<SessionManager> {
     SessionManager::from_config(config)?
         .ok_or_else(|| anyhow::anyhow!("storage not configured; set `[storage].path` in config"))
@@ -185,20 +239,21 @@ fn configured_active_session(config: &Config) -> String {
         .to_owned()
 }
 
-fn resolve_admin_addr_for_switch(
+fn resolve_admin_addr_for_command(
     config: &Config,
     admin_addr_override: Option<SocketAddr>,
+    command_name: &str,
 ) -> anyhow::Result<SocketAddr> {
     if let Some(admin_addr) = admin_addr_override {
         return Ok(admin_addr);
     }
 
     let Some(admin_port) = config.proxy.admin_port else {
-        bail!("`session switch` requires `proxy.admin_port` in config or `--admin-addr` override");
+        bail!("`{command_name}` requires `proxy.admin_port` in config or `--admin-addr` override");
     };
     if admin_port == 0 {
         bail!(
-            "`session switch` cannot infer admin port from `proxy.admin_port = 0`; pass `--admin-addr`"
+            "`{command_name}` cannot infer admin port from `proxy.admin_port = 0`; pass `--admin-addr`"
         );
     }
 
@@ -207,6 +262,20 @@ fn resolve_admin_addr_for_switch(
         .admin_connect_ip()
         .expect("admin connect IP should exist when admin_port is configured");
     Ok(SocketAddr::new(admin_ip, admin_port))
+}
+
+fn resolve_admin_addr_for_switch(
+    config: &Config,
+    admin_addr_override: Option<SocketAddr>,
+) -> anyhow::Result<SocketAddr> {
+    resolve_admin_addr_for_command(config, admin_addr_override, "session switch")
+}
+
+fn resolve_admin_addr_for_mode(
+    config: &Config,
+    admin_addr_override: Option<SocketAddr>,
+) -> anyhow::Result<SocketAddr> {
+    resolve_admin_addr_for_command(config, admin_addr_override, "mode")
 }
 
 fn encode_uri_path_segment(value: &str) -> String {
@@ -229,6 +298,23 @@ fn extract_admin_error_message(response_body: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn admin_http_client() -> Client<HttpConnector, Full<Bytes>> {
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminModeApiResponse {
+    runtime_override_mode: Option<RouteMode>,
+    default_mode: RouteMode,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSetModeApiRequest {
+    mode: RouteMode,
+}
+
 async fn switch_session_via_admin(
     admin_addr: SocketAddr,
     session_name: &str,
@@ -241,10 +327,7 @@ async fn switch_session_via_admin(
     .parse()
     .map_err(|err| anyhow::anyhow!("build admin activation URI: {err}"))?;
 
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(false);
-    let client: Client<HttpConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(connector);
+    let client = admin_http_client();
 
     let mut request_builder = Request::builder().method(Method::POST).uri(uri);
     if let Some(admin_api_token) = admin_api_token {
@@ -274,6 +357,145 @@ async fn switch_session_via_admin(
     }
 
     Ok(())
+}
+
+async fn get_mode_via_admin(
+    admin_addr: SocketAddr,
+    admin_api_token: Option<&str>,
+) -> anyhow::Result<AdminModeState> {
+    let uri: Uri = format!("http://{admin_addr}/_admin/mode")
+        .parse()
+        .map_err(|err| anyhow::anyhow!("build admin mode URI: {err}"))?;
+    let client = admin_http_client();
+
+    let mut request_builder = Request::builder().method(Method::GET).uri(uri);
+    if let Some(admin_api_token) = admin_api_token {
+        request_builder = request_builder.header(ADMIN_API_TOKEN_HEADER, admin_api_token);
+    }
+    let request = request_builder
+        .body(Full::new(Bytes::new()))
+        .map_err(|err| anyhow::anyhow!("build admin mode request: {err}"))?;
+
+    let response = client
+        .request(request)
+        .await
+        .map_err(|err| anyhow::anyhow!("request admin mode endpoint: {err}"))?;
+    let status = response.status();
+    let response_body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| anyhow::anyhow!("read admin mode response body: {err}"))?
+        .to_bytes();
+    if !status.is_success() {
+        let message = extract_admin_error_message(&response_body)
+            .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
+        bail!("read mode failed via admin {admin_addr}: {status} {message}");
+    }
+
+    let body: AdminModeApiResponse = serde_json::from_slice(&response_body)
+        .map_err(|err| anyhow::anyhow!("parse admin mode response JSON: {err}"))?;
+    Ok(AdminModeState {
+        runtime_override_mode: body.runtime_override_mode,
+        default_mode: body.default_mode,
+    })
+}
+
+async fn set_mode_via_admin(
+    admin_addr: SocketAddr,
+    mode: RouteMode,
+    admin_api_token: Option<&str>,
+) -> anyhow::Result<AdminModeState> {
+    let uri: Uri = format!("http://{admin_addr}/_admin/mode")
+        .parse()
+        .map_err(|err| anyhow::anyhow!("build admin mode URI: {err}"))?;
+    let client = admin_http_client();
+    let request_body = serde_json::to_vec(&AdminSetModeApiRequest { mode })
+        .map_err(|err| anyhow::anyhow!("serialize admin mode request JSON: {err}"))?;
+
+    let mut request_builder = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(admin_api_token) = admin_api_token {
+        request_builder = request_builder.header(ADMIN_API_TOKEN_HEADER, admin_api_token);
+    }
+    let request = request_builder
+        .body(Full::new(Bytes::from(request_body)))
+        .map_err(|err| anyhow::anyhow!("build admin mode request: {err}"))?;
+
+    let response = client
+        .request(request)
+        .await
+        .map_err(|err| anyhow::anyhow!("request admin mode endpoint: {err}"))?;
+    let status = response.status();
+    let response_body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| anyhow::anyhow!("read admin mode response body: {err}"))?
+        .to_bytes();
+    if !status.is_success() {
+        let message = extract_admin_error_message(&response_body)
+            .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
+        bail!("set mode to `{mode}` failed via admin {admin_addr}: {status} {message}");
+    }
+
+    let body: AdminModeApiResponse = serde_json::from_slice(&response_body)
+        .map_err(|err| anyhow::anyhow!("parse admin mode response JSON: {err}"))?;
+    Ok(AdminModeState {
+        runtime_override_mode: body.runtime_override_mode,
+        default_mode: body.default_mode,
+    })
+}
+
+fn update_proxy_mode_in_toml(config_toml: &str, mode: RouteMode) -> anyhow::Result<String> {
+    let mut config_value: toml::Value = toml::from_str(config_toml)
+        .map_err(|err| anyhow::anyhow!("parse config TOML for mode persistence: {err}"))?;
+    let root = config_value
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root must be a TOML table"))?;
+    let proxy_value = root
+        .entry("proxy")
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let proxy_table = proxy_value
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("`proxy` must be a TOML table"))?;
+    proxy_table.insert("mode".to_owned(), toml::Value::String(mode.to_string()));
+    toml::to_string_pretty(&config_value)
+        .map_err(|err| anyhow::anyhow!("serialize updated config TOML: {err}"))
+}
+
+fn write_file_atomically(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+
+    fs::write(&temp_path, contents)
+        .map_err(|err| anyhow::anyhow!("write temporary config {}: {err}", temp_path.display()))?;
+    fs::rename(&temp_path, path).map_err(|err| {
+        anyhow::anyhow!(
+            "replace config {} with {}: {err}",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn persist_proxy_mode(config: &Config, mode: RouteMode) -> anyhow::Result<PathBuf> {
+    let source_path = config.source_path().ok_or_else(|| {
+        anyhow::anyhow!("`mode set --persist` requires a config file path (`--config`)")
+    })?;
+    let source_path = source_path.to_path_buf();
+    let config_toml = fs::read_to_string(&source_path)
+        .map_err(|err| anyhow::anyhow!("read config {}: {err}", source_path.display()))?;
+    let updated_toml = update_proxy_mode_in_toml(&config_toml, mode)?;
+    write_file_atomically(&source_path, updated_toml.as_bytes())?;
+    Ok(source_path)
 }
 
 async fn run_session_command(
@@ -468,6 +690,44 @@ async fn run_recording_command(
     }
 }
 
+async fn run_mode_command(
+    config: &Config,
+    command: ModeCommand,
+) -> anyhow::Result<ModeCommandOutcome> {
+    match command {
+        ModeCommand::Show { admin_addr } => {
+            let admin_addr = resolve_admin_addr_for_mode(config, admin_addr)?;
+            let state =
+                get_mode_via_admin(admin_addr, config.proxy.admin_api_token.as_deref()).await?;
+            Ok(ModeCommandOutcome::Shown { admin_addr, state })
+        }
+        ModeCommand::Set {
+            mode,
+            admin_addr,
+            persist,
+        } => {
+            let admin_addr = resolve_admin_addr_for_mode(config, admin_addr)?;
+            let state =
+                set_mode_via_admin(admin_addr, mode, config.proxy.admin_api_token.as_deref())
+                    .await?;
+            let persisted_path = if persist {
+                Some(persist_proxy_mode(config, mode).map_err(|err| {
+                    anyhow::anyhow!(
+                        "set runtime mode via admin {admin_addr}, but failed to persist config: {err}"
+                    )
+                })?)
+            } else {
+                None
+            };
+            Ok(ModeCommandOutcome::Set {
+                admin_addr,
+                state,
+                persisted_path,
+            })
+        }
+    }
+}
+
 fn print_session_command_outcome(outcome: SessionCommandOutcome) {
     match outcome {
         SessionCommandOutcome::Listed {
@@ -506,6 +766,35 @@ fn print_session_command_outcome(outcome: SessionCommandOutcome) {
                 result.recordings_imported,
                 result.input_dir.display()
             );
+        }
+    }
+}
+
+fn print_mode_command_outcome(outcome: ModeCommandOutcome) {
+    match outcome {
+        ModeCommandOutcome::Shown { admin_addr, state } => {
+            if let Some(runtime_override_mode) = state.runtime_override_mode {
+                println!("runtime mode override via admin {admin_addr}: `{runtime_override_mode}`");
+            } else {
+                println!(
+                    "no runtime mode override via admin {admin_addr}; default mode is `{}`",
+                    state.default_mode
+                );
+            }
+        }
+        ModeCommandOutcome::Set {
+            admin_addr,
+            state,
+            persisted_path,
+        } => {
+            let current_mode = state.runtime_override_mode.unwrap_or(state.default_mode);
+            println!("set runtime mode override via admin {admin_addr}: `{current_mode}`");
+            if let Some(persisted_path) = persisted_path {
+                println!(
+                    "persisted `proxy.mode = \"{current_mode}\"` to {}",
+                    persisted_path.display()
+                );
+            }
         }
     }
 }
@@ -586,6 +875,11 @@ async fn main() -> anyhow::Result<()> {
             let outcome = run_recording_command(&config, action).await?;
             print_recording_command_outcome(outcome);
         }
+        Command::Mode { config, action } => {
+            let config = Config::load(config.as_deref())?;
+            let outcome = run_mode_command(&config, action).await?;
+            print_mode_command_outcome(outcome);
+        }
     }
 
     Ok(())
@@ -645,17 +939,21 @@ fn redact_active_session(value: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use super::{
-        Cli, Command, RecordingCommand, RecordingCommandOutcome, SessionCommand,
-        SessionCommandOutcome, encode_uri_path_segment, parse_recording_search_query,
-        redact_active_session, redact_if_present, resolve_admin_addr_for_switch,
-        run_recording_command, run_session_command, startup_summary,
+        Cli, Command, ModeCommand, ModeCommandOutcome, RecordingCommand, RecordingCommandOutcome,
+        SessionCommand, SessionCommandOutcome, encode_uri_path_segment,
+        parse_recording_search_query, redact_active_session, redact_if_present,
+        resolve_admin_addr_for_mode, resolve_admin_addr_for_switch, run_mode_command,
+        run_recording_command, run_session_command, startup_summary, update_proxy_mode_in_toml,
     };
     use clap::Parser;
     use replayproxy::{
-        config::Config,
+        config::{Config, RouteMode},
         session_export::SessionExportFormat,
         storage::{Recording, RecordingSearch, SessionManager, Storage},
     };
@@ -695,6 +993,27 @@ listen = "127.0.0.1:8080"
 [proxy]
 listen = "127.0.0.1:0"
 admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "{active_session}"
+"#,
+            base_path.display()
+        ))
+        .expect("config should parse")
+    }
+
+    fn config_with_ephemeral_admin_mode(
+        base_path: &Path,
+        active_session: &str,
+        mode: RouteMode,
+    ) -> Config {
+        Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+mode = "{mode}"
 
 [storage]
 path = "{}"
@@ -942,6 +1261,107 @@ admin_bind = "127.0.0.2"
         let inferred =
             resolve_admin_addr_for_switch(&config, None).expect("admin addr should infer");
         assert_eq!(inferred, "127.0.0.2:9090".parse().unwrap());
+    }
+
+    #[test]
+    fn mode_show_parses_with_config_and_admin_addr() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "mode",
+            "--config",
+            "custom.toml",
+            "show",
+            "--admin-addr",
+            "127.0.0.1:9090",
+        ])
+        .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Mode { config, action } => (config, action),
+            other => panic!("expected mode command, got {other:?}"),
+        };
+        assert_eq!(config, Some(PathBuf::from("custom.toml")));
+        assert_eq!(
+            action,
+            ModeCommand::Show {
+                admin_addr: Some("127.0.0.1:9090".parse().unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn mode_set_parses_with_persist_flag() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "mode",
+            "set",
+            "replay",
+            "--persist",
+            "--admin-addr",
+            "127.0.0.1:9090",
+        ])
+        .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Mode { config, action } => (config, action),
+            other => panic!("expected mode command, got {other:?}"),
+        };
+        assert_eq!(config, None);
+        assert_eq!(
+            action,
+            ModeCommand::Set {
+                mode: RouteMode::Replay,
+                admin_addr: Some("127.0.0.1:9090".parse().unwrap()),
+                persist: true,
+            }
+        );
+    }
+
+    #[test]
+    fn mode_resolve_infers_loopback_for_unspecified_admin_bind() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "0.0.0.0:8080"
+admin_port = 9090
+admin_bind = "0.0.0.0"
+"#,
+        )
+        .expect("config should parse");
+
+        let inferred = resolve_admin_addr_for_mode(&config, None).expect("admin addr should infer");
+        assert_eq!(inferred, "127.0.0.1:9090".parse().unwrap());
+    }
+
+    #[test]
+    fn update_proxy_mode_in_toml_updates_existing_mode() {
+        let updated = update_proxy_mode_in_toml(
+            r#"
+[proxy]
+listen = "127.0.0.1:8080"
+mode = "record"
+"#,
+            RouteMode::Replay,
+        )
+        .expect("mode update should succeed");
+        assert!(
+            updated.contains("mode = \"replay\""),
+            "updated config: {updated}"
+        );
+    }
+
+    #[test]
+    fn update_proxy_mode_in_toml_inserts_missing_mode() {
+        let updated = update_proxy_mode_in_toml(
+            r#"
+[proxy]
+listen = "127.0.0.1:8080"
+"#,
+            RouteMode::PassthroughCache,
+        )
+        .expect("mode update should succeed");
+        assert!(
+            updated.contains("mode = \"passthrough-cache\""),
+            "updated config: {updated}"
+        );
     }
 
     #[test]
@@ -1329,6 +1749,134 @@ admin_bind = "127.0.0.2"
                 .contains("`session switch` requires `proxy.admin_port`"),
             "error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn mode_set_updates_runtime_mode_via_admin_endpoint() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config =
+            config_with_ephemeral_admin_mode(temp_dir.path(), "default", RouteMode::Record);
+        let proxy = replayproxy::proxy::serve(&config)
+            .await
+            .expect("proxy should start");
+        let admin_addr = proxy
+            .admin_listen_addr
+            .expect("admin listener should be running");
+
+        let shown = run_mode_command(
+            &config,
+            ModeCommand::Show {
+                admin_addr: Some(admin_addr),
+            },
+        )
+        .await
+        .expect("mode show should succeed");
+        assert_eq!(
+            shown,
+            ModeCommandOutcome::Shown {
+                admin_addr,
+                state: super::AdminModeState {
+                    runtime_override_mode: None,
+                    default_mode: RouteMode::Record,
+                },
+            }
+        );
+
+        let set = run_mode_command(
+            &config,
+            ModeCommand::Set {
+                mode: RouteMode::Replay,
+                admin_addr: Some(admin_addr),
+                persist: false,
+            },
+        )
+        .await
+        .expect("mode set should succeed");
+        assert_eq!(
+            set,
+            ModeCommandOutcome::Set {
+                admin_addr,
+                state: super::AdminModeState {
+                    runtime_override_mode: Some(RouteMode::Replay),
+                    default_mode: RouteMode::Record,
+                },
+                persisted_path: None,
+            }
+        );
+
+        let shown_after = run_mode_command(
+            &config,
+            ModeCommand::Show {
+                admin_addr: Some(admin_addr),
+            },
+        )
+        .await
+        .expect("mode show should succeed");
+        assert_eq!(
+            shown_after,
+            ModeCommandOutcome::Shown {
+                admin_addr,
+                state: super::AdminModeState {
+                    runtime_override_mode: Some(RouteMode::Replay),
+                    default_mode: RouteMode::Record,
+                },
+            }
+        );
+
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mode_set_persist_writes_proxy_mode_back_to_config() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config_path = temp_dir.path().join("replayproxy.toml");
+        fs::write(
+            &config_path,
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+mode = "record"
+"#,
+        )
+        .expect("config file should be written");
+        let config = Config::from_path(&config_path).expect("config should load");
+        let proxy = replayproxy::proxy::serve(&config)
+            .await
+            .expect("proxy should start");
+        let admin_addr = proxy
+            .admin_listen_addr
+            .expect("admin listener should be running");
+
+        let outcome = run_mode_command(
+            &config,
+            ModeCommand::Set {
+                mode: RouteMode::Replay,
+                admin_addr: Some(admin_addr),
+                persist: true,
+            },
+        )
+        .await
+        .expect("mode set should succeed");
+        assert_eq!(
+            outcome,
+            ModeCommandOutcome::Set {
+                admin_addr,
+                state: super::AdminModeState {
+                    runtime_override_mode: Some(RouteMode::Replay),
+                    default_mode: RouteMode::Record,
+                },
+                persisted_path: Some(config_path.clone()),
+            }
+        );
+
+        let persisted = fs::read_to_string(&config_path).expect("config should be readable");
+        assert!(
+            persisted.contains("mode = \"replay\""),
+            "persisted config: {persisted}"
+        );
+
+        proxy.shutdown().await;
     }
 
     #[tokio::test]

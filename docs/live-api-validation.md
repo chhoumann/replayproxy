@@ -54,6 +54,27 @@ REPLAYPROXY_LIVE_TESTS=1 cargo test --test live_api_validation live_forward_prox
 
 If `REPLAYPROXY_LIVE_TESTS` is not set to a truthy value (`1`, `true`, `yes`), each live test intentionally fails fast.
 
+## GitHub Actions workflow
+
+Scheduled and manual CI runs are defined in
+[`.github/workflows/live-api-validation.yml`](../.github/workflows/live-api-validation.yml).
+
+- Schedule: weekly (`cron: 23 4 * * 1`).
+- Manual: `workflow_dispatch` with optional `live_http_origin` and `live_https_origin` input overrides.
+- Run command: `cargo test --locked --test live_api_validation -- --ignored --nocapture`.
+
+Configuration precedence used by the workflow:
+
+1. `workflow_dispatch` inputs (`live_http_origin`, `live_https_origin`)
+2. repository variables (`REPLAYPROXY_LIVE_HTTP_ORIGIN`, `REPLAYPROXY_LIVE_HTTPS_ORIGIN`)
+3. safe defaults (`http://httpbingo.org`, `https://httpbingo.org`)
+
+Secret handling:
+
+- Optional repository secret `REPLAYPROXY_LIVE_SECRET` is used when set.
+- Safe fallback default is `live-secret-token`.
+- The workflow masks the runtime secret and writes a job summary including resolved sources and run log links.
+
 ## Release Checklist (Pass/Fail)
 
 1. Opt-in gating

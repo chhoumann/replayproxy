@@ -15,10 +15,16 @@ Release automation and validation are implemented by:
   Linux/macOS amd64+arm64 archives, generates `SHA256SUMS`, and publishes GitHub Release assets.
 - [`.github/workflows/release-validate.yml`](.github/workflows/release-validate.yml): validates
   published assets (checksum + smoke tests), and can be run manually for a specific tag.
+- [`.github/workflows/live-api-validation.yml`](.github/workflows/live-api-validation.yml):
+  scheduled + manual live-origin validation for opt-in external API checks.
 
 Secrets/tokens:
 
-- No custom repository secrets are required for these workflows.
+- No custom repository secrets are required for release publish/validate workflows.
+- Optional live-validation configuration:
+  - repository variables: `REPLAYPROXY_LIVE_HTTP_ORIGIN`, `REPLAYPROXY_LIVE_HTTPS_ORIGIN`
+  - repository secret: `REPLAYPROXY_LIVE_SECRET`
+  - safe defaults are used when these are unset (see `docs/live-api-validation.md`)
 - GitHub Actions uses the built-in `GITHUB_TOKEN` (`github.token`), surfaced as `GH_TOKEN` where
   needed in workflow steps.
 - Human operators need `gh` CLI authenticated locally (`gh auth status`) to run the manual

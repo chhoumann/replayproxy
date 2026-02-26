@@ -1,0 +1,159 @@
+name: Live API Validation
+
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      live_http_origin:
+        description: "Optional HTTP origin override (must start with http://)."
+        required: false
+        type: string
+      live_https_origin:
+        description: "Optional HTTPS origin override (must start with https://)."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-api-validation-${{ github.ref_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  live-api-validation:
+    name: live-api-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve live validation settings
+        env:
+          INPUT_HTTP_ORIGIN: ${{ github.event_name == 'workflow_dispatch' && inputs.live_http_origin || '' }}
+          INPUT_HTTPS_ORIGIN: ${{ github.event_name == 'workflow_dispatch' && inputs.live_https_origin || '' }}
+          VAR_HTTP_ORIGIN: ${{ vars.REPLAYPROXY_LIVE_HTTP_ORIGIN || '' }}
+          VAR_HTTPS_ORIGIN: ${{ vars.REPLAYPROXY_LIVE_HTTPS_ORIGIN || '' }}
+          SECRET_LIVE: ${{ secrets.REPLAYPROXY_LIVE_SECRET || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          http_origin_default="http://httpbingo.org"
+          https_origin_default="https://httpbingo.org"
+
+          http_origin="${http_origin_default}"
+          http_origin_source="default (${http_origin_default})"
+          if [ -n "${INPUT_HTTP_ORIGIN}" ]; then
+            http_origin="${INPUT_HTTP_ORIGIN}"
+            http_origin_source="workflow_dispatch input"
+          elif [ -n "${VAR_HTTP_ORIGIN}" ]; then
+            http_origin="${VAR_HTTP_ORIGIN}"
+            http_origin_source="repository variable REPLAYPROXY_LIVE_HTTP_ORIGIN"
+          fi
+
+          https_origin="${https_origin_default}"
+          https_origin_source="default (${https_origin_default})"
+          if [ -n "${INPUT_HTTPS_ORIGIN}" ]; then
+            https_origin="${INPUT_HTTPS_ORIGIN}"
+            https_origin_source="workflow_dispatch input"
+          elif [ -n "${VAR_HTTPS_ORIGIN}" ]; then
+            https_origin="${VAR_HTTPS_ORIGIN}"
+            https_origin_source="repository variable REPLAYPROXY_LIVE_HTTPS_ORIGIN"
+          fi
+
+          secret_value="live-secret-token"
+          secret_source="default test token"
+          if [ -n "${SECRET_LIVE}" ]; then
+            secret_value="${SECRET_LIVE}"
+            secret_source="repository secret REPLAYPROXY_LIVE_SECRET"
+          fi
+          echo "::add-mask::${secret_value}"
+
+          case "${http_origin}" in
+            http://*) ;;
+            *)
+              echo "REPLAYPROXY_LIVE_HTTP_ORIGIN must begin with http:// (got '${http_origin}')" >&2
+              exit 1
+              ;;
+          esac
+
+          case "${https_origin}" in
+            https://*) ;;
+            *)
+              echo "REPLAYPROXY_LIVE_HTTPS_ORIGIN must begin with https:// (got '${https_origin}')" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "REPLAYPROXY_LIVE_TESTS=1"
+            echo "REPLAYPROXY_LIVE_HTTP_ORIGIN=${http_origin}"
+            echo "REPLAYPROXY_LIVE_HTTPS_ORIGIN=${https_origin}"
+            echo "REPLAYPROXY_LIVE_SECRET=${secret_value}"
+            echo "LIVE_HTTP_ORIGIN_SOURCE=${http_origin_source}"
+            echo "LIVE_HTTPS_ORIGIN_SOURCE=${https_origin_source}"
+            echo "LIVE_SECRET_SOURCE=${secret_source}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Add configuration summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Live API validation configuration"
+            echo
+            echo "| Setting | Value | Source |"
+            echo "| --- | --- | --- |"
+            echo "| REPLAYPROXY_LIVE_TESTS | \`1\` | workflow default |"
+            echo "| REPLAYPROXY_LIVE_HTTP_ORIGIN | \`${REPLAYPROXY_LIVE_HTTP_ORIGIN}\` | ${LIVE_HTTP_ORIGIN_SOURCE} |"
+            echo "| REPLAYPROXY_LIVE_HTTPS_ORIGIN | \`${REPLAYPROXY_LIVE_HTTPS_ORIGIN}\` | ${LIVE_HTTPS_ORIGIN_SOURCE} |"
+            echo "| REPLAYPROXY_LIVE_SECRET | (masked) | ${LIVE_SECRET_SOURCE} |"
+            echo
+            echo "Run logs: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Run live API validation tests
+        id: live_tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test live_api_validation -- --ignored --nocapture 2>&1 | tee live-api-validation.log
+
+      - name: Upload live validation log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-api-validation-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: live-api-validation.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Add result summary
+        if: always()
+        env:
+          LIVE_TEST_OUTCOME: ${{ steps.live_tests.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_logs_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          artifact_name="live-api-validation-log-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "## Live API validation result"
+            echo
+            if [ "${LIVE_TEST_OUTCOME}" = "success" ]; then
+              echo "- Status: pass"
+            else
+              echo "- Status: fail"
+              echo "- Logs: ${run_logs_url}"
+              echo "- Artifact: ${artifact_name}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

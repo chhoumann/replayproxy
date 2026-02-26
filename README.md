@@ -124,6 +124,97 @@ curl -i http://127.0.0.1:8080/api/get?demo=1
 
 The response should now come from local storage (no upstream call). If no recording matches, replay mode returns `502 Gateway Not Recorded`.
 
+## Forward proxy + HTTPS MITM (macOS/Linux)
+
+Use forward proxy mode when clients should call original upstream URLs and route through `replayproxy` via `HTTP_PROXY`/`HTTPS_PROXY`.
+
+### 1) Generate local CA material
+
+```bash
+replayproxy ca generate
+```
+
+Default output:
+- `~/.replayproxy/ca/cert.pem`
+- `~/.replayproxy/ca/key.pem`
+
+### 2) Trust the CA certificate
+
+macOS:
+
+```bash
+replayproxy ca install
+```
+
+If automatic install falls back to manual mode, run:
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.replayproxy/ca/cert.pem
+```
+
+Linux:
+
+```bash
+replayproxy ca install
+```
+
+On Debian/Ubuntu/Alpine, the automatic path copies the cert to
+`/usr/local/share/ca-certificates/replayproxy-ca.crt` and runs
+`update-ca-certificates`. If that does not complete, run:
+
+```bash
+sudo cp ~/.replayproxy/ca/cert.pem /usr/local/share/ca-certificates/replayproxy-ca.crt
+sudo update-ca-certificates
+```
+
+On Fedora/RHEL-family distros, install manually:
+
+```bash
+sudo trust anchor ~/.replayproxy/ca/cert.pem
+```
+
+### 3) Configure forward proxy routing
+
+Create `replayproxy.toml`:
+
+```toml
+[proxy]
+listen = "127.0.0.1:8080"
+mode = "passthrough-cache"
+
+[proxy.tls]
+enabled = true
+ca_cert = "~/.replayproxy/ca/cert.pem"
+ca_key = "~/.replayproxy/ca/key.pem"
+
+[storage]
+path = "./.replayproxy-data"
+active_session = "default"
+
+[[routes]]
+name = "forward-all"
+path_prefix = "/"
+```
+
+`path_prefix = "/"` is required so CONNECT and absolute-form proxy requests match a route.
+Leave `upstream` unset to allow forwarding to arbitrary hosts from client request targets.
+
+### 4) Run and route client traffic through the proxy
+
+```bash
+replayproxy serve --config ./replayproxy.toml
+```
+
+In another terminal:
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:8080
+export HTTPS_PROXY=http://127.0.0.1:8080
+curl https://example.com/
+```
+
+If your client ignores proxy env vars, pass proxy settings explicitly in that client/tool.
+
 ## Troubleshooting
 
 ### `502 Gateway Not Recorded` in replay mode
@@ -178,6 +269,24 @@ If clients report trust failures (for example, unknown authority), make sure the
 ```bash
 curl --cacert ~/.replayproxy/ca/cert.pem https://example.test
 ```
+
+### Forward proxy + CA install failures
+
+`replayproxy ca install` prints either an installed method or:
+
+```text
+automatic CA install did not complete
+```
+
+Follow the platform-specific manual command printed after that line.
+
+Common failures and fixes:
+- `CA certificate not found ... run replayproxy ca generate first`: run `replayproxy ca generate` before install/export.
+- `permission denied writing /usr/local/share/ca-certificates/replayproxy-ca.crt`: rerun Linux trust steps with `sudo`.
+- `update-ca-certificates` command not found: install CA certificates tooling for your distro, or use distro-specific manual trust commands.
+- `TLS handshake for CONNECT authority ... ensure client trust includes the replayproxy CA certificate`: client does not trust the replayproxy CA yet; complete install and restart the client process.
+- `incomplete proxy.tls CA material` or `missing proxy.tls CA material`: verify both configured files exist and point to matching `cert.pem` + `key.pem`.
+- Requests are not hitting replayproxy at all: clear or adjust `NO_PROXY`/`no_proxy` so your target host is not bypassing proxy env vars.
 
 ### Config reload not applying
 

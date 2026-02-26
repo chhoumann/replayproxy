@@ -773,6 +773,8 @@ mode = "passthrough-cache"
 [storage]
 path = "{storage_path}"
 active_session = "default"
+# optional: cap per-session recording count by evicting oldest rows on insert/import
+# max_recordings = 50000
 
 [logging]
 level = "info"

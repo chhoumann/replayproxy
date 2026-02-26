@@ -17,11 +17,13 @@ const QUERY_SUBSET_CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMS - 1;
 #[derive(Debug, Clone)]
 pub struct Storage {
     db_path: PathBuf,
+    max_recordings: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     base_path: PathBuf,
+    max_recordings: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,16 +172,29 @@ impl Storage {
             .unwrap_or(session::DEFAULT_SESSION_NAME);
         let db_path = session::resolve_session_db_path(&storage.path, session_name)
             .map_err(|err| anyhow::anyhow!("resolve storage session `{session_name}`: {err}"))?;
-        Ok(Some(Self::open(db_path)?))
+        Ok(Some(Self::open_with_max_recordings(
+            db_path,
+            storage.max_recordings,
+        )?))
     }
 
     pub fn open(db_path: PathBuf) -> anyhow::Result<Self> {
+        Self::open_with_max_recordings(db_path, None)
+    }
+
+    pub fn open_with_max_recordings(
+        db_path: PathBuf,
+        max_recordings: Option<u64>,
+    ) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create storage dir {}", parent.display()))?;
         }
 
-        let storage = Self { db_path };
+        let storage = Self {
+            db_path,
+            max_recordings,
+        };
         storage.init()?;
         Ok(storage)
     }
@@ -198,8 +213,9 @@ impl Storage {
         request_query_norm: Option<String>,
     ) -> anyhow::Result<i64> {
         let db_path = self.db_path.clone();
+        let max_recordings = self.max_recordings;
         tokio::task::spawn_blocking(move || {
-            insert_recording_blocking(&db_path, recording, request_query_norm)
+            insert_recording_blocking(&db_path, recording, request_query_norm, max_recordings)
         })
         .await
         .context("join insert_recording task")?
@@ -452,11 +468,21 @@ impl SessionManager {
         fs::create_dir_all(&storage.path)
             .with_context(|| format!("create sessions dir {}", storage.path.display()))?;
 
-        Ok(Some(Self::new(storage.path.clone())))
+        Ok(Some(Self::new_with_max_recordings(
+            storage.path.clone(),
+            storage.max_recordings,
+        )))
     }
 
     pub fn new(base_path: PathBuf) -> Self {
-        Self { base_path }
+        Self::new_with_max_recordings(base_path, None)
+    }
+
+    fn new_with_max_recordings(base_path: PathBuf, max_recordings: Option<u64>) -> Self {
+        Self {
+            base_path,
+            max_recordings,
+        }
     }
 
     pub fn base_path(&self) -> &Path {
@@ -495,13 +521,14 @@ impl SessionManager {
     pub async fn open_session_storage(&self, name: &str) -> Result<Storage, SessionManagerError> {
         let base_path = self.base_path.clone();
         let name = name.to_owned();
-        tokio::task::spawn_blocking(move || open_session_storage_blocking(&base_path, &name))
-            .await
-            .map_err(|err| {
-                SessionManagerError::Internal(format!(
-                    "join open session storage task failed: {err}"
-                ))
-            })?
+        let max_recordings = self.max_recordings;
+        tokio::task::spawn_blocking(move || {
+            open_session_storage_blocking(&base_path, &name, max_recordings)
+        })
+        .await
+        .map_err(|err| {
+            SessionManagerError::Internal(format!("join open session storage task failed: {err}"))
+        })?
     }
 }
 
@@ -870,6 +897,7 @@ fn delete_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionMa
 fn open_session_storage_blocking(
     base_path: &Path,
     name: &str,
+    max_recordings: Option<u64>,
 ) -> Result<Storage, SessionManagerError> {
     let session_dir =
         session::resolve_session_dir(base_path, name).map_err(invalid_session_name)?;
@@ -880,7 +908,7 @@ fn open_session_storage_blocking(
         return Err(SessionManagerError::NotFound(name.to_owned()));
     }
 
-    Storage::open(db_path)
+    Storage::open_with_max_recordings(db_path, max_recordings)
         .map_err(|err| SessionManagerError::Internal(format!("open session `{name}`: {err}")))
 }
 
@@ -1121,6 +1149,7 @@ fn insert_recording_blocking(
     path: &Path,
     recording: Recording,
     request_query_norm: Option<String>,
+    max_recordings: Option<u64>,
 ) -> anyhow::Result<i64> {
     let mut conn = open_connection(path)?;
     let match_key = recording.match_key.clone();
@@ -1180,9 +1209,34 @@ fn insert_recording_blocking(
         &request_query_norm,
         request_query_param_count,
     )?;
+    if let Some(max_recordings) = max_recordings {
+        enforce_max_recordings(&tx, max_recordings)?;
+    }
     tx.commit().context("commit recording insert transaction")?;
 
     Ok(recording_id)
+}
+
+fn enforce_max_recordings(
+    tx: &rusqlite::Transaction<'_>,
+    max_recordings: u64,
+) -> anyhow::Result<()> {
+    let keep = i64::try_from(max_recordings)
+        .context("`storage.max_recordings` exceeds sqlite integer range")?;
+    tx.execute(
+        r#"
+        DELETE FROM recordings
+        WHERE id IN (
+          SELECT id
+          FROM recordings
+          ORDER BY id DESC
+          LIMIT -1 OFFSET ?1
+        )
+        "#,
+        params![keep],
+    )
+    .context("enforce `storage.max_recordings` retention policy")?;
+    Ok(())
 }
 
 fn insert_response_chunks_blocking(
@@ -2068,6 +2122,20 @@ mod tests {
     };
     use crate::{config::Config, matching, session};
 
+    fn test_recording(request_uri: &str, created_at_unix_ms: i64) -> Recording {
+        Recording {
+            match_key: "retention-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: request_uri.to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: request_uri.as_bytes().to_vec(),
+            created_at_unix_ms,
+        }
+    }
+
     #[test]
     fn from_config_resolves_default_session_db_path() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2112,6 +2180,38 @@ active_session = "default"
                 .contains("session name cannot contain path separators"),
             "err: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn from_config_applies_max_recordings_retention() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "default"
+max_recordings = 1
+"#,
+            temp_dir.path().display()
+        ))
+        .unwrap();
+
+        let storage = Storage::from_config(&config).unwrap().unwrap();
+        let first = test_recording("/one", Recording::now_unix_ms().unwrap());
+        let mut second = first.clone();
+        second.request_uri = "/two".to_owned();
+        second.response_body = b"/two".to_vec();
+        second.created_at_unix_ms += 1;
+
+        storage.insert_recording(first).await.unwrap();
+        storage.insert_recording(second).await.unwrap();
+
+        let summaries = storage.list_recordings(0, 10).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].request_uri, "/two");
     }
 
     #[tokio::test]
@@ -2713,6 +2813,42 @@ active_session = "default"
         storage.insert_recording(recording).await.unwrap();
 
         assert_eq!(storage.count_recordings().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn open_with_max_recordings_prunes_oldest_recordings() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage =
+            Storage::open_with_max_recordings(temp_dir.path().join("recordings.db"), Some(2))
+                .unwrap();
+
+        let first = test_recording("/one", Recording::now_unix_ms().unwrap());
+        let mut second = test_recording("/two", first.created_at_unix_ms + 1);
+        second.match_key = "retention-key-2".to_owned();
+        let mut third = test_recording("/three", first.created_at_unix_ms + 2);
+        third.match_key = "retention-key-3".to_owned();
+
+        let first_id = storage.insert_recording(first).await.unwrap();
+        storage.insert_recording(second).await.unwrap();
+        storage.insert_recording(third).await.unwrap();
+
+        assert_eq!(storage.count_recordings().await.unwrap(), 2);
+        assert!(
+            storage
+                .get_recording_by_id(first_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let summaries = storage.list_recordings(0, 10).await.unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.request_uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/three", "/two"]
+        );
     }
 
     #[tokio::test]
@@ -3635,5 +3771,37 @@ active_session = "default"
         manager.create_session("default").await.unwrap();
         let storage = manager.open_session_storage("default").await.unwrap();
         assert!(storage.db_path().exists());
+    }
+
+    #[tokio::test]
+    async fn session_manager_from_config_propagates_max_recordings() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+max_recordings = 1
+"#,
+            temp_dir.path().display()
+        ))
+        .unwrap();
+
+        let manager = SessionManager::from_config(&config).unwrap().unwrap();
+        manager.create_session("default").await.unwrap();
+        let storage = manager.open_session_storage("default").await.unwrap();
+
+        let first = test_recording("/one", Recording::now_unix_ms().unwrap());
+        let mut second = test_recording("/two", first.created_at_unix_ms + 1);
+        second.match_key = "manager-retention-key".to_owned();
+
+        storage.insert_recording(first).await.unwrap();
+        storage.insert_recording(second).await.unwrap();
+
+        let summaries = storage.list_recordings(0, 10).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].request_uri, "/two");
     }
 }

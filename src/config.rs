@@ -360,6 +360,8 @@ pub struct StorageConfig {
     pub path: PathBuf,
     #[serde(default)]
     pub active_session: Option<String>,
+    #[serde(default)]
+    pub max_recordings: Option<u64>,
 }
 
 impl StorageConfig {
@@ -369,6 +371,10 @@ impl StorageConfig {
         if let Some(active_session) = self.active_session.as_ref() {
             session::validate_session_name(active_session)
                 .map_err(|err| anyhow::anyhow!("invalid `storage.active_session`: {err}"))?;
+        }
+
+        if self.max_recordings == Some(0) {
+            bail!("`storage.max_recordings` must be greater than 0");
         }
 
         Ok(())
@@ -1051,6 +1057,7 @@ ca_key = "~/.replayproxy/ca/key.pem"
 [storage]
 path = "~/.replayproxy/sessions"
 active_session = "default"
+max_recordings = 500
 
 [logging]
 level = "info"
@@ -1161,6 +1168,13 @@ recording_mode = "server-only"
                 .as_ref()
                 .map(|storage| storage.path.as_path()),
             Some(expected_storage_path.as_path())
+        );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_recordings),
+            Some(500)
         );
 
         let logging = config.logging.as_ref().unwrap();
@@ -1938,6 +1952,49 @@ active_session = "../prod"
             err.to_string().contains(
                 "invalid `storage.active_session`: session name cannot contain path separators"
             ),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_max_recordings_defaults_to_none() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_recordings),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_zero_storage_max_recordings() {
+        let err = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+max_recordings = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("`storage.max_recordings` must be greater than 0"),
             "err: {err}"
         );
     }

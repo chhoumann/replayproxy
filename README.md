@@ -399,6 +399,7 @@ Operational notes:
 - `session` and `recording` commands require `[storage].path`.
 - Session names are validated; path traversal and empty/invalid names are rejected.
 - Active session cannot be deleted.
+- Optional `storage.max_recordings = <N>` keeps only the newest `N` recordings per session by evicting oldest rows during writes/imports.
 
 ## Admin API and runtime operations
 
@@ -570,7 +571,7 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 ## Known limitations (current)
 
 - gRPC proto-aware matching (`routes.grpc.match_fields`) requires a build with `--features grpc`; without it, matching falls back to opaque request-body behavior.
-- No built-in TTL/retention/eviction policy for stored recordings.
+- No built-in time-based TTL retention policy for stored recordings (size-based eviction via `storage.max_recordings` is supported).
 - Query `subset` matching fallback uses a per-param inverted index, but extremely broad buckets can still trigger additional candidate scanning.
 
 ## Additional docs

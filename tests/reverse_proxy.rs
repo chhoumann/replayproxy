@@ -7364,6 +7364,112 @@ max_age_hours = 1
 }
 
 #[tokio::test]
+async fn background_retention_pruner_prunes_idle_sessions_and_refreshes_status_count() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session_name = "default";
+    let session_db_path =
+        replayproxy::session::resolve_session_db_path(storage_dir.path(), session_name).unwrap();
+    let seed_storage = Storage::open(session_db_path.clone()).unwrap();
+    let now_unix_ms = Recording::now_unix_ms().unwrap();
+
+    seed_storage
+        .insert_recording(Recording {
+            match_key: "stale-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/stale".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"stale".to_vec(),
+            created_at_unix_ms: now_unix_ms - (2 * 60 * 60 * 1_000),
+        })
+        .await
+        .unwrap();
+    seed_storage
+        .insert_recording(Recording {
+            match_key: "fresh-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/fresh".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"fresh".to_vec(),
+            created_at_unix_ms: now_unix_ms - (5 * 60 * 1_000),
+        })
+        .await
+        .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "{session_name}"
+max_age_hours = 1
+retention_prune_interval_ms = 25
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(
+        body["stats"]["active_session_recordings_total"].as_u64(),
+        Some(2)
+    );
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(status_uri.clone())
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let res = client.request(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = response_json(res).await;
+            if body["stats"]["active_session_recordings_total"].as_u64() == Some(1) {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("background retention prune should run");
+
+    let verify_storage = Storage::open(session_db_path).unwrap();
+    let summaries = verify_storage.list_recordings(0, 10).await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].request_uri, "/fresh");
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_recordings_endpoints_return_informative_errors() {
     let storage_dir = tempfile::tempdir().unwrap();
     let config_toml = format!(

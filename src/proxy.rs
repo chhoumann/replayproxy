@@ -49,7 +49,7 @@ use tokio::sync::mpsc;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, oneshot},
-    time::{Instant as TokioInstant, Sleep},
+    time::{Instant as TokioInstant, MissedTickBehavior, Sleep},
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -111,6 +111,8 @@ pub struct ProxyHandle {
     admin_join: Option<tokio::task::JoinHandle<()>>,
     config_watcher_shutdown_tx: Option<oneshot::Sender<()>>,
     config_watcher_join: Option<tokio::task::JoinHandle<()>>,
+    retention_pruner_shutdown_tx: Option<oneshot::Sender<()>>,
+    retention_pruner_join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProxyHandle {
@@ -122,12 +124,18 @@ impl ProxyHandle {
         if let Some(config_watcher_shutdown_tx) = self.config_watcher_shutdown_tx {
             let _ = config_watcher_shutdown_tx.send(());
         }
+        if let Some(retention_pruner_shutdown_tx) = self.retention_pruner_shutdown_tx {
+            let _ = retention_pruner_shutdown_tx.send(());
+        }
         let _ = self.join.await;
         if let Some(admin_join) = self.admin_join {
             let _ = admin_join.await;
         }
         if let Some(config_watcher_join) = self.config_watcher_join {
             let _ = config_watcher_join.await;
+        }
+        if let Some(retention_pruner_join) = self.retention_pruner_join {
+            let _ = retention_pruner_join.await;
         }
     }
 }
@@ -179,6 +187,21 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         .as_ref()
         .is_some_and(|metrics| metrics.enabled);
     let session_manager = SessionManager::from_config(config)?;
+    let retention_prune_interval = config.storage.as_ref().and_then(|storage| {
+        if storage.retention_enabled() {
+            storage.retention_prune_interval()
+        } else {
+            None
+        }
+    });
+    if let Some(storage) = config.storage.as_ref()
+        && storage.retention_prune_interval().is_some()
+        && !storage.retention_enabled()
+    {
+        tracing::warn!(
+            "`storage.retention_prune_interval_ms` is set without a retention policy; configure `storage.max_recordings` or `storage.max_age_*` to enable background pruning"
+        );
+    }
 
     let client = build_http_client()?;
     let h2_upstream_client = build_http2_only_client()?;
@@ -217,6 +240,19 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         };
     #[cfg(not(feature = "watch"))]
     let (config_watcher_shutdown_tx, config_watcher_join) = (None, None);
+    let (retention_pruner_shutdown_tx, retention_pruner_join) =
+        if let (Some(session_manager), Some(retention_prune_interval)) =
+            (session_manager.clone(), retention_prune_interval)
+        {
+            let (shutdown_tx, join) = spawn_retention_pruner(
+                session_manager,
+                Arc::clone(&runtime_status),
+                retention_prune_interval,
+            );
+            (Some(shutdown_tx), Some(join))
+        } else {
+            (None, None)
+        };
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
@@ -292,6 +328,8 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         admin_join,
         config_watcher_shutdown_tx,
         config_watcher_join,
+        retention_pruner_shutdown_tx,
+        retention_pruner_join,
     })
 }
 
@@ -301,6 +339,99 @@ fn resolve_request_url_log_mode(config: &Config) -> RequestUrlLogMode {
         .as_ref()
         .and_then(|logging| logging.request_url)
         .unwrap_or(RequestUrlLogMode::Path)
+}
+
+fn spawn_retention_pruner(
+    session_manager: SessionManager,
+    status: Arc<RuntimeStatus>,
+    interval: Duration,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    tracing::info!(
+        interval_ms = interval.as_millis(),
+        "background retention pruner started"
+    );
+    let join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(TokioInstant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                _ = ticker.tick() => run_retention_prune_tick(&session_manager, &status).await,
+            }
+        }
+
+        tracing::info!("background retention pruner stopped");
+    });
+    (shutdown_tx, join)
+}
+
+async fn run_retention_prune_tick(session_manager: &SessionManager, status: &Arc<RuntimeStatus>) {
+    let sessions = match session_manager.list_sessions().await {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::debug!("failed to list sessions for retention pruning: {err}");
+            return;
+        }
+    };
+    if sessions.is_empty() {
+        return;
+    }
+
+    let active_session = status.active_session();
+    let mut checked_sessions = 0usize;
+    let mut deleted_recordings = 0u64;
+    let mut active_session_count_refreshed = false;
+
+    for session_name in sessions {
+        checked_sessions = checked_sessions.saturating_add(1);
+        let storage = match session_manager.open_session_storage(&session_name).await {
+            Ok(storage) => storage,
+            Err(err) => {
+                tracing::debug!(
+                    "failed to open session storage for background retention prune in `{session_name}`: {err}"
+                );
+                continue;
+            }
+        };
+
+        let deleted_for_session = match storage.prune_retention().await {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                tracing::debug!(
+                    "failed to run background retention prune for session `{session_name}`: {err}"
+                );
+                continue;
+            }
+        };
+        deleted_recordings = deleted_recordings.saturating_add(deleted_for_session);
+
+        if deleted_for_session > 0 && session_name == active_session {
+            match storage.count_recordings().await {
+                Ok(remaining) => {
+                    status.set_active_session_recordings_total(remaining);
+                    active_session_count_refreshed = true;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "failed to refresh active session recording count after background retention prune for `{session_name}`: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    if deleted_recordings > 0 {
+        if !active_session_count_refreshed {
+            status.invalidate_recordings_totals_cache();
+        }
+        tracing::info!(
+            sessions_checked = checked_sessions,
+            deleted_recordings,
+            "background retention prune removed recordings"
+        );
+    }
 }
 
 fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {

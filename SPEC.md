@@ -369,6 +369,10 @@ ca_key = "~/.replayproxy/ca/key.pem"
 [storage]
 path = "~/.replayproxy/sessions"
 active_session = "default"
+# max_recordings = 50000
+# max_age_days = 30            # use either days or hours
+# max_age_hours = 12
+# retention_prune_interval_ms = 3600000
 
 [logging]
 level = "info"

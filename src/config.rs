@@ -5,6 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     str::FromStr,
+    time::Duration,
 };
 
 use anyhow::bail;
@@ -366,6 +367,8 @@ pub struct StorageConfig {
     pub max_age_days: Option<u64>,
     #[serde(default)]
     pub max_age_hours: Option<u64>,
+    #[serde(default)]
+    pub retention_prune_interval_ms: Option<u64>,
 }
 
 impl StorageConfig {
@@ -385,6 +388,9 @@ impl StorageConfig {
         }
         if self.max_age_hours == Some(0) {
             bail!("`storage.max_age_hours` must be greater than 0");
+        }
+        if self.retention_prune_interval_ms == Some(0) {
+            bail!("`storage.retention_prune_interval_ms` must be greater than 0");
         }
         if self.max_age_days.is_some() && self.max_age_hours.is_some() {
             bail!("`storage.max_age_days` and `storage.max_age_hours` are mutually exclusive");
@@ -413,6 +419,14 @@ impl StorageConfig {
         let max_age_ms = i64::try_from(max_age_ms)
             .map_err(|_| anyhow::anyhow!("`{field_name}` exceeds supported range"))?;
         Ok(Some(max_age_ms))
+    }
+
+    pub(crate) fn retention_enabled(&self) -> bool {
+        self.max_recordings.is_some() || self.max_age_days.is_some() || self.max_age_hours.is_some()
+    }
+
+    pub(crate) fn retention_prune_interval(&self) -> Option<Duration> {
+        self.retention_prune_interval_ms.map(Duration::from_millis)
     }
 }
 
@@ -1224,6 +1238,13 @@ recording_mode = "server-only"
                 .storage
                 .as_ref()
                 .and_then(|storage| storage.max_age_hours),
+            None
+        );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.retention_prune_interval_ms),
             None
         );
 
@@ -2040,6 +2061,13 @@ path = "/tmp/replayproxy-tests"
                 .and_then(|storage| storage.max_age_hours),
             None
         );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.retention_prune_interval_ms),
+            None
+        );
     }
 
     #[test]
@@ -2101,6 +2129,27 @@ max_age_hours = 0
         assert!(
             err.to_string()
                 .contains("`storage.max_age_hours` must be greater than 0"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_storage_retention_prune_interval_ms() {
+        let err = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+retention_prune_interval_ms = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("`storage.retention_prune_interval_ms` must be greater than 0"),
             "err: {err}"
         );
     }

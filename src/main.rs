@@ -798,6 +798,8 @@ active_session = "default"
 # optional: time-based retention window (choose one)
 # max_age_days = 30
 # max_age_hours = 12
+# optional: prune idle sessions on an interval (milliseconds)
+# retention_prune_interval_ms = 3600000
 
 [logging]
 level = "info"

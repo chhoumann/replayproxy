@@ -663,6 +663,96 @@ body_oversize = "bypass-cache"
 }
 
 #[tokio::test]
+async fn record_mode_persists_chunked_response_chunks_with_offsets() {
+    let expected_chunks = vec![
+        Bytes::from_static(b"data: first\n\n"),
+        Bytes::from_static(b"data: second\n\n"),
+        Bytes::from_static(b"data: done\n\n"),
+    ];
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_with_response_chunks(expected_chunks.clone()).await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/stream", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let response_body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        response_body,
+        Bytes::from_static(b"data: first\n\ndata: second\n\ndata: done\n\n")
+    );
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/stream");
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT chunk_index, offset_ms, chunk_body
+            FROM recording_response_chunks
+            ORDER BY chunk_index ASC
+            "#,
+        )
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    let mut actual_chunks = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        actual_chunks.push((
+            row.get::<_, i64>(0).unwrap(),
+            row.get::<_, i64>(1).unwrap(),
+            row.get::<_, Vec<u8>>(2).unwrap(),
+        ));
+    }
+
+    assert_eq!(actual_chunks.len(), expected_chunks.len());
+    for (index, expected_chunk) in expected_chunks.iter().enumerate() {
+        let (stored_index, _, stored_body) = &actual_chunks[index];
+        assert_eq!(*stored_index, i64::try_from(index).unwrap());
+        assert_eq!(stored_body.as_slice(), expected_chunk.as_ref());
+    }
+    for offsets in actual_chunks.windows(2) {
+        assert!(offsets[0].1 <= offsets[1].1);
+    }
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn serve_starts_admin_listener_when_configured() {
     let config = replayproxy::config::Config::from_toml_str(
         r#"

@@ -49,7 +49,8 @@ use crate::{
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
     session_import::{self, SessionImportError, SessionImportRequest},
     storage::{
-        Recording, RecordingSearch, RecordingSummary, SessionManager, SessionManagerError, Storage,
+        Recording, RecordingSearch, RecordingSummary, ResponseChunk, SessionManager,
+        SessionManagerError, Storage,
     },
 };
 
@@ -1446,6 +1447,22 @@ enum BodyReadOutcome {
     },
 }
 
+#[derive(Debug)]
+struct RecordedResponseBody {
+    body_bytes: Bytes,
+    chunks: Vec<ResponseChunk>,
+}
+
+#[derive(Debug)]
+enum ResponseBodyReadOutcome {
+    Buffered(RecordedResponseBody),
+    TooLarge {
+        limit_bytes: usize,
+        prefetched: Vec<Bytes>,
+        remaining: Incoming,
+    },
+}
+
 async fn read_body_with_limit(
     mut body: Incoming,
     max_body_bytes: usize,
@@ -1468,20 +1485,62 @@ async fn read_body_with_limit(
         }
     }
 
+    Ok(BodyReadOutcome::Buffered(flatten_chunks(
+        buffered,
+        buffered_len,
+    )))
+}
+
+async fn read_response_body_with_chunks_with_limit(
+    mut body: Incoming,
+    max_body_bytes: usize,
+) -> Result<ResponseBodyReadOutcome, BodyReadError> {
+    let started_at = Instant::now();
+    let mut buffered = Vec::new();
+    let mut buffered_len = 0usize;
+    let mut chunks = Vec::new();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.map_err(BodyReadError::Read)?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let chunk_index = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+        let offset_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        buffered_len = buffered_len.saturating_add(data.len());
+        chunks.push(ResponseChunk {
+            chunk_index,
+            offset_ms,
+            chunk_body: data.to_vec(),
+        });
+        buffered.push(data);
+        if buffered_len > max_body_bytes {
+            return Ok(ResponseBodyReadOutcome::TooLarge {
+                limit_bytes: max_body_bytes,
+                prefetched: buffered,
+                remaining: body,
+            });
+        }
+    }
+
+    Ok(ResponseBodyReadOutcome::Buffered(RecordedResponseBody {
+        body_bytes: flatten_chunks(buffered, buffered_len),
+        chunks,
+    }))
+}
+
+fn flatten_chunks(mut buffered: Vec<Bytes>, buffered_len: usize) -> Bytes {
     if buffered.is_empty() {
-        return Ok(BodyReadOutcome::Buffered(Bytes::new()));
+        return Bytes::new();
     }
     if buffered.len() == 1 {
-        return Ok(BodyReadOutcome::Buffered(
-            buffered.pop().expect("buffered contains exactly one chunk"),
-        ));
+        return buffered.pop().expect("buffered contains exactly one chunk");
     }
 
     let mut flattened = Vec::with_capacity(buffered_len);
     for chunk in buffered {
         flattened.extend_from_slice(&chunk);
     }
-    Ok(BodyReadOutcome::Buffered(Bytes::from(flattened)))
+    Bytes::from(flattened)
 }
 
 struct PrefixedIncomingBody {
@@ -1984,9 +2043,14 @@ async fn proxy_handler(
         );
     }
 
-    let body_bytes = match read_body_with_limit(body, max_body_bytes).await {
-        Ok(BodyReadOutcome::Buffered(bytes)) => bytes,
-        Ok(BodyReadOutcome::TooLarge {
+    let (body_bytes, response_chunks) = match read_response_body_with_chunks_with_limit(
+        body,
+        max_body_bytes,
+    )
+    .await
+    {
+        Ok(ResponseBodyReadOutcome::Buffered(recorded)) => (recorded.body_bytes, recorded.chunks),
+        Ok(ResponseBodyReadOutcome::TooLarge {
             limit_bytes,
             prefetched,
             remaining,
@@ -2050,6 +2114,11 @@ async fn proxy_handler(
         let request_body =
             redact_recording_body_json(request_body.as_slice(), route.redact.as_ref());
         let response_body = redact_recording_body_json(body_bytes.as_ref(), route.redact.as_ref());
+        let response_chunks = response_chunks_for_storage(
+            body_bytes.as_ref(),
+            response_body.as_slice(),
+            response_chunks,
+        );
         let created_at_unix_ms = match Recording::now_unix_ms() {
             Ok(ts) => ts,
             Err(err) => {
@@ -2077,7 +2146,15 @@ async fn proxy_handler(
         };
 
         match storage.insert_recording(recording).await {
-            Ok(_) => state.status.increment_active_session_recordings_total(),
+            Ok(recording_id) => {
+                state.status.increment_active_session_recordings_total();
+                if let Err(err) = storage
+                    .insert_response_chunks(recording_id, response_chunks)
+                    .await
+                {
+                    tracing::debug!("failed to persist response chunks: {err}");
+                }
+            }
             Err(err) => tracing::debug!("failed to persist recording: {err}"),
         }
     }
@@ -2086,6 +2163,26 @@ async fn proxy_handler(
         Some(upstream_latency),
         Response::from_parts(parts, boxed_full(body_bytes))
     );
+}
+
+fn response_chunks_for_storage(
+    original_body: &[u8],
+    stored_body: &[u8],
+    chunks: Vec<ResponseChunk>,
+) -> Vec<ResponseChunk> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    if original_body == stored_body {
+        return chunks;
+    }
+
+    vec![ResponseChunk {
+        chunk_index: 0,
+        offset_ms: 0,
+        chunk_body: stored_body.to_vec(),
+    }]
 }
 
 #[derive(Debug, Clone, Copy)]

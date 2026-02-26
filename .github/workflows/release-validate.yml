@@ -30,7 +30,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-13
+          - runner: macos-14
             target: x86_64-apple-darwin
           - runner: macos-14
             target: aarch64-apple-darwin
@@ -95,6 +95,13 @@ jobs:
           mkdir -p smoke
           tar -xzf "${artifact}" -C smoke
           chmod +x smoke/replayproxy
-          smoke/replayproxy --version
-          smoke/replayproxy --help >/dev/null
-          smoke/replayproxy serve --help >/dev/null
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            sudo softwareupdate --install-rosetta --agree-to-license || true
+            arch -x86_64 smoke/replayproxy --version
+            arch -x86_64 smoke/replayproxy --help >/dev/null
+            arch -x86_64 smoke/replayproxy serve --help >/dev/null
+          else
+            smoke/replayproxy --version
+            smoke/replayproxy --help >/dev/null
+            smoke/replayproxy serve --help >/dev/null
+          fi

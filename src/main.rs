@@ -1,4 +1,5 @@
 use std::{
+    env,
     fmt::Write as _,
     fs,
     net::SocketAddr,
@@ -26,6 +27,8 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_RECORDING_PAGE_LIMIT: usize = 100;
 const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
+const PRESET_FILE_EXTENSION: &str = "toml";
+const USER_PRESETS_DIR_NAME: &str = "presets";
 
 #[derive(Debug, Parser)]
 #[command(name = "replayproxy")]
@@ -76,6 +79,11 @@ enum Command {
     Ca {
         #[command(subcommand)]
         action: CaCommand,
+    },
+    /// Manage shipped route presets.
+    Preset {
+        #[command(subcommand)]
+        action: PresetCommand,
     },
 }
 
@@ -202,6 +210,15 @@ enum CaCommand {
     },
 }
 
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum PresetCommand {
+    /// Import a bundled preset config into `~/.replayproxy/presets`.
+    Import {
+        /// Preset name without extension (for example: `openai`).
+        name: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionCommandOutcome {
     Listed {
@@ -276,6 +293,16 @@ enum CaCommandOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PresetCommandOutcome {
+    Imported {
+        name: String,
+        source_path: PathBuf,
+        output_path: PathBuf,
+        overwritten: bool,
+    },
+}
+
 fn require_session_manager(config: &Config) -> anyhow::Result<SessionManager> {
     SessionManager::from_config(config)?
         .ok_or_else(|| anyhow::anyhow!("storage not configured; set `[storage].path` in config"))
@@ -288,6 +315,85 @@ fn configured_active_session(config: &Config) -> String {
         .and_then(|storage| storage.active_session.as_deref())
         .unwrap_or(session::DEFAULT_SESSION_NAME)
         .to_owned()
+}
+
+fn bundled_presets_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("presets")
+}
+
+fn user_presets_dir() -> anyhow::Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve presets directory: HOME is not set"))?;
+    Ok(PathBuf::from(home)
+        .join(".replayproxy")
+        .join(USER_PRESETS_DIR_NAME))
+}
+
+fn validate_preset_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        bail!("preset name cannot be empty");
+    }
+    if name == "." || name == ".." {
+        bail!("preset name `{name}` is invalid");
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        bail!("preset name `{name}` contains invalid characters; use [a-zA-Z0-9._-] only");
+    }
+    Ok(())
+}
+
+fn list_bundled_presets(presets_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let entries = fs::read_dir(presets_dir).map_err(|err| {
+        anyhow::anyhow!(
+            "read bundled presets directory {}: {err}",
+            presets_dir.display()
+        )
+    })?;
+
+    let mut preset_names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            anyhow::anyhow!(
+                "read entry in bundled presets directory {}: {err}",
+                presets_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some(PRESET_FILE_EXTENSION) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        preset_names.push(stem.to_owned());
+    }
+    preset_names.sort();
+    preset_names.dedup();
+    Ok(preset_names)
+}
+
+fn resolve_preset_source_path(name: &str) -> anyhow::Result<PathBuf> {
+    validate_preset_name(name)?;
+
+    let presets_dir = bundled_presets_dir();
+    let source_path = presets_dir.join(format!("{name}.{PRESET_FILE_EXTENSION}"));
+    if source_path.is_file() {
+        return Ok(source_path);
+    }
+
+    let available = list_bundled_presets(&presets_dir)?;
+    let available = if available.is_empty() {
+        "none".to_owned()
+    } else {
+        available.join(", ")
+    };
+    bail!(
+        "unknown preset `{name}` in {} (available: {available})",
+        presets_dir.display()
+    )
 }
 
 fn resolve_admin_addr_for_command(
@@ -803,6 +909,35 @@ fn run_ca_command(command: CaCommand) -> anyhow::Result<CaCommandOutcome> {
     }
 }
 
+fn run_preset_command(command: PresetCommand) -> anyhow::Result<PresetCommandOutcome> {
+    match command {
+        PresetCommand::Import { name } => {
+            let source_path = resolve_preset_source_path(&name)?;
+            let output_dir = user_presets_dir()?;
+            fs::create_dir_all(&output_dir).map_err(|err| {
+                anyhow::anyhow!("create presets directory {}: {err}", output_dir.display())
+            })?;
+
+            let output_path = output_dir.join(format!("{name}.{PRESET_FILE_EXTENSION}"));
+            let overwritten = output_path.exists();
+            fs::copy(&source_path, &output_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "copy preset `{name}` from {} to {}: {err}",
+                    source_path.display(),
+                    output_path.display()
+                )
+            })?;
+
+            Ok(PresetCommandOutcome::Imported {
+                name,
+                source_path,
+                output_path,
+                overwritten,
+            })
+        }
+    }
+}
+
 fn print_session_command_outcome(outcome: SessionCommandOutcome) {
     match outcome {
         SessionCommandOutcome::Listed {
@@ -899,6 +1034,26 @@ fn print_ca_command_outcome(outcome: CaCommandOutcome) {
     }
 }
 
+fn print_preset_command_outcome(outcome: PresetCommandOutcome) {
+    match outcome {
+        PresetCommandOutcome::Imported {
+            name,
+            source_path,
+            output_path,
+            overwritten,
+        } => {
+            println!(
+                "imported preset `{name}` from {} to {}",
+                source_path.display(),
+                output_path.display()
+            );
+            if overwritten {
+                println!("updated existing preset file");
+            }
+        }
+    }
+}
+
 fn print_recording_summaries(recordings: &[RecordingSummary]) {
     println!("id\tmethod\tstatus\turi\tcreated_at_unix_ms");
     for recording in recordings {
@@ -984,6 +1139,10 @@ async fn main() -> anyhow::Result<()> {
             let outcome = run_ca_command(action)?;
             print_ca_command_outcome(outcome);
         }
+        Command::Preset { action } => {
+            let outcome = run_preset_command(action)?;
+            print_preset_command_outcome(outcome);
+        }
     }
 
     Ok(())
@@ -1049,7 +1208,7 @@ mod tests {
     };
 
     use super::{
-        CaCommand, Cli, Command, ModeCommand, ModeCommandOutcome, RecordingCommand,
+        CaCommand, Cli, Command, ModeCommand, ModeCommandOutcome, PresetCommand, RecordingCommand,
         RecordingCommandOutcome, SessionCommand, SessionCommandOutcome, encode_uri_path_segment,
         parse_recording_search_query, redact_active_session, redact_if_present,
         resolve_admin_addr_for_mode, resolve_admin_addr_for_switch, run_mode_command,
@@ -1657,6 +1816,23 @@ listen = "127.0.0.1:8080"
                 input: PathBuf::from("./exports/staging"),
             }
         );
+    }
+
+    #[test]
+    fn preset_import_parses_with_name() {
+        let cli = Cli::try_parse_from(["replayproxy", "preset", "import", "openai"])
+            .expect("cli parse should work");
+        match cli.command {
+            Command::Preset { action } => {
+                assert_eq!(
+                    action,
+                    PresetCommand::Import {
+                        name: "openai".to_owned(),
+                    }
+                );
+            }
+            other => panic!("expected preset command, got {other:?}"),
+        }
     }
 
     #[test]

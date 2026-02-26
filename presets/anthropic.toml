@@ -1,0 +1,26 @@
+# Anthropic-oriented capture/replay preset.
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+mode = "record"
+
+[storage]
+path = "./.replayproxy-data"
+active_session = "anthropic"
+
+[defaults.redact]
+headers = ["x-api-key"]
+body_json = ["$.messages[*].content"]
+placeholder = "<REDACTED>"
+
+[[routes]]
+name = "anthropic-messages"
+path_prefix = "/v1/messages"
+upstream = "https://api.anthropic.com"
+mode = "record"
+
+[routes.match]
+method = true
+path = true
+headers = ["x-api-key"]
+body_json = ["$.model", "$.messages", "$.max_tokens"]

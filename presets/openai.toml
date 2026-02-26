@@ -1,0 +1,27 @@
+# OpenAI-oriented capture/replay preset.
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+mode = "passthrough-cache"
+
+[storage]
+path = "./.replayproxy-data"
+active_session = "openai"
+
+[defaults.redact]
+headers = ["authorization"]
+body_json = ["$.api_key", "$.messages[*].content"]
+placeholder = "<REDACTED>"
+
+[[routes]]
+name = "openai-chat-completions"
+path_prefix = "/v1/chat/completions"
+upstream = "https://api.openai.com"
+mode = "passthrough-cache"
+cache_miss = "forward"
+
+[routes.match]
+method = true
+path = true
+headers = ["authorization"]
+body_json = ["$.model", "$.messages", "$.temperature"]

@@ -213,6 +213,9 @@ replayproxy recording search "GET /api/get" --config ./replayproxy.toml
 replayproxy ca generate
 replayproxy ca install
 replayproxy ca export --out ./replayproxy-ca.pem
+
+# bundled presets
+replayproxy preset import openai
 ```
 
 `mode set` changes the running proxy immediately through `/_admin/mode`; `--persist` also writes

@@ -3575,8 +3575,15 @@ path_prefix = "/api/inherited"
 #[tokio::test]
 async fn record_mode_redacts_configured_response_json_body_before_storage() {
     let upstream_response_body = br#"{"id":"resp-123","usage":{"prompt_tokens":7,"completion_tokens":11},"choices":[{"message":{"role":"assistant","content":"top-secret-1"}},{"message":{"role":"assistant","content":"top-secret-2"}}],"metadata":{"trace_id":"trace-abc"}}"#;
+    let split_one = upstream_response_body.len() / 3;
+    let split_two = (upstream_response_body.len() * 2) / 3;
+    let expected_chunks = vec![
+        Bytes::copy_from_slice(&upstream_response_body[..split_one]),
+        Bytes::copy_from_slice(&upstream_response_body[split_one..split_two]),
+        Bytes::copy_from_slice(&upstream_response_body[split_two..]),
+    ];
     let (upstream_addr, mut upstream_rx, upstream_shutdown) =
-        spawn_upstream_with_response_chunks(vec![Bytes::from_static(upstream_response_body)]).await;
+        spawn_upstream_with_response_chunks(expected_chunks.clone()).await;
 
     let storage_dir = tempfile::tempdir().unwrap();
     let session = "default";
@@ -3669,6 +3676,42 @@ body_json = ["$.usage.prompt_tokens", "$.choices[*].message.content"]
             .and_then(Value::as_str),
         Some("trace-abc")
     );
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT chunk_index, offset_ms, chunk_body
+            FROM recording_response_chunks
+            ORDER BY chunk_index ASC
+            "#,
+        )
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    let mut stored_chunks = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        stored_chunks.push((
+            row.get::<_, i64>(0).unwrap(),
+            row.get::<_, i64>(1).unwrap(),
+            row.get::<_, Vec<u8>>(2).unwrap(),
+        ));
+    }
+
+    assert!(stored_chunks.len() > 1);
+    assert_eq!(stored_chunks.len(), expected_chunks.len());
+    for (index, (stored_index, _, _)) in stored_chunks.iter().enumerate() {
+        assert_eq!(*stored_index, i64::try_from(index).unwrap());
+    }
+    for offsets in stored_chunks.windows(2) {
+        assert!(offsets[0].1 <= offsets[1].1);
+    }
+
+    let reconstructed_chunks = stored_chunks
+        .iter()
+        .flat_map(|(_, _, chunk_body)| chunk_body.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(reconstructed_chunks, stored_response_body);
+    let reconstructed_text = String::from_utf8_lossy(&reconstructed_chunks);
+    assert!(!reconstructed_text.contains("top-secret-1"));
+    assert!(!reconstructed_text.contains("top-secret-2"));
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;

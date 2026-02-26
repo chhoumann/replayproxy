@@ -2347,11 +2347,60 @@ fn response_chunks_for_storage(
         return chunks;
     }
 
-    vec![ResponseChunk {
-        chunk_index: 0,
-        offset_ms: 0,
-        chunk_body: stored_body.to_vec(),
-    }]
+    rechunk_stored_body_preserving_metadata(stored_body, chunks)
+}
+
+fn rechunk_stored_body_preserving_metadata(
+    stored_body: &[u8],
+    chunks: Vec<ResponseChunk>,
+) -> Vec<ResponseChunk> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    let chunk_count = chunks.len();
+    let total_original_len = chunks
+        .iter()
+        .map(|chunk| chunk.chunk_body.len() as u128)
+        .sum::<u128>();
+    let stored_len = stored_body.len();
+    let stored_len_u128 = stored_len as u128;
+
+    // If the original stream body was empty, keep chunk metadata and place the stored body
+    // in the last chunk so replay still emits the original number of chunks in order.
+    if total_original_len == 0 {
+        return chunks
+            .into_iter()
+            .enumerate()
+            .map(|(idx, mut chunk)| {
+                chunk.chunk_body = if idx + 1 == chunk_count {
+                    stored_body.to_vec()
+                } else {
+                    Vec::new()
+                };
+                chunk
+            })
+            .collect();
+    }
+
+    let mut consumed_original_len = 0u128;
+    let mut rechunked = Vec::with_capacity(chunk_count);
+    for (idx, mut chunk) in chunks.into_iter().enumerate() {
+        let chunk_original_len = chunk.chunk_body.len() as u128;
+        let next_consumed_original_len = consumed_original_len.saturating_add(chunk_original_len);
+        let start = ((consumed_original_len * stored_len_u128) / total_original_len) as usize;
+        let end = if idx + 1 == chunk_count {
+            stored_len
+        } else {
+            ((next_consumed_original_len * stored_len_u128) / total_original_len) as usize
+        };
+
+        chunk.chunk_body = stored_body[start..end].to_vec();
+        rechunked.push(chunk);
+        consumed_original_len = next_consumed_original_len;
+    }
+
+    rechunked
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3994,13 +4043,14 @@ mod tests {
         emit_proxy_request_log, format_route_ref, forward_proxy_upstream_uri,
         lookup_recording_for_request_with_subset_limit, mode_log_label,
         normalize_tunneled_https_request_uri, redact_recording_body_json, redact_recording_headers,
-        request_runtime_config_for_path, sanitize_match_key, select_route, summarize_route_diff,
+        request_runtime_config_for_path, response_chunks_for_storage, sanitize_match_key,
+        select_route, summarize_route_diff,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
         RouteMode,
     };
-    use crate::storage::{Recording, Storage};
+    use crate::storage::{Recording, ResponseChunk, Storage};
     use serde_json::Value;
     use tracing_subscriber::{filter::LevelFilter, fmt::MakeWriter};
 
@@ -4573,6 +4623,57 @@ ca_key = "{}"
             !output.contains(&expression),
             "log output leaked raw expression: {output}"
         );
+    }
+
+    #[test]
+    fn response_chunks_for_storage_preserves_chunk_metadata_when_redaction_changes_body() {
+        let original_body = br#"{"secret":"top-secret-1","items":[{"content":"top-secret-2"},{"content":"keep-me"}]}"#;
+        let stored_body =
+            br#"{"secret":"[REDACTED]","items":[{"content":"[REDACTED]"},{"content":"keep-me"}]}"#;
+        let chunks = vec![
+            ResponseChunk {
+                chunk_index: 0,
+                offset_ms: 0,
+                chunk_body: original_body[..26].to_vec(),
+            },
+            ResponseChunk {
+                chunk_index: 1,
+                offset_ms: 7,
+                chunk_body: original_body[26..58].to_vec(),
+            },
+            ResponseChunk {
+                chunk_index: 2,
+                offset_ms: 15,
+                chunk_body: original_body[58..].to_vec(),
+            },
+        ];
+
+        let stored_chunks = response_chunks_for_storage(original_body, stored_body, chunks);
+        assert_eq!(stored_chunks.len(), 3);
+        assert_eq!(
+            stored_chunks
+                .iter()
+                .map(|chunk| chunk.chunk_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            stored_chunks
+                .iter()
+                .map(|chunk| chunk.offset_ms)
+                .collect::<Vec<_>>(),
+            vec![0, 7, 15]
+        );
+
+        let reconstructed = stored_chunks
+            .iter()
+            .flat_map(|chunk| chunk.chunk_body.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(reconstructed, stored_body);
+
+        let stored_text = String::from_utf8_lossy(&reconstructed);
+        assert!(!stored_text.contains("top-secret-1"));
+        assert!(!stored_text.contains("top-secret-2"));
     }
 
     #[test]

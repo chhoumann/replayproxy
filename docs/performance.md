@@ -32,6 +32,8 @@ REPLAYPROXY_PERF_REQUESTS=2000 \
 REPLAYPROXY_PERF_CONCURRENCY=64 \
 REPLAYPROXY_PERF_WARMUP=200 \
 REPLAYPROXY_PERF_RESPONSE_BYTES=4096 \
+REPLAYPROXY_PERF_REPETITIONS=5 \
+REPLAYPROXY_PERF_MAX_CV=0.20 \
 cargo test --test performance_harness -- --ignored --nocapture
 ```
 
@@ -40,10 +42,18 @@ Environment knobs:
 - `REPLAYPROXY_PERF_CONCURRENCY` default `32`: in-flight request cap.
 - `REPLAYPROXY_PERF_WARMUP` default `100`: warmup requests before measured run.
 - `REPLAYPROXY_PERF_RESPONSE_BYTES` default `2048`: upstream response payload size.
+- `REPLAYPROXY_PERF_REPETITIONS` default `3`: number of full harness repetitions.
+- `REPLAYPROXY_PERF_MAX_CV` default `0.20`: max allowed throughput coefficient of variation (CV)
+  for `replay` and `passthrough-cache-warm`. Exceeding this threshold fails the test with a
+  non-zero exit.
 
 ## Output Fields
 
-The harness prints one `perf_result ...` line per scenario. Key fields:
+The harness prints:
+- one `perf_result ...` line per scenario per repetition (single-run metrics stay visible), and
+- one `perf_summary ...` line per scenario with aggregated metrics across repetitions.
+
+Key `perf_result` fields:
 - `scenario`: benchmark scenario name.
 - `requests`: measured request count.
 - `success` / `errors`: status/result correctness counts.
@@ -54,10 +64,18 @@ The harness prints one `perf_result ...` line per scenario. Key fields:
 - `rss_before_kib`, `rss_after_kib`, `rss_delta_kib`, `hwm_after_kib` (Linux best-effort).
 - `cache_hits_total`, `cache_misses_total`, `upstream_requests_total` (from `/_admin/status`).
 
+Key `perf_summary` fields:
+- `runs`: number of repetitions included.
+- `throughput_median_rps`: per-scenario median throughput across runs.
+- `latency_p95_median_ms`: per-scenario median p95 latency across runs.
+- `throughput_min_rps` / `throughput_max_rps` / `throughput_cv`: spread of throughput.
+- `latency_p95_min_ms` / `latency_p95_max_ms` / `latency_p95_cv`: spread of p95 latency.
+
 Example shape:
 
 ```text
-perf_result scenario=replay requests=1000 success=1000 errors=0 throughput_rps=12345.67 total_ms=80.91 latency_avg_ms=2.101 latency_p50_ms=1.722 latency_p95_ms=4.938 latency_p99_ms=7.244 latency_max_ms=15.332 response_bytes_total=2048000 rss_before_kib=91500 rss_after_kib=93240 rss_delta_kib=1740 hwm_after_kib=94012 cache_hits_total=1100 cache_misses_total=0 upstream_requests_total=0
+perf_result repetition=2 repetitions=5 scenario=replay requests=1000 success=1000 errors=0 throughput_rps=12345.67 total_ms=80.91 latency_avg_ms=2.101 latency_p50_ms=1.722 latency_p95_ms=4.938 latency_p99_ms=7.244 latency_max_ms=15.332 response_bytes_total=2048000 rss_before_kib=91500 rss_after_kib=93240 rss_delta_kib=1740 hwm_after_kib=94012 cache_hits_total=1100 cache_misses_total=0 upstream_requests_total=0
+perf_summary scenario=replay runs=5 throughput_median_rps=12123.45 latency_p95_median_ms=5.112 throughput_min_rps=11800.11 throughput_max_rps=12456.78 throughput_cv=0.0213 latency_p95_min_ms=4.938 latency_p95_max_ms=5.491 latency_p95_cv=0.0407
 ```
 
 ## Baseline Snapshot (2026-02-26)
@@ -69,6 +87,7 @@ REPLAYPROXY_PERF_REQUESTS=240 \
 REPLAYPROXY_PERF_CONCURRENCY=24 \
 REPLAYPROXY_PERF_WARMUP=48 \
 REPLAYPROXY_PERF_RESPONSE_BYTES=2048 \
+REPLAYPROXY_PERF_REPETITIONS=1 \
 cargo test --test performance_harness performance_harness_record_replay_passthrough_cache -- --ignored --nocapture
 ```
 
@@ -108,7 +127,7 @@ Optimization implemented:
 Use this harness for regression detection, not absolute cross-machine comparison.
 
 Recommended process:
-1. Run at least 3 times on the same machine and take the median per field.
+1. Use `REPLAYPROXY_PERF_REPETITIONS` (for example `3` or `5`) to gather medians/spread in one run.
 2. Keep baseline artifacts in release notes/PR comments.
 3. Flag regressions when any of the below trigger:
 - `errors > 0` for any scenario.

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     net::SocketAddr,
     path::Path,
@@ -29,6 +30,22 @@ const DEFAULT_REQUEST_COUNT: usize = 1_000;
 const DEFAULT_CONCURRENCY: usize = 32;
 const DEFAULT_WARMUP_COUNT: usize = 100;
 const DEFAULT_RESPONSE_BYTES: usize = 2_048;
+const DEFAULT_REPETITIONS: usize = 3;
+const DEFAULT_MAX_CV: f64 = 0.20;
+
+const SCENARIO_RECORD: &str = "record";
+const SCENARIO_REPLAY: &str = "replay";
+const SCENARIO_PASSTHROUGH_CACHE_COLD: &str = "passthrough-cache-cold";
+const SCENARIO_PASSTHROUGH_CACHE_WARM: &str = "passthrough-cache-warm";
+
+const SCENARIO_ORDER: [&str; 4] = [
+    SCENARIO_RECORD,
+    SCENARIO_REPLAY,
+    SCENARIO_PASSTHROUGH_CACHE_COLD,
+    SCENARIO_PASSTHROUGH_CACHE_WARM,
+];
+
+const STABILITY_CHECK_SCENARIOS: [&str; 2] = [SCENARIO_REPLAY, SCENARIO_PASSTHROUGH_CACHE_WARM];
 
 type BenchClient = Client<HttpConnector, Full<Bytes>>;
 
@@ -41,6 +58,8 @@ async fn performance_harness_record_replay_passthrough_cache() {
         env_usize("REPLAYPROXY_PERF_WARMUP", DEFAULT_WARMUP_COUNT).min(request_count);
     let response_bytes =
         env_usize_nonzero("REPLAYPROXY_PERF_RESPONSE_BYTES", DEFAULT_RESPONSE_BYTES);
+    let repetitions = env_usize_nonzero("REPLAYPROXY_PERF_REPETITIONS", DEFAULT_REPETITIONS);
+    let max_cv_threshold = env_f64_nonnegative("REPLAYPROXY_PERF_MAX_CV", DEFAULT_MAX_CV);
 
     let record_paths = build_paths("/api/perf-record-replay", request_count);
     let replay_paths = record_paths.clone();
@@ -48,13 +67,83 @@ async fn performance_harness_record_replay_passthrough_cache() {
     let cache_paths = build_paths("/api/perf-passthrough-cache", request_count);
     let cache_warmup_paths = cache_paths[..warmup_count].to_vec();
 
+    println!();
+    println!(
+        "perf_harness settings request_count={} concurrency={} warmup_count={} response_bytes={} repetitions={} max_cv_threshold={:.4}",
+        request_count, concurrency, warmup_count, response_bytes, repetitions, max_cv_threshold,
+    );
+
+    let mut reports_by_scenario: BTreeMap<&'static str, Vec<ScenarioReport>> = SCENARIO_ORDER
+        .iter()
+        .copied()
+        .map(|scenario| (scenario, Vec::with_capacity(repetitions)))
+        .collect();
+
+    for repetition in 1..=repetitions {
+        let reports = run_scenarios_once(
+            response_bytes,
+            &warmup_paths,
+            &record_paths,
+            &replay_paths,
+            &cache_paths,
+            &cache_warmup_paths,
+            concurrency,
+        )
+        .await;
+
+        for report in reports {
+            print_perf_result(repetition, repetitions, &report);
+            reports_by_scenario
+                .get_mut(report.name)
+                .expect("all scenario names are pre-registered")
+                .push(report);
+        }
+    }
+
+    println!();
+    let mut summaries = Vec::with_capacity(SCENARIO_ORDER.len());
+    for scenario in SCENARIO_ORDER {
+        let summary = ScenarioSummary::from_reports(
+            scenario,
+            reports_by_scenario
+                .get(scenario)
+                .expect("scenario summary should have reports"),
+        );
+        println!(
+            "perf_summary scenario={} runs={} throughput_median_rps={:.2} latency_p95_median_ms={:.3} throughput_min_rps={:.2} throughput_max_rps={:.2} throughput_cv={:.4} latency_p95_min_ms={:.3} latency_p95_max_ms={:.3} latency_p95_cv={:.4}",
+            summary.name,
+            summary.runs,
+            summary.throughput_median_rps,
+            duration_ms(summary.latency_p95_median),
+            summary.throughput_min_rps,
+            summary.throughput_max_rps,
+            summary.throughput_cv,
+            duration_ms(summary.latency_p95_min),
+            duration_ms(summary.latency_p95_max),
+            summary.latency_p95_cv,
+        );
+        summaries.push(summary);
+    }
+
+    assert_stability(&summaries, max_cv_threshold);
+}
+
+async fn run_scenarios_once(
+    response_bytes: usize,
+    warmup_paths: &[String],
+    record_paths: &[String],
+    replay_paths: &[String],
+    cache_paths: &[String],
+    cache_warmup_paths: &[String],
+    concurrency: usize,
+) -> [ScenarioReport; 4] {
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_root = temp_dir.path().join("storage");
     let upstream = spawn_upstream(Bytes::from(vec![b'x'; response_bytes])).await;
     let upstream_url = format!("http://{}", upstream.addr);
 
     let record_report = benchmark_scenario(
-        "record",
+        SCENARIO_RECORD,
         build_config_toml(
             &storage_root,
             "perf-record-replay",
@@ -62,15 +151,15 @@ async fn performance_harness_record_replay_passthrough_cache() {
             "record",
             None,
         ),
-        &warmup_paths,
-        &record_paths,
+        warmup_paths,
+        record_paths,
         concurrency,
         StatusCode::OK,
     )
     .await;
 
     let replay_report = benchmark_scenario(
-        "replay",
+        SCENARIO_REPLAY,
         build_config_toml(
             &storage_root,
             "perf-record-replay",
@@ -78,8 +167,8 @@ async fn performance_harness_record_replay_passthrough_cache() {
             "replay",
             Some("error"),
         ),
-        &warmup_paths,
-        &replay_paths,
+        warmup_paths,
+        replay_paths,
         concurrency,
         StatusCode::OK,
     )
@@ -90,7 +179,7 @@ async fn performance_harness_record_replay_passthrough_cache() {
     );
 
     let passthrough_cold_report = benchmark_scenario(
-        "passthrough-cache-cold",
+        SCENARIO_PASSTHROUGH_CACHE_COLD,
         build_config_toml(
             &storage_root,
             "perf-passthrough-cache",
@@ -99,14 +188,14 @@ async fn performance_harness_record_replay_passthrough_cache() {
             None,
         ),
         &[],
-        &cache_paths,
+        cache_paths,
         concurrency,
         StatusCode::OK,
     )
     .await;
 
     let passthrough_warm_report = benchmark_scenario(
-        "passthrough-cache-warm",
+        SCENARIO_PASSTHROUGH_CACHE_WARM,
         build_config_toml(
             &storage_root,
             "perf-passthrough-cache",
@@ -114,8 +203,8 @@ async fn performance_harness_record_replay_passthrough_cache() {
             "passthrough-cache",
             None,
         ),
-        &cache_warmup_paths,
-        &cache_paths,
+        cache_warmup_paths,
+        cache_paths,
         concurrency,
         StatusCode::OK,
     )
@@ -133,42 +222,124 @@ async fn performance_harness_record_replay_passthrough_cache() {
         "unexpected upstream request total after benchmark scenarios"
     );
 
-    println!();
-    println!(
-        "perf_harness settings request_count={} concurrency={} warmup_count={} response_bytes={}",
-        request_count, concurrency, warmup_count, response_bytes
-    );
-    for report in [
+    upstream.shutdown().await;
+
+    [
         record_report,
         replay_report,
         passthrough_cold_report,
         passthrough_warm_report,
-    ] {
-        println!(
-            "perf_result scenario={} requests={} success={} errors={} throughput_rps={:.2} total_ms={:.2} latency_avg_ms={:.3} latency_p50_ms={:.3} latency_p95_ms={:.3} latency_p99_ms={:.3} latency_max_ms={:.3} response_bytes_total={} rss_before_kib={} rss_after_kib={} rss_delta_kib={} hwm_after_kib={} cache_hits_total={} cache_misses_total={} upstream_requests_total={}",
-            report.name,
-            report.request_count,
-            report.success_count,
-            report.error_count,
-            report.throughput_rps,
-            duration_ms(report.total_elapsed),
-            duration_ms(report.latency.avg),
-            duration_ms(report.latency.p50),
-            duration_ms(report.latency.p95),
-            duration_ms(report.latency.p99),
-            duration_ms(report.latency.max),
-            report.response_bytes_total,
-            display_opt_u64(report.rss_before_kib),
-            display_opt_u64(report.rss_after_kib),
-            display_opt_i64(report.rss_delta_kib),
-            display_opt_u64(report.hwm_after_kib),
-            report.admin_stats.cache_hits_total,
-            report.admin_stats.cache_misses_total,
-            report.admin_stats.upstream_requests_total,
+    ]
+}
+
+fn print_perf_result(repetition: usize, repetitions: usize, report: &ScenarioReport) {
+    println!(
+        "perf_result repetition={} repetitions={} scenario={} requests={} success={} errors={} throughput_rps={:.2} total_ms={:.2} latency_avg_ms={:.3} latency_p50_ms={:.3} latency_p95_ms={:.3} latency_p99_ms={:.3} latency_max_ms={:.3} response_bytes_total={} rss_before_kib={} rss_after_kib={} rss_delta_kib={} hwm_after_kib={} cache_hits_total={} cache_misses_total={} upstream_requests_total={}",
+        repetition,
+        repetitions,
+        report.name,
+        report.request_count,
+        report.success_count,
+        report.error_count,
+        report.throughput_rps,
+        duration_ms(report.total_elapsed),
+        duration_ms(report.latency.avg),
+        duration_ms(report.latency.p50),
+        duration_ms(report.latency.p95),
+        duration_ms(report.latency.p99),
+        duration_ms(report.latency.max),
+        report.response_bytes_total,
+        display_opt_u64(report.rss_before_kib),
+        display_opt_u64(report.rss_after_kib),
+        display_opt_i64(report.rss_delta_kib),
+        display_opt_u64(report.hwm_after_kib),
+        report.admin_stats.cache_hits_total,
+        report.admin_stats.cache_misses_total,
+        report.admin_stats.upstream_requests_total,
+    );
+}
+
+#[derive(Debug)]
+struct ScenarioSummary {
+    name: &'static str,
+    runs: usize,
+    throughput_median_rps: f64,
+    throughput_min_rps: f64,
+    throughput_max_rps: f64,
+    throughput_cv: f64,
+    latency_p95_median: Duration,
+    latency_p95_min: Duration,
+    latency_p95_max: Duration,
+    latency_p95_cv: f64,
+}
+
+impl ScenarioSummary {
+    fn from_reports(name: &'static str, reports: &[ScenarioReport]) -> Self {
+        assert!(
+            !reports.is_empty(),
+            "cannot summarize empty report set for `{name}`"
+        );
+
+        let throughputs: Vec<f64> = reports.iter().map(|report| report.throughput_rps).collect();
+        let latency_p95_nanos: Vec<u64> = reports
+            .iter()
+            .map(|report| report.latency.p95.as_nanos().min(u128::from(u64::MAX)) as u64)
+            .collect();
+        let latency_p95_as_f64: Vec<f64> = latency_p95_nanos
+            .iter()
+            .map(|value| *value as f64)
+            .collect();
+
+        let throughput_min_rps = throughputs.iter().copied().fold(f64::INFINITY, f64::min);
+        let throughput_max_rps = throughputs
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let latency_p95_min = Duration::from_nanos(
+            *latency_p95_nanos
+                .iter()
+                .min()
+                .expect("latency_p95_nanos cannot be empty"),
+        );
+        let latency_p95_max = Duration::from_nanos(
+            *latency_p95_nanos
+                .iter()
+                .max()
+                .expect("latency_p95_nanos cannot be empty"),
+        );
+
+        Self {
+            name,
+            runs: reports.len(),
+            throughput_median_rps: median_f64(&throughputs),
+            throughput_min_rps,
+            throughput_max_rps,
+            throughput_cv: coefficient_of_variation(&throughputs),
+            latency_p95_median: Duration::from_nanos(median_u64(&latency_p95_nanos)),
+            latency_p95_min,
+            latency_p95_max,
+            latency_p95_cv: coefficient_of_variation(&latency_p95_as_f64),
+        }
+    }
+}
+
+fn assert_stability(summaries: &[ScenarioSummary], max_cv_threshold: f64) {
+    for scenario in STABILITY_CHECK_SCENARIOS {
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.name == scenario)
+            .expect("stability scenario should be present in summaries");
+
+        assert!(
+            summary.throughput_cv <= max_cv_threshold,
+            "stability threshold exceeded for `{scenario}` throughput cv={:.4} threshold={:.4} min_rps={:.2} max_rps={:.2} runs={}",
+            summary.throughput_cv,
+            max_cv_threshold,
+            summary.throughput_min_rps,
+            summary.throughput_max_rps,
+            summary.runs,
         );
     }
-
-    upstream.shutdown().await;
 }
 
 #[derive(Debug)]
@@ -673,6 +844,61 @@ fn env_usize_nonzero(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn env_f64_nonnegative(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(default)
+}
+
+fn median_f64(values: &[f64]) -> f64 {
+    assert!(!values.is_empty(), "median input must not be empty");
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap());
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
+}
+
+fn median_u64(values: &[u64]) -> u64 {
+    assert!(!values.is_empty(), "median input must not be empty");
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        let pair_sum = u128::from(sorted[mid - 1]) + u128::from(sorted[mid]);
+        (pair_sum / 2).min(u128::from(u64::MAX)) as u64
+    } else {
+        sorted[mid]
+    }
+}
+
+fn coefficient_of_variation(values: &[f64]) -> f64 {
+    assert!(!values.is_empty(), "coefficient input must not be empty");
+    if values.len() < 2 {
+        return 0.0;
+    }
+
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if mean == 0.0 {
+        return 0.0;
+    }
+
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt() / mean.abs()
 }
 
 fn percentile_nanos(sorted: &[u64], percentile: u32) -> u64 {

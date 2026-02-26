@@ -1246,8 +1246,8 @@ mod tests {
     use clap::Parser;
     use replayproxy::{
         config::{Config, RouteMode},
-        session_export::SessionExportFormat,
-        storage::{Recording, RecordingSearch, SessionManager, Storage},
+        session_export::{CURRENT_EXPORT_MANIFEST_VERSION, SessionExportFormat},
+        storage::{Recording, RecordingSearch, ResponseChunk, SessionManager, Storage},
     };
     use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
@@ -1357,6 +1357,8 @@ active_session = "{active_session}"
     struct ExportedRecordingDocument {
         #[serde(flatten)]
         recording: Recording,
+        #[serde(default)]
+        response_chunks: Vec<ResponseChunk>,
     }
 
     #[derive(Debug, Serialize)]
@@ -1383,6 +1385,8 @@ active_session = "{active_session}"
         id: i64,
         #[serde(flatten)]
         recording: Recording,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        response_chunks: Vec<ResponseChunk>,
     }
 
     fn header_value<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
@@ -1390,6 +1394,215 @@ active_session = "{active_session}"
             .iter()
             .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_slice())
+    }
+
+    fn serialize_export_fixture<T: Serialize>(format: SessionExportFormat, value: &T) -> Vec<u8> {
+        match format {
+            SessionExportFormat::Json => {
+                serde_json::to_vec_pretty(value).expect("json fixture should serialize")
+            }
+            SessionExportFormat::Yaml => serde_yaml::to_string(value)
+                .expect("yaml fixture should serialize")
+                .into_bytes(),
+        }
+    }
+
+    async fn assert_session_export_import_preserves_response_chunks(format: SessionExportFormat) {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager should initialize")
+            .expect("storage should be configured");
+        manager
+            .create_session("default")
+            .await
+            .expect("default session should be created");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should be created");
+
+        let default_storage = manager
+            .open_session_storage("default")
+            .await
+            .expect("default storage should open");
+        let mut recording = recording_fixture("stream-key", "GET", "/v1/stream", 4242);
+        recording.response_headers =
+            vec![("content-type".to_owned(), b"text/event-stream".to_vec())];
+        recording.response_body = b"data: first\n\ndata: second\n\ndata: done\n\n".to_vec();
+        let recording_id = default_storage
+            .insert_recording(recording)
+            .await
+            .expect("insert should succeed");
+        let expected_chunks = vec![
+            ResponseChunk {
+                chunk_index: 0,
+                offset_ms: 0,
+                chunk_body: b"data: first\n\n".to_vec(),
+            },
+            ResponseChunk {
+                chunk_index: 1,
+                offset_ms: 120,
+                chunk_body: b"data: second\n\n".to_vec(),
+            },
+            ResponseChunk {
+                chunk_index: 2,
+                offset_ms: 260,
+                chunk_body: b"data: done\n\n".to_vec(),
+            },
+        ];
+        default_storage
+            .insert_response_chunks(recording_id, expected_chunks.clone())
+            .await
+            .expect("response chunks should insert");
+
+        let export_dir = temp_dir
+            .path()
+            .join("exports")
+            .join(format!("default-{format}"));
+        let outcome = run_session_command(
+            &config,
+            SessionCommand::Export {
+                name: "default".to_owned(),
+                out: Some(export_dir.clone()),
+                format,
+            },
+        )
+        .await
+        .expect("session export should succeed");
+        let result = match outcome {
+            SessionCommandOutcome::Exported { result } => result,
+            other => panic!("expected exported outcome, got {other:?}"),
+        };
+        assert_eq!(result.recordings_exported, 1);
+
+        let manifest_bytes = fs::read(&result.manifest_path).expect("manifest should be readable");
+        let manifest: serde_json::Value =
+            match format {
+                SessionExportFormat::Json => serde_json::from_slice(&manifest_bytes)
+                    .expect("json manifest should deserialize"),
+                SessionExportFormat::Yaml => serde_yaml::from_slice(&manifest_bytes)
+                    .expect("yaml manifest should deserialize"),
+            };
+        assert_eq!(
+            manifest["version"].as_u64(),
+            Some(u64::from(CURRENT_EXPORT_MANIFEST_VERSION))
+        );
+
+        let import_outcome = run_session_command(
+            &config,
+            SessionCommand::Import {
+                name: "staging".to_owned(),
+                input: export_dir,
+            },
+        )
+        .await
+        .expect("session import should succeed");
+        let import_result = match import_outcome {
+            SessionCommandOutcome::Imported { result } => result,
+            other => panic!("expected imported outcome, got {other:?}"),
+        };
+        assert_eq!(import_result.recordings_imported, 1);
+
+        let staging_storage = manager
+            .open_session_storage("staging")
+            .await
+            .expect("staging storage should open");
+        let summaries = staging_storage
+            .list_recordings(0, 10)
+            .await
+            .expect("staging recordings should list");
+        assert_eq!(summaries.len(), 1);
+
+        let imported_chunks = staging_storage
+            .get_response_chunks(summaries[0].id)
+            .await
+            .expect("imported response chunks should load");
+        assert_eq!(imported_chunks, expected_chunks);
+    }
+
+    async fn assert_session_import_accepts_v1_export_without_response_chunks(
+        format: SessionExportFormat,
+    ) {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager should initialize")
+            .expect("storage should be configured");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should be created");
+
+        let import_dir = temp_dir.path().join(format!("legacy-v1-{format}"));
+        fs::create_dir_all(import_dir.join("recordings")).expect("recordings dir should exist");
+
+        let recording = recording_fixture("legacy-key", "GET", "/v1/models", 7);
+        let relative_recording_path = format!(
+            "recordings/0001-get-v1-models-id1.{}",
+            format.recording_file_extension()
+        );
+        let recording_document = ImportRecordingDocument {
+            id: 1,
+            recording,
+            response_chunks: Vec::new(),
+        };
+        fs::write(
+            import_dir.join(&relative_recording_path),
+            serialize_export_fixture(format, &recording_document),
+        )
+        .expect("recording file should be written");
+
+        let manifest = ImportManifest {
+            version: 1,
+            session: "legacy".to_owned(),
+            format,
+            exported_at_unix_ms: 0,
+            recordings: vec![ImportManifestEntry {
+                id: 1,
+                file: relative_recording_path,
+                request_method: "GET".to_owned(),
+                request_uri: "/v1/models".to_owned(),
+                response_status: 200,
+                created_at_unix_ms: 7,
+            }],
+        };
+        fs::write(
+            import_dir.join(format.manifest_file_name()),
+            serialize_export_fixture(format, &manifest),
+        )
+        .expect("manifest should be written");
+
+        let outcome = run_session_command(
+            &config,
+            SessionCommand::Import {
+                name: "staging".to_owned(),
+                input: import_dir,
+            },
+        )
+        .await
+        .expect("v1 import should succeed");
+        let result = match outcome {
+            SessionCommandOutcome::Imported { result } => result,
+            other => panic!("expected imported outcome, got {other:?}"),
+        };
+        assert_eq!(result.format, format);
+        assert_eq!(result.recordings_imported, 1);
+
+        let staging_storage = manager
+            .open_session_storage("staging")
+            .await
+            .expect("staging storage should open");
+        let summaries = staging_storage
+            .list_recordings(0, 10)
+            .await
+            .expect("imported recordings should list");
+        assert_eq!(summaries.len(), 1);
+        let chunks = staging_storage
+            .get_response_chunks(summaries[0].id)
+            .await
+            .expect("v1 import should not fail chunk lookup");
+        assert!(chunks.is_empty());
     }
 
     #[test]
@@ -2395,6 +2608,10 @@ mode = "record"
         let manifest_bytes = std::fs::read(&result.manifest_path).expect("manifest should exist");
         let manifest: serde_json::Value =
             serde_json::from_slice(&manifest_bytes).expect("manifest should be JSON");
+        assert_eq!(
+            manifest["version"].as_u64(),
+            Some(u64::from(CURRENT_EXPORT_MANIFEST_VERSION))
+        );
         assert_eq!(manifest["session"].as_str(), Some("default"));
         assert_eq!(manifest["format"].as_str(), Some("json"));
         assert_eq!(manifest["recordings"].as_array().map(Vec::len), Some(2));
@@ -2463,6 +2680,7 @@ mode = "record"
         let recording_bytes = fs::read(entries[0].path()).expect("recording should be readable");
         let exported: ExportedRecordingDocument =
             serde_json::from_slice(&recording_bytes).expect("recording should parse");
+        assert!(exported.response_chunks.is_empty());
 
         assert_eq!(
             header_value(&exported.recording.request_headers, "authorization"),
@@ -2510,6 +2728,28 @@ mode = "record"
                 .and_then(serde_json::Value::as_str),
             Some("ok")
         );
+    }
+
+    #[tokio::test]
+    async fn session_export_import_round_trip_preserves_response_chunks_json() {
+        assert_session_export_import_preserves_response_chunks(SessionExportFormat::Json).await;
+    }
+
+    #[tokio::test]
+    async fn session_export_import_round_trip_preserves_response_chunks_yaml() {
+        assert_session_export_import_preserves_response_chunks(SessionExportFormat::Yaml).await;
+    }
+
+    #[tokio::test]
+    async fn session_import_accepts_v1_json_exports_without_response_chunks() {
+        assert_session_import_accepts_v1_export_without_response_chunks(SessionExportFormat::Json)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn session_import_accepts_v1_yaml_exports_without_response_chunks() {
+        assert_session_import_accepts_v1_export_without_response_chunks(SessionExportFormat::Yaml)
+            .await;
     }
 
     #[tokio::test]
@@ -2689,6 +2929,7 @@ mode = "record"
         let recording_document = ImportRecordingDocument {
             id: 1,
             recording: legacy_recording,
+            response_chunks: Vec::new(),
         };
         fs::write(
             import_dir.join(relative_recording_path),

@@ -1,4 +1,4 @@
-# Session Export Format (v1)
+# Session Export Format (v2)
 
 This document defines the stable on-disk export format used by:
 
@@ -42,7 +42,7 @@ Notes:
 ## Manifest Schema (`index.json` / `index.yaml`)
 
 Required top-level fields:
-- `version` (`number`): format version. Current value is `1`.
+- `version` (`number`): manifest version. Current value is `2`.
 - `session` (`string`): exported session name.
 - `format` (`string`): serialization format (`"json"` or `"yaml"`).
 - `exported_at_unix_ms` (`number`): export timestamp in Unix milliseconds.
@@ -60,7 +60,7 @@ Example (JSON, abridged):
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "session": "default",
   "format": "json",
   "exported_at_unix_ms": 1767066000123,
@@ -94,6 +94,21 @@ Each recording file is an object with required fields:
 `request_headers` and `response_headers` are arrays of `[name, value]` pairs where `value` is bytes.
 
 `request_body` and `response_body` are raw bytes serialized in the selected format.
+
+Optional fields:
+- `response_chunks` (`array`): streaming replay metadata. Present when the source recording has stored response chunks.
+  - `chunk_index` (`number`): zero-based chunk order.
+  - `offset_ms` (`number`): elapsed milliseconds from stream start.
+  - `chunk_body` (`bytes`): response bytes for the chunk.
+
+When `response_chunks` is missing or empty, replay falls back to non-stream chunked-body reconstruction.
+
+## Versioning And Compatibility
+
+- Export currently writes manifest `version: 2`.
+- Import accepts both `version: 1` and `version: 2`.
+- `version: 1` bundles do not include `response_chunks`.
+- `version: 2` bundles may include optional `response_chunks` per recording.
 
 ## Deterministic Ordering And Filenames
 

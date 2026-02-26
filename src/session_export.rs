@@ -9,10 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     legacy_redaction, session,
-    storage::{Recording, SessionManager, SessionManagerError, Storage},
+    storage::{Recording, ResponseChunk, SessionManager, SessionManagerError, Storage},
 };
 
 const EXPORT_LIST_PAGE_SIZE: usize = 256;
+pub const EXPORT_MANIFEST_VERSION_V1: u32 = 1;
+pub const EXPORT_MANIFEST_VERSION_V2: u32 = 2;
+pub const CURRENT_EXPORT_MANIFEST_VERSION: u32 = EXPORT_MANIFEST_VERSION_V2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -112,6 +115,7 @@ impl From<SessionManagerError> for SessionExportError {
 struct ExportRecording {
     id: i64,
     recording: Recording,
+    response_chunks: Vec<ResponseChunk>,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +142,8 @@ struct ExportRecordingDocument {
     id: i64,
     #[serde(flatten)]
     recording: Recording,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    response_chunks: Vec<ResponseChunk>,
 }
 
 pub async fn export_session(
@@ -240,24 +246,30 @@ fn write_export(
 
     let mut manifest_entries = Vec::with_capacity(recordings.len());
     for (index, export_recording) in recordings.into_iter().enumerate() {
+        let ExportRecording {
+            id,
+            recording,
+            response_chunks,
+        } = export_recording;
         let file_name = recording_file_name(
             index,
-            export_recording.id,
-            &export_recording.recording.request_method,
-            &export_recording.recording.request_uri,
+            id,
+            &recording.request_method,
+            &recording.request_uri,
             format,
         );
         let relative_file = Path::new("recordings").join(&file_name);
         let file_path = output_dir.join(&relative_file);
 
-        let request_method = export_recording.recording.request_method.clone();
-        let request_uri = export_recording.recording.request_uri.clone();
-        let response_status = export_recording.recording.response_status;
-        let created_at_unix_ms = export_recording.recording.created_at_unix_ms;
+        let request_method = recording.request_method.clone();
+        let request_uri = recording.request_uri.clone();
+        let response_status = recording.response_status;
+        let created_at_unix_ms = recording.created_at_unix_ms;
 
         let document = ExportRecordingDocument {
-            id: export_recording.id,
-            recording: export_recording.recording,
+            id,
+            recording,
+            response_chunks,
         };
         let document_bytes = serialize_export_bytes(format, &document).map_err(|err| {
             SessionExportError::Internal(format!(
@@ -283,7 +295,7 @@ fn write_export(
     }
 
     let manifest = ExportManifest {
-        version: 1,
+        version: CURRENT_EXPORT_MANIFEST_VERSION,
         session: session_name.to_owned(),
         format,
         exported_at_unix_ms,
@@ -349,9 +361,19 @@ async fn collect_recordings_for_export(
             })?;
         let mut recording = recording;
         legacy_redaction::scrub_recording_for_legacy_redaction(&mut recording);
+        let response_chunks = storage
+            .get_response_chunks(summary.id)
+            .await
+            .map_err(|err| {
+                SessionExportError::Internal(format!(
+                    "read response chunks for recording `{}` from session `{session_name}`: {err}",
+                    summary.id
+                ))
+            })?;
         recordings.push(ExportRecording {
             id: summary.id,
             recording,
+            response_chunks,
         });
     }
 

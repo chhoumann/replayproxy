@@ -59,7 +59,7 @@ pub struct Recording {
     pub created_at_unix_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ResponseChunk {
     pub chunk_index: u32,
     pub offset_ms: u64,

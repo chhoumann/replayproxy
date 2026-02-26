@@ -2916,7 +2916,7 @@ active_session = "{session_name}"
     fs::create_dir_all(&bad_manifest_dir).unwrap();
     fs::write(
         bad_manifest_dir.join("index.json"),
-        br#"{"version":2,"session":"default","format":"json","exported_at_unix_ms":0,"recordings":[]}"#,
+        br#"{"version":3,"session":"default","format":"json","exported_at_unix_ms":0,"recordings":[]}"#,
     )
     .unwrap();
     let bad_import_payload = serde_json::json!({

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     legacy_redaction, session,
-    session_export::SessionExportFormat,
-    storage::{Recording, SessionManager, SessionManagerError},
+    session_export::{EXPORT_MANIFEST_VERSION_V1, EXPORT_MANIFEST_VERSION_V2, SessionExportFormat},
+    storage::{Recording, ResponseChunk, SessionManager, SessionManagerError},
 };
 
 #[derive(Debug, Clone)]
@@ -81,6 +81,8 @@ struct ImportRecordingDocument {
     id: i64,
     #[serde(flatten)]
     recording: Recording,
+    #[serde(default)]
+    response_chunks: Vec<ResponseChunk>,
 }
 
 #[derive(Debug)]
@@ -94,6 +96,7 @@ struct ParsedImport {
 struct ParsedImportRecording {
     source: String,
     recording: Recording,
+    response_chunks: Vec<ResponseChunk>,
 }
 
 pub async fn import_session(
@@ -119,9 +122,10 @@ pub async fn import_session(
             SessionImportError::Internal(format!("join import parse task failed: {err}"))
         })??;
 
-    for parsed_recording in &parsed_import.recordings {
-        storage
-            .insert_recording(parsed_recording.recording.clone())
+    let recordings_imported = parsed_import.recordings.len();
+    for parsed_recording in parsed_import.recordings {
+        let recording_id = storage
+            .insert_recording(parsed_recording.recording)
             .await
             .map_err(|err| {
                 SessionImportError::Internal(format!(
@@ -129,6 +133,17 @@ pub async fn import_session(
                     parsed_recording.source, session_name
                 ))
             })?;
+        if !parsed_recording.response_chunks.is_empty() {
+            storage
+                .insert_response_chunks(recording_id, parsed_recording.response_chunks)
+                .await
+                .map_err(|err| {
+                    SessionImportError::Internal(format!(
+                        "insert response chunks from `{}` into session `{}`: {err}",
+                        parsed_recording.source, session_name
+                    ))
+                })?;
+        }
     }
 
     Ok(SessionImportResult {
@@ -137,7 +152,7 @@ pub async fn import_session(
         format: parsed_import.format,
         input_dir: in_dir,
         manifest_path: parsed_import.manifest_path,
-        recordings_imported: parsed_import.recordings.len(),
+        recordings_imported,
     })
 }
 
@@ -158,11 +173,13 @@ fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError
         }
         validate_recording_file_extension(&entry.file, manifest.format)?;
         let recording_path = resolve_recording_path(in_dir, &entry.file)?;
-        let mut recording = read_recording_document(&recording_path, entry, manifest.format)?;
-        legacy_redaction::scrub_recording_for_legacy_redaction(&mut recording);
+        let mut document = read_recording_document(&recording_path, entry, manifest.format)?;
+        legacy_redaction::scrub_recording_for_legacy_redaction(&mut document.recording);
+        let response_chunks = document.response_chunks;
         recordings.push(ParsedImportRecording {
             source: recording_path.to_string_lossy().into_owned(),
-            recording,
+            recording: document.recording,
+            response_chunks,
         });
     }
 
@@ -205,10 +222,13 @@ fn validate_manifest(
     manifest: &ImportManifest,
     manifest_path: &Path,
 ) -> Result<(), SessionImportError> {
-    if manifest.version != 1 {
+    if !matches!(
+        manifest.version,
+        EXPORT_MANIFEST_VERSION_V1 | EXPORT_MANIFEST_VERSION_V2
+    ) {
         return Err(SessionImportError::InvalidRequest(format!(
-            "unsupported export manifest version `{}`; expected `1`",
-            manifest.version
+            "unsupported export manifest version `{}`; expected `1` or `2`",
+            manifest.version,
         )));
     }
 
@@ -239,7 +259,7 @@ fn read_recording_document(
     recording_path: &Path,
     entry: &ImportManifestEntry,
     format: SessionExportFormat,
-) -> Result<Recording, SessionImportError> {
+) -> Result<ImportRecordingDocument, SessionImportError> {
     let recording_bytes = read_bundle_file(recording_path, "recording")?;
     let document: ImportRecordingDocument =
         deserialize_import_bytes(format, &recording_bytes, "recording", recording_path)?;
@@ -289,7 +309,7 @@ fn read_recording_document(
         )));
     }
 
-    Ok(document.recording)
+    Ok(document)
 }
 
 fn resolve_recording_path(

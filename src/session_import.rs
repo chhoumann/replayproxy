@@ -715,10 +715,7 @@ mod tests {
         let escaped_recordings_dir = temp_dir.path().join("escaped-recordings");
         fs::create_dir_all(&import_dir).expect("import dir should be created");
         fs::create_dir_all(&escaped_recordings_dir).expect("escaped dir should be created");
-        symlink_dir(
-            &escaped_recordings_dir,
-            &import_dir.join("recordings"),
-        );
+        symlink_dir(&escaped_recordings_dir, &import_dir.join("recordings"));
 
         let recording = recording_fixture("symlink-escape", "/v1/chat/completions", 42);
         let request_method = recording.request_method.clone();

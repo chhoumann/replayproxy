@@ -764,12 +764,7 @@ impl RecordTokenBucket {
                 debug_assert!(delay.is_zero());
                 Ok(())
             }
-            Err(RecordRateLimitRejection::QueueTimeoutExceeded { required_delay, .. }) => {
-                Err(required_delay)
-            }
-            Err(RecordRateLimitRejection::QueueDepthExceeded { .. }) => {
-                unreachable!("queue depth is disabled for replay reservation")
-            }
+            Err(rejection) => Err(replay_rejection_required_delay(rejection)),
         }
     }
 }
@@ -789,6 +784,19 @@ enum RecordRateLimitRejection {
         timeout: Duration,
         required_delay: Duration,
     },
+}
+
+fn replay_rejection_required_delay(rejection: RecordRateLimitRejection) -> Duration {
+    match rejection {
+        RecordRateLimitRejection::QueueTimeoutExceeded { required_delay, .. } => required_delay,
+        RecordRateLimitRejection::QueueDepthExceeded { queue_depth } => {
+            tracing::error!(
+                queue_depth,
+                "unexpected replay queue-depth rejection while queue depth is disabled"
+            );
+            Duration::ZERO
+        }
+    }
 }
 
 fn reserve_delay_for_bucket_with_limits(
@@ -7254,6 +7262,25 @@ mod tests {
             second_retry_after < Duration::from_millis(1100),
             "rejected replay requests should not consume additional tokens"
         );
+    }
+
+    #[test]
+    fn replay_rejection_required_delay_returns_timeout_delay() {
+        let delay = super::replay_rejection_required_delay(
+            super::RecordRateLimitRejection::QueueTimeoutExceeded {
+                timeout: Duration::from_millis(100),
+                required_delay: Duration::from_secs(1),
+            },
+        );
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn replay_rejection_required_delay_gracefully_handles_queue_depth_rejection() {
+        let delay = super::replay_rejection_required_delay(
+            super::RecordRateLimitRejection::QueueDepthExceeded { queue_depth: 2 },
+        );
+        assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]

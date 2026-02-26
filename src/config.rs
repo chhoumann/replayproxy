@@ -382,6 +382,8 @@ pub struct LoggingConfig {
     pub level: Option<String>,
     #[serde(default)]
     pub format: Option<LogFormat>,
+    #[serde(default)]
+    pub request_url: Option<RequestUrlLogMode>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -389,6 +391,14 @@ pub struct LoggingConfig {
 pub enum LogFormat {
     Json,
     Pretty,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestUrlLogMode {
+    Full,
+    Path,
+    Redacted,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -966,7 +976,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Config, LogFormat, RouteMode, WebSocketRecordingMode};
+    use super::{Config, LogFormat, RequestUrlLogMode, RouteMode, WebSocketRecordingMode};
     use tempfile::tempdir;
 
     #[test]
@@ -989,6 +999,7 @@ active_session = "default"
 [logging]
 level = "info"
 format = "json"
+request_url = "path"
 
 [metrics]
 enabled = true
@@ -1096,6 +1107,7 @@ recording_mode = "server-only"
         let logging = config.logging.as_ref().unwrap();
         assert_eq!(logging.level.as_deref(), Some("info"));
         assert_eq!(logging.format, Some(LogFormat::Json));
+        assert_eq!(logging.request_url, Some(RequestUrlLogMode::Path));
 
         assert_eq!(config.routes.len(), 4);
 
@@ -1164,6 +1176,52 @@ wat = 123
 
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "err: {err}");
+    }
+
+    #[test]
+    fn logging_request_url_modes_parse() {
+        for (raw_mode, expected_mode) in [
+            ("full", RequestUrlLogMode::Full),
+            ("path", RequestUrlLogMode::Path),
+            ("redacted", RequestUrlLogMode::Redacted),
+        ] {
+            let toml = format!(
+                r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[logging]
+request_url = "{raw_mode}"
+"#
+            );
+            let config = Config::from_toml_str(toml.as_str()).expect("config should parse");
+            assert_eq!(
+                config
+                    .logging
+                    .as_ref()
+                    .and_then(|logging| logging.request_url),
+                Some(expected_mode),
+                "raw_mode={raw_mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_request_url_invalid_value_fails_fast() {
+        let err = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[logging]
+request_url = "queryless"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("request_url"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

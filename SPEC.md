@@ -262,8 +262,9 @@ Acceptance expectations:
   │   └── ...
   ```
 - Import from exported directories back into SQLite.
-- Canonical v1 schema details (manifest required fields + deterministic naming rules) live in
+- Canonical v2 schema details (manifest fields + deterministic naming rules) live in
   `docs/session-export-format.md`.
+- Import compatibility: both v1 and v2 manifest bundles are accepted.
 
 ---
 
@@ -278,7 +279,7 @@ A companion CLI (`replayproxy`) with subcommands:
 | `replayproxy session create <name>` | Create a new session |
 | `replayproxy session delete <name>` | Delete a session and its recordings |
 | `replayproxy session export <name> --format <json\|yaml> --out ./dir` | Export session to files |
-| `replayproxy session import <dir>` | Import session from exported files |
+| `replayproxy session import <name> --in ./dir` | Import files into an existing session |
 | `replayproxy recording list [--session <name>]` | List recordings in a session |
 | `replayproxy recording search <query>` | Search recordings by URL, method, body content |
 | `replayproxy recording delete <id>` | Delete a specific recording |
@@ -339,9 +340,10 @@ Located at `./replayproxy.toml` or `~/.replayproxy/config.toml` (with CLI `--con
 
 ### Hot reload
 
-- Watch the config file for changes using filesystem notifications (`notify` crate).
-- Automatically reload matching rules, routes, and transforms without restarting the proxy.
+- In default builds (`watch` feature enabled), watch the config file for changes using filesystem notifications (`notify` crate).
+- Automatically reload matching rules, routes, and transforms without restarting the proxy when file watch support is enabled.
 - Log a summary of what changed on each reload.
+- In builds without `watch`, file-watch reload is unavailable; use `POST /_admin/config/reload` for explicit reload requests.
 
 ### Full example
 
@@ -365,6 +367,7 @@ active_session = "default"
 [logging]
 level = "info"
 format = "json"                      # "json" or "pretty"
+request_url = "path"                # "path" (default), "full", or "redacted"
 
 [metrics]
 enabled = true

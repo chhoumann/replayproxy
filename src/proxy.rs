@@ -62,8 +62,8 @@ use crate::{
     ca,
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, GrpcConfig, QueryMatchMode, RateLimitConfig,
-        RedactConfig, RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig,
-        WebSocketConfig, WebSocketRecordingMode, grpc_match_field_to_json_path,
+        RedactConfig, RequestUrlLogMode, RouteMatchConfig, RouteMode, StreamingConfig,
+        TransformConfig, WebSocketConfig, WebSocketRecordingMode, grpc_match_field_to_json_path,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
@@ -98,6 +98,7 @@ const DURATION_HISTOGRAM_BUCKETS: [(&str, u64); 12] = [
     ("5", 5_000_000),
     ("10", 10_000_000),
 ];
+const RECORDINGS_TOTALS_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct ProxyHandle {
@@ -183,6 +184,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let mitm_tls = build_mitm_tls_state(config)?;
     let runtime_mode_override = Arc::new(RwLock::new(None));
     let record_rate_limiters = Arc::new(RecordRateLimiterRegistry::default());
+    let request_url_log_mode = resolve_request_url_log_mode(config);
 
     let state = Arc::new(ProxyState::new(
         Arc::clone(&runtime_config),
@@ -191,6 +193,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         Arc::clone(&runtime_status),
         Arc::clone(&session_runtime),
         Arc::clone(&runtime_mode_override),
+        request_url_log_mode,
         mitm_tls,
         Arc::clone(&record_rate_limiters),
     ));
@@ -289,6 +292,14 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         config_watcher_shutdown_tx,
         config_watcher_join,
     })
+}
+
+fn resolve_request_url_log_mode(config: &Config) -> RequestUrlLogMode {
+    config
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.request_url)
+        .unwrap_or(RequestUrlLogMode::Path)
 }
 
 fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {
@@ -520,6 +531,7 @@ struct GrpcProtoAwareMatchInput {
 #[derive(Debug, Clone)]
 struct ProxyRuntimeConfig {
     routes: Vec<ProxyRoute>,
+    default_mode: RouteMode,
     max_body_bytes: usize,
 }
 
@@ -701,8 +713,16 @@ fn queued_requests_from_available_tokens(available_tokens: f64) -> usize {
     (-available_tokens).ceil() as usize
 }
 
+fn route_cache_miss_policy_for_mode(mode: RouteMode) -> CacheMissPolicy {
+    match mode {
+        RouteMode::Replay => CacheMissPolicy::Error,
+        RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
+    }
+}
+
 impl ProxyRuntimeConfig {
     fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let default_mode = config.proxy.mode.unwrap_or(RouteMode::PassthroughCache);
         let mut parsed_routes = Vec::with_capacity(config.routes.len());
         for (idx, route) in config.routes.iter().enumerate() {
             let route_ref = format_route_ref(route, idx);
@@ -721,14 +741,10 @@ impl ProxyRuntimeConfig {
                     None => None,
                 };
 
-            let mode = route
-                .mode
-                .or(config.proxy.mode)
-                .unwrap_or(RouteMode::PassthroughCache);
-            let cache_miss = route.cache_miss.unwrap_or(match mode {
-                RouteMode::Replay => CacheMissPolicy::Error,
-                RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
-            });
+            let mode = route.mode.unwrap_or(default_mode);
+            let cache_miss = route
+                .cache_miss
+                .unwrap_or(route_cache_miss_policy_for_mode(mode));
             parsed_routes.push(ProxyRoute {
                 route_ref: route_ref.clone(),
                 path_prefix: route.path_prefix.clone(),
@@ -758,6 +774,7 @@ impl ProxyRuntimeConfig {
 
         Ok(Self {
             routes: parsed_routes,
+            default_mode,
             max_body_bytes: config.proxy.max_body_bytes,
         })
     }
@@ -1113,6 +1130,7 @@ struct RuntimeStatus {
     active_connections: AtomicU64,
     active_session_recordings_total: AtomicU64,
     metrics_state: Mutex<RuntimeMetricsState>,
+    recordings_totals_cache: Mutex<RecordingsTotalsCache>,
 }
 
 #[derive(Debug)]
@@ -1437,6 +1455,31 @@ impl RuntimeMetricsState {
     }
 }
 
+#[derive(Debug, Default)]
+struct RecordingsTotalsCache {
+    totals: Vec<(String, u64)>,
+    refreshed_at: Option<Instant>,
+}
+
+impl RecordingsTotalsCache {
+    fn get_if_fresh(&self, max_age: Duration) -> Option<Vec<(String, u64)>> {
+        let refreshed_at = self.refreshed_at?;
+        if refreshed_at.elapsed() > max_age {
+            return None;
+        }
+        Some(self.totals.clone())
+    }
+
+    fn set(&mut self, totals: Vec<(String, u64)>) {
+        self.totals = totals;
+        self.refreshed_at = Some(Instant::now());
+    }
+
+    fn invalidate(&mut self) {
+        self.refreshed_at = None;
+    }
+}
+
 #[derive(Debug)]
 struct ActiveConnectionGuard {
     status: Arc<RuntimeStatus>,
@@ -1477,6 +1520,7 @@ impl RuntimeStatus {
             active_connections: AtomicU64::new(0),
             active_session_recordings_total: AtomicU64::new(initial_recordings_total),
             metrics_state: Mutex::new(RuntimeMetricsState::new()),
+            recordings_totals_cache: Mutex::new(RecordingsTotalsCache::default()),
         }
     }
 
@@ -1529,11 +1573,13 @@ impl RuntimeStatus {
     fn set_active_session_recordings_total(&self, total: u64) {
         self.active_session_recordings_total
             .store(total, Ordering::Relaxed);
+        self.invalidate_recordings_totals_cache();
     }
 
     fn increment_active_session_recordings_total(&self) {
         self.active_session_recordings_total
             .fetch_add(1, Ordering::Relaxed);
+        self.invalidate_recordings_totals_cache();
     }
 
     fn set_routes_configured(&self, count: usize) {
@@ -1546,10 +1592,32 @@ impl RuntimeStatus {
             Ordering::Relaxed,
             |value| value.checked_sub(1),
         );
+        self.invalidate_recordings_totals_cache();
     }
 
     fn active_session_recordings_total(&self) -> u64 {
         self.active_session_recordings_total.load(Ordering::Relaxed)
+    }
+
+    fn cached_recordings_totals(&self) -> Option<Vec<(String, u64)>> {
+        self.recordings_totals_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_if_fresh(RECORDINGS_TOTALS_CACHE_TTL)
+    }
+
+    fn set_recordings_totals_cache(&self, totals: Vec<(String, u64)>) {
+        self.recordings_totals_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set(totals);
+    }
+
+    fn invalidate_recordings_totals_cache(&self) {
+        self.recordings_totals_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate();
     }
 
     fn observe_proxy_request(&self, mode: Option<RouteMode>, method: &str, status: StatusCode) {
@@ -2000,6 +2068,7 @@ struct ProxyState {
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     status: Arc<RuntimeStatus>,
     runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
+    request_url_log_mode: RequestUrlLogMode,
     mitm_tls: Option<Arc<MitmTlsState>>,
     record_rate_limiters: Arc<RecordRateLimiterRegistry>,
 }
@@ -2018,6 +2087,7 @@ impl ProxyState {
         status: Arc<RuntimeStatus>,
         session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
         runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
+        request_url_log_mode: RequestUrlLogMode,
         mitm_tls: Option<Arc<MitmTlsState>>,
         record_rate_limiters: Arc<RecordRateLimiterRegistry>,
     ) -> Self {
@@ -2028,6 +2098,7 @@ impl ProxyState {
             session_runtime,
             status,
             runtime_mode_override,
+            request_url_log_mode,
             mitm_tls,
             record_rate_limiters,
         }
@@ -2043,12 +2114,12 @@ impl ProxyState {
             .runtime_mode_override
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let (Some(mode), Some(route)) = (runtime_mode_override, request_config.route.as_mut()) {
-            route.mode = mode;
-            route.cache_miss = match mode {
-                RouteMode::Replay => CacheMissPolicy::Error,
-                RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
-            };
+        if let Some(mode) = runtime_mode_override {
+            request_config.mode = mode;
+            if let Some(route) = request_config.route.as_mut() {
+                route.mode = mode;
+                route.cache_miss = route_cache_miss_policy_for_mode(mode);
+            }
         }
         request_config
     }
@@ -2064,6 +2135,7 @@ impl ProxyState {
 #[derive(Debug, Clone)]
 struct RequestRuntimeConfig {
     route: Option<ProxyRoute>,
+    mode: RouteMode,
     max_body_bytes: usize,
 }
 
@@ -2071,9 +2143,39 @@ fn request_runtime_config_for_path(
     runtime_config: &ProxyRuntimeConfig,
     path: &str,
 ) -> RequestRuntimeConfig {
+    let route = select_route(&runtime_config.routes, path).cloned();
+    let mode = route
+        .as_ref()
+        .map(|route| route.mode)
+        .unwrap_or(runtime_config.default_mode);
     RequestRuntimeConfig {
-        route: select_route(&runtime_config.routes, path).cloned(),
+        route,
+        mode,
         max_body_bytes: runtime_config.max_body_bytes,
+    }
+}
+
+fn unmatched_mode_applies(method: &Method, uri: &Uri) -> bool {
+    *method == Method::CONNECT || forward_proxy_upstream_uri(uri).is_some()
+}
+
+fn unmatched_fallback_route(mode: RouteMode) -> ProxyRoute {
+    ProxyRoute {
+        route_ref: "unmatched".to_owned(),
+        path_prefix: None,
+        path_exact: None,
+        path_regex: None,
+        upstream: None,
+        mode,
+        cache_miss: route_cache_miss_policy_for_mode(mode),
+        body_oversize: BodyOversizePolicy::Error,
+        match_config: None,
+        streaming: None,
+        websocket: None,
+        grpc: None,
+        rate_limit: None,
+        redact: None,
+        transform: RouteTransformScripts::default(),
     }
 }
 
@@ -2554,7 +2656,7 @@ async fn proxy_handler(
         .fetch_add(1, Ordering::Relaxed);
 
     let request_method = req.method().to_string();
-    let request_url = req.uri().to_string();
+    let request_url = format_request_url_for_logging(req.uri(), state.request_url_log_mode);
     let request_span = tracing::info_span!(
         "proxy.request",
         method = %request_method,
@@ -2593,14 +2695,21 @@ async fn proxy_handler(
         }};
     }
 
-    let Some(route) = request_runtime_config.route else {
-        respond!(
-            None,
-            proxy_simple_response(StatusCode::NOT_FOUND, "no matching route")
-        );
+    let route = match request_runtime_config.route {
+        Some(route) => route,
+        None => {
+            if unmatched_mode_applies(req.method(), req.uri()) {
+                unmatched_fallback_route(request_runtime_config.mode)
+            } else {
+                respond!(
+                    None,
+                    proxy_simple_response(StatusCode::NOT_FOUND, "no matching route")
+                );
+            }
+        }
     };
     route_ref = Some(route.route_ref.as_str());
-    mode = Some(route.mode);
+    mode = Some(request_runtime_config.mode);
 
     if req.method() == Method::CONNECT {
         let Some(connect_authority) = req.uri().authority().cloned() else {
@@ -3780,6 +3889,21 @@ struct RequestObservation<'a> {
     cache_outcome: CacheLogOutcome,
     replay_latency: Option<Duration>,
     upstream_latency: Option<Duration>,
+}
+
+fn format_request_url_for_logging(uri: &Uri, mode: RequestUrlLogMode) -> String {
+    match mode {
+        RequestUrlLogMode::Full => uri.to_string(),
+        RequestUrlLogMode::Path => {
+            let path = uri.path();
+            if path.is_empty() {
+                "/".to_owned()
+            } else {
+                path.to_owned()
+            }
+        }
+        RequestUrlLogMode::Redacted => REDACTION_PLACEHOLDER.to_owned(),
+    }
 }
 
 fn response_with_observability<B>(
@@ -5373,6 +5497,18 @@ async fn recordings_totals_by_session(
     session_manager: Option<&SessionManager>,
     status: &RuntimeStatus,
 ) -> Vec<(String, u64)> {
+    if let Some(cached_totals) = status.cached_recordings_totals() {
+        return cached_totals;
+    }
+    let totals = recordings_totals_by_session_uncached(session_manager, status).await;
+    status.set_recordings_totals_cache(totals.clone());
+    totals
+}
+
+async fn recordings_totals_by_session_uncached(
+    session_manager: Option<&SessionManager>,
+    status: &RuntimeStatus,
+) -> Vec<(String, u64)> {
     let fallback = || {
         vec![(
             status.active_session(),
@@ -5835,12 +5971,7 @@ async fn admin_handler(
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     for route in &mut runtime_config.routes {
                         route.mode = mode_request.mode;
-                        route.cache_miss = match mode_request.mode {
-                            RouteMode::Replay => CacheMissPolicy::Error,
-                            RouteMode::Record | RouteMode::PassthroughCache => {
-                                CacheMissPolicy::Forward
-                            }
-                        };
+                        route.cache_miss = route_cache_miss_policy_for_mode(mode_request.mode);
                     }
                     AdminModeResponse {
                         runtime_override_mode: *runtime_mode,
@@ -5929,6 +6060,7 @@ async fn admin_handler(
 
                 match session_manager.create_session(&create_request.name).await {
                     Ok(()) => {
+                        state.status.invalidate_recordings_totals_cache();
                         let response = SessionResponse {
                             name: create_request.name,
                         };
@@ -5990,6 +6122,7 @@ async fn admin_handler(
                     if state.status.active_session() == session_name {
                         state.status.decrement_active_session_recordings_total();
                     }
+                    state.status.invalidate_recordings_totals_cache();
                     let mut response = Response::new(Full::new(Bytes::new()));
                     *response.status_mut() = StatusCode::NO_CONTENT;
                     Ok(response)
@@ -6197,6 +6330,7 @@ async fn admin_handler(
         .await
         {
             Ok(result) => {
+                state.status.invalidate_recordings_totals_cache();
                 if state.status.active_session() == session_name {
                     let active_storage = {
                         let session_runtime = state
@@ -6308,6 +6442,7 @@ async fn admin_handler(
 
         return match session_manager.delete_session(session_name).await {
             Ok(()) => {
+                state.status.invalidate_recordings_totals_cache();
                 let mut response = Response::new(Full::new(Bytes::new()));
                 *response.status_mut() = StatusCode::NO_CONTENT;
                 Ok(response)
@@ -6443,15 +6578,16 @@ mod tests {
 
     use super::{
         CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, connect_tunnel_target,
-        emit_proxy_request_log, format_route_ref, forward_proxy_upstream_uri,
-        lookup_recording_for_request_with_subset_limit, mode_log_label,
+        emit_proxy_request_log, format_request_url_for_logging, format_route_ref,
+        forward_proxy_upstream_uri, lookup_recording_for_request_with_subset_limit, mode_log_label,
         normalize_tunneled_https_request_uri, redact_recording_body_json, redact_recording_headers,
         request_runtime_config_for_path, reserve_delay_for_bucket_with_limits,
-        response_chunks_for_storage, sanitize_match_key, select_route, summarize_route_diff,
+        resolve_request_url_log_mode, response_chunks_for_storage, sanitize_match_key,
+        select_route, summarize_route_diff,
     };
     use crate::config::{
-        BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
-        RouteMode,
+        BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RequestUrlLogMode, RouteConfig,
+        RouteMatchConfig, RouteMode,
     };
     use crate::storage::{Recording, ResponseChunk, Storage};
     use serde_json::Value;
@@ -6537,6 +6673,7 @@ mod tests {
     fn request_runtime_config_snapshot_keeps_route_and_limit_together() {
         let runtime_config = super::ProxyRuntimeConfig {
             routes: vec![test_route(Some("/v2/snapshot"), None, None)],
+            default_mode: RouteMode::PassthroughCache,
             max_body_bytes: 256,
         };
 
@@ -6544,7 +6681,43 @@ mod tests {
         let route = snapshot.route.expect("expected matching route");
 
         assert_eq!(snapshot.max_body_bytes, 256);
+        assert_eq!(snapshot.mode, RouteMode::Record);
         assert_eq!(route.path_exact.as_deref(), Some("/v2/snapshot"));
+    }
+
+    #[test]
+    fn request_runtime_config_uses_default_mode_for_unmatched_paths() {
+        let runtime_config = super::ProxyRuntimeConfig {
+            routes: vec![test_route(Some("/v2/matched"), None, None)],
+            default_mode: RouteMode::Replay,
+            max_body_bytes: 512,
+        };
+
+        let snapshot = request_runtime_config_for_path(&runtime_config, "/v9/unmatched");
+        assert!(snapshot.route.is_none());
+        assert_eq!(snapshot.mode, RouteMode::Replay);
+        assert_eq!(snapshot.max_body_bytes, 512);
+    }
+
+    #[test]
+    fn unmatched_mode_applies_to_connect_and_absolute_form_only() {
+        let connect_uri: hyper::Uri = "api.example.test:443".parse().unwrap();
+        assert!(super::unmatched_mode_applies(
+            &hyper::Method::CONNECT,
+            &connect_uri
+        ));
+
+        let absolute_uri: hyper::Uri = "https://api.example.test/v1/models".parse().unwrap();
+        assert!(super::unmatched_mode_applies(
+            &hyper::Method::GET,
+            &absolute_uri
+        ));
+
+        let origin_form_uri: hyper::Uri = "/v1/models".parse().unwrap();
+        assert!(!super::unmatched_mode_applies(
+            &hyper::Method::GET,
+            &origin_form_uri
+        ));
     }
 
     #[test]
@@ -6772,6 +6945,7 @@ mod tests {
                 test_route(Some("/v1/removed"), None, None),
                 test_route(Some("/v1/redacted"), None, None),
             ],
+            default_mode: RouteMode::PassthroughCache,
             max_body_bytes: 64,
         };
         let mut changed_redaction_route = test_route(Some("/v1/redacted"), None, None);
@@ -6787,6 +6961,7 @@ mod tests {
                 test_route(Some("/v1/new"), None, None),
                 test_route(Some("/v1/added"), None, None),
             ],
+            default_mode: RouteMode::PassthroughCache,
             max_body_bytes: 64,
         };
 
@@ -6805,6 +6980,7 @@ mod tests {
                 test_route(Some("/v1/bravo"), None, None),
                 test_route(Some("/v1/charlie"), None, None),
             ],
+            default_mode: RouteMode::PassthroughCache,
             max_body_bytes: 64,
         };
         let next = super::ProxyRuntimeConfig {
@@ -6813,6 +6989,7 @@ mod tests {
                 test_route(Some("/v1/alpha"), None, None),
                 test_route(Some("/v1/bravo"), None, None),
             ],
+            default_mode: RouteMode::PassthroughCache,
             max_body_bytes: 64,
         };
 
@@ -6830,10 +7007,12 @@ mod tests {
                 test_route(Some("/v1/keep"), None, None),
                 test_route(Some("/v1/removed"), None, None),
             ],
+            default_mode: RouteMode::PassthroughCache,
             max_body_bytes: 64,
         };
         let next = super::ProxyRuntimeConfig {
             routes: vec![test_route(Some("/v1/keep"), None, None)],
+            default_mode: RouteMode::PassthroughCache,
             max_body_bytes: 64,
         };
 
@@ -7519,6 +7698,58 @@ ca_key = "{}"
     }
 
     #[test]
+    fn request_url_log_mode_defaults_to_path() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+"#,
+        )
+        .expect("config should parse");
+        assert_eq!(
+            resolve_request_url_log_mode(&config),
+            RequestUrlLogMode::Path
+        );
+    }
+
+    #[test]
+    fn request_url_log_mode_reads_config_value() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[logging]
+request_url = "redacted"
+"#,
+        )
+        .expect("config should parse");
+        assert_eq!(
+            resolve_request_url_log_mode(&config),
+            RequestUrlLogMode::Redacted
+        );
+    }
+
+    #[test]
+    fn format_request_url_for_logging_respects_mode() {
+        let uri: hyper::Uri = "http://proxy.local/api/hello?token=super-secret"
+            .parse()
+            .expect("URI should parse");
+        assert_eq!(
+            format_request_url_for_logging(&uri, RequestUrlLogMode::Full),
+            "http://proxy.local/api/hello?token=super-secret"
+        );
+        assert_eq!(
+            format_request_url_for_logging(&uri, RequestUrlLogMode::Path),
+            "/api/hello"
+        );
+        assert_eq!(
+            format_request_url_for_logging(&uri, RequestUrlLogMode::Redacted),
+            REDACTION_PLACEHOLDER
+        );
+    }
+
+    #[test]
     fn emit_proxy_request_log_includes_required_fields_and_no_headers() {
         let writer = SharedWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -7529,15 +7760,11 @@ ca_key = "{}"
             .finish();
 
         tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!(
-                "proxy.request",
-                method = "GET",
-                url = "http://proxy.local/api/hello?x=1"
-            );
+            let span = tracing::info_span!("proxy.request", method = "GET", url = "/api/hello");
             let _span_guard = span.enter();
             emit_proxy_request_log(
                 "GET",
-                "http://proxy.local/api/hello?x=1",
+                "/api/hello",
                 Some("routes[0] (hello)"),
                 Some(RouteMode::PassthroughCache),
                 CacheLogOutcome::Miss,
@@ -7557,7 +7784,7 @@ ca_key = "{}"
         );
         assert_eq!(
             log.pointer("/fields/url").and_then(Value::as_str),
-            Some("http://proxy.local/api/hello?x=1"),
+            Some("/api/hello"),
             "log: {log}"
         );
         assert_eq!(

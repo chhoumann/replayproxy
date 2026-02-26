@@ -66,6 +66,42 @@ Feature notes:
 - `grpc` enables proto-aware matching via `[routes.grpc]`.
 - `scripting` enables Lua hooks via `[routes.transform]`.
 
+## Bootstrap with `replayproxy init`
+
+Generate a starter config and local directory layout:
+
+```bash
+# project-local scaffold (default)
+replayproxy init
+
+# include an enabled sample route
+replayproxy init --sample-route
+
+# target a specific project root
+replayproxy init --root ./my-proxy-project
+
+# scaffold in home layout (~/.replayproxy/config.toml)
+replayproxy init --home
+
+# preview changes without writing
+replayproxy init --dry-run
+
+# overwrite existing config
+replayproxy init --force
+```
+
+Generated layout (project-local default):
+
+```text
+./replayproxy.toml
+./.replayproxy/sessions/
+./.replayproxy/ca/
+./.replayproxy/presets/
+```
+
+The generated config is valid for `replayproxy serve --config ...`; add or adjust `[[routes]]`
+for your upstream APIs.
+
 ## Config discovery and examples
 
 When `--config` is omitted, replayproxy loads the first existing file from:

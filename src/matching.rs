@@ -323,6 +323,58 @@ pub(crate) fn subset_query_matches_parsed_request(
     )
 }
 
+pub(crate) fn subset_normalized_query_matches_parsed_request(
+    recorded_query_norm: Option<&str>,
+    request_query: &ParsedSubsetQuery<'_>,
+) -> bool {
+    subset_normalized_query_matches_sorted_or_fallback(
+        recorded_query_norm,
+        request_query.sorted.as_slice(),
+    )
+}
+
+fn subset_normalized_query_matches_sorted_or_fallback(
+    recorded_query_norm: Option<&str>,
+    candidate: &[(&str, &str)],
+) -> bool {
+    let Some(recorded_query_norm) = recorded_query_norm else {
+        return true;
+    };
+
+    let mut candidate_idx = 0usize;
+    let mut previous_required = None;
+
+    for segment in recorded_query_norm.split('&') {
+        if segment.is_empty() {
+            continue;
+        }
+
+        let mut parts = segment.splitn(2, '=');
+        let required = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        );
+
+        if previous_required.is_some_and(|previous| required < previous) {
+            return subset_query_matches_sorted(
+                &query_params_sorted(Some(recorded_query_norm)),
+                candidate,
+            );
+        }
+        previous_required = Some(required);
+
+        while candidate_idx < candidate.len() && candidate[candidate_idx] < required {
+            candidate_idx += 1;
+        }
+        if candidate_idx == candidate.len() || candidate[candidate_idx] != required {
+            return false;
+        }
+        candidate_idx += 1;
+    }
+
+    true
+}
+
 fn subset_query_matches_sorted(required: &[(&str, &str)], candidate: &[(&str, &str)]) -> bool {
     let mut required_idx = 0;
     let mut candidate_idx = 0;
@@ -429,8 +481,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::{
         MatchKeyError, ParsedSubsetQuery, compute_match_key, normalized_query, query_params_match,
+        subset_normalized_query_matches_parsed_request,
         subset_query_candidate_normalizations_with_limit, subset_query_matches_parsed_request,
     };
     use crate::config::{QueryMatchMode, RouteMatchConfig};
@@ -747,6 +802,87 @@ headers_ignore = ["Date", "X-Request-Id"]
                 expected
             );
         }
+    }
+
+    #[test]
+    fn normalized_subset_query_matcher_matches_legacy_subset_api() {
+        let request_query = Some("c=3&a=1&b=2&a=1");
+        let parsed = ParsedSubsetQuery::from_query(request_query);
+
+        let cases = [
+            (None, true),
+            (Some("a=1"), true),
+            (Some("a=1&a=1&b=2"), true),
+            (Some("a=1&a=1&a=1"), false),
+            (Some("d=4"), false),
+            // Unsorted recorded input should preserve legacy behavior via fallback.
+            (Some("b=2&a=1"), true),
+        ];
+
+        for (recorded_query_norm, expected) in cases {
+            assert_eq!(
+                subset_normalized_query_matches_parsed_request(recorded_query_norm, &parsed),
+                expected
+            );
+            assert_eq!(
+                subset_query_matches_parsed_request(recorded_query_norm, &parsed),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark-style profiling; run explicitly with --ignored --nocapture"]
+    fn perf_normalized_subset_query_matcher_vs_legacy_sorting() {
+        let request_query = Some("a=1&a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10&k=11&l=12");
+        let parsed = ParsedSubsetQuery::from_query(request_query);
+        let iterations = std::env::var("REPLAYPROXY_PERF_MATCHING_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(300);
+
+        let mut recorded_queries: Vec<String> = (0..2_000)
+            .map(|idx| format!("a=1&a=1&bucket={}&c=3&g=7&token={idx}", idx % 64))
+            .collect();
+        *recorded_queries.last_mut().unwrap() =
+            "a=1&a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10&k=11&l=12".to_owned();
+
+        let legacy_started = Instant::now();
+        let mut legacy_matches = 0usize;
+        for _ in 0..iterations {
+            for recorded_query in &recorded_queries {
+                if subset_query_matches_parsed_request(Some(recorded_query.as_str()), &parsed) {
+                    legacy_matches += 1;
+                }
+            }
+        }
+        let legacy_elapsed = legacy_started.elapsed();
+
+        let optimized_started = Instant::now();
+        let mut optimized_matches = 0usize;
+        for _ in 0..iterations {
+            for recorded_query in &recorded_queries {
+                if subset_normalized_query_matches_parsed_request(
+                    Some(recorded_query.as_str()),
+                    &parsed,
+                ) {
+                    optimized_matches += 1;
+                }
+            }
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        assert_eq!(legacy_matches, optimized_matches);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1_000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1_000.0;
+        let speedup = legacy_ms / optimized_ms.max(f64::EPSILON);
+        eprintln!(
+            "perf_subset_matching legacy_ms={legacy_ms:.2} optimized_ms={optimized_ms:.2} speedup={speedup:.2}x iterations={} dataset={}",
+            iterations,
+            recorded_queries.len(),
+        );
     }
 
     #[test]

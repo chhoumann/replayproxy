@@ -1076,13 +1076,16 @@ fn get_latest_recording_with_id_by_match_key_and_query_subset_scan_with_stats_bl
         let request_query_norm = row
             .get::<_, String>(1)
             .context("deserialize request_query_norm for subset lookup scan")?;
-        let recorded_query = if request_query_norm.is_empty() {
+        let recorded_query_norm = if request_query_norm.is_empty() {
             None
         } else {
             Some(request_query_norm.as_str())
         };
 
-        if matching::subset_query_matches_parsed_request(recorded_query, &parsed_request_query) {
+        if matching::subset_normalized_query_matches_parsed_request(
+            recorded_query_norm,
+            &parsed_request_query,
+        ) {
             matched_recording_id = Some(recording_id);
             break;
         }
@@ -1983,6 +1986,45 @@ active_session = "default"
             .unwrap();
 
         assert_eq!(fetched.request_uri, "/api?a=1");
+    }
+
+    #[tokio::test]
+    async fn subset_scan_lookup_preserves_behavior_for_unsorted_query_norm_rows() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().join("recordings.db")).unwrap();
+
+        let recording = Recording {
+            match_key: "same-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/api?a=1&b=2".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"matched".to_vec(),
+            created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+        };
+        storage.insert_recording(recording).await.unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path()).unwrap();
+        conn.execute(
+            "UPDATE recordings SET request_query_norm = 'b=2&a=1' WHERE match_key = 'same-key'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let fetched = storage
+            .get_latest_recording_by_match_key_and_query_subset_scan_with_stats(
+                "same-key",
+                Some("a=1&b=2&c=3"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.scanned_rows, 1);
+        let recording = fetched.recording.unwrap();
+        assert_eq!(recording.request_uri, "/api?a=1&b=2");
     }
 
     #[tokio::test]

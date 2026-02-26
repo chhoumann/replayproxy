@@ -98,11 +98,11 @@ jobs:
           chmod +x smoke/replayproxy
           if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
             sudo softwareupdate --install-rosetta --agree-to-license || true
-            arch -x86_64 smoke/replayproxy --version
             arch -x86_64 smoke/replayproxy --help >/dev/null
+            arch -x86_64 smoke/replayproxy preset list >/dev/null
             arch -x86_64 smoke/replayproxy serve --help >/dev/null
           else
-            smoke/replayproxy --version
             smoke/replayproxy --help >/dev/null
+            smoke/replayproxy preset list >/dev/null
             smoke/replayproxy serve --help >/dev/null
           fi

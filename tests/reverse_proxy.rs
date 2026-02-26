@@ -2083,6 +2083,243 @@ active_session = "{session_name}"
 }
 
 #[tokio::test]
+async fn admin_session_export_import_round_trip_replays_from_imported_fresh_session() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream_with_responses(vec![
+        Bytes::from_static(b"recorded-response-1"),
+        Bytes::from_static(b"recorded-response-2"),
+    ])
+    .await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+mode = "record"
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+cache_miss = "error"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/chat?turn=1", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(first_uri.clone())
+        .body(Full::new(Bytes::from_static(br#"{"prompt":"first"}"#)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"recorded-response-1");
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/chat");
+    assert_eq!(captured.uri.query(), Some("turn=1"));
+    assert_eq!(&captured.body[..], br#"{"prompt":"first"}"#);
+
+    let second_uri: Uri = format!("http://{}/api/models?limit=2", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"recorded-response-2");
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/models");
+    assert_eq!(captured.uri.query(), Some("limit=2"));
+    assert_eq!(&captured.body[..], b"");
+
+    let export_dir = tempfile::tempdir().unwrap();
+    let output_dir = export_dir.path().join("session-export");
+    let export_uri: Uri = format!("http://{admin_addr}/_admin/sessions/default/export")
+        .parse()
+        .unwrap();
+    let export_payload = serde_json::json!({
+        "out_dir": output_dir.to_string_lossy(),
+        "format": "json",
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(export_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&export_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let export_body = response_json(res).await;
+    assert_eq!(export_body["recordings_exported"].as_u64(), Some(2));
+    assert_eq!(
+        export_body["manifest_path"].as_str(),
+        output_dir.join("index.json").to_str()
+    );
+
+    let sessions_uri: Uri = format!("http://{admin_addr}/_admin/sessions")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(sessions_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(br#"{"name":"staging"}"#)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let import_uri: Uri = format!("http://{admin_addr}/_admin/sessions/staging/import")
+        .parse()
+        .unwrap();
+    let import_payload = serde_json::json!({
+        "in_dir": output_dir.to_string_lossy(),
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(import_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&import_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let import_body = response_json(res).await;
+    assert_eq!(import_body["recordings_imported"].as_u64(), Some(2));
+
+    let activate_uri: Uri = format!("http://{admin_addr}/_admin/sessions/staging/activate")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(activate_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let activate_body = response_json(res).await;
+    assert_eq!(activate_body["name"].as_str(), Some("staging"));
+
+    let delete_default_uri: Uri = format!("http://{admin_addr}/_admin/sessions/default")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(delete_default_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let mode_uri: Uri = format!("http://{admin_addr}/_admin/mode").parse().unwrap();
+    let mode_payload = serde_json::json!({
+        "mode": "replay",
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(mode_uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&mode_payload).unwrap(),
+        )))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mode_body = response_json(res).await;
+    assert_eq!(mode_body["runtime_override_mode"].as_str(), Some("replay"));
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let status_before_replay = response_json(res).await;
+    assert_eq!(
+        status_before_replay["active_session"].as_str(),
+        Some("staging")
+    );
+    assert_eq!(
+        status_before_replay["stats"]["active_session_recordings_total"].as_u64(),
+        Some(2)
+    );
+    let upstream_total_before_replay = status_before_replay["stats"]["upstream_requests_total"]
+        .as_u64()
+        .unwrap();
+    let cache_hits_before_replay = status_before_replay["stats"]["cache_hits_total"]
+        .as_u64()
+        .unwrap();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(first_uri)
+        .body(Full::new(Bytes::from_static(br#"{"prompt":"first"}"#)))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"recorded-response-1");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"recorded-response-2");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let status_after_replay = response_json(res).await;
+    assert_eq!(
+        status_after_replay["stats"]["upstream_requests_total"].as_u64(),
+        Some(upstream_total_before_replay)
+    );
+    assert_eq!(
+        status_after_replay["stats"]["cache_hits_total"].as_u64(),
+        Some(cache_hits_before_replay + 2)
+    );
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_sessions_activation_switches_active_session_and_recording_target() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
@@ -3602,6 +3839,68 @@ async fn spawn_upstream() -> (
 
         let builder = ConnectionBuilder::new(TokioExecutor::new());
         builder.serve_connection(io, service).await.unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn spawn_upstream_with_responses(
+    response_bodies: Vec<Bytes>,
+) -> (
+    SocketAddr,
+    mpsc::Receiver<CapturedRequest>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    assert!(
+        !response_bodies.is_empty(),
+        "response_bodies must not be empty"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = mpsc::channel::<CapturedRequest>(response_bodies.len());
+
+    let join = tokio::spawn(async move {
+        for response_body in response_bodies {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let tx = tx.clone();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let tx = tx.clone();
+                let response_body = response_body.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body_bytes = body.collect().await.unwrap().to_bytes();
+                    tx.send(CapturedRequest {
+                        uri: parts.uri,
+                        headers: parts.headers,
+                        body: body_bytes,
+                    })
+                    .await
+                    .unwrap();
+
+                    let mut res = Response::new(Full::new(response_body));
+                    *res.status_mut() = StatusCode::CREATED;
+                    res.headers_mut().insert(
+                        header::CONNECTION,
+                        HeaderValue::from_static("close, x-resp-hop"),
+                    );
+                    res.headers_mut()
+                        .insert("x-resp-hop", HeaderValue::from_static("yes"));
+                    res.headers_mut()
+                        .insert("x-resp-end", HeaderValue::from_static("ok"));
+                    res.headers_mut().insert(
+                        "x-resp-binary",
+                        HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
+                    );
+                    Ok::<_, hyper::Error>(res)
+                }
+            });
+
+            let builder = ConnectionBuilder::new(TokioExecutor::new());
+            builder.serve_connection(io, service).await.unwrap();
+        }
     });
 
     (addr, rx, move || join)

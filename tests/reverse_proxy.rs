@@ -218,6 +218,115 @@ upstream = "http://{upstream_addr}"
 }
 
 #[tokio::test]
+async fn direct_http2_route_recovers_after_repeated_upstream_connect_failures() {
+    let (healthy_upstream_addr, mut healthy_upstream_rx, healthy_upstream_shutdown) =
+        spawn_grpc_upstream().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[[routes]]
+path_prefix = "/bad"
+upstream = "http://127.0.0.1:9"
+mode = "record"
+
+[[routes]]
+path_prefix = "/good"
+upstream = "http://{healthy_upstream_addr}"
+mode = "record"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut admin_connector = HttpConnector::new();
+    admin_connector.enforce_http(false);
+    let admin_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(admin_connector);
+
+    let stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    for attempt in 0..4 {
+        let req = Request::builder()
+            .method(Method::POST)
+            .version(hyper::Version::HTTP_2)
+            .uri(format!(
+                "http://{}/bad/unreachable-{attempt}",
+                proxy.listen_addr
+            ))
+            .header(header::HOST, proxy.listen_addr.to_string())
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header("te", "trailers")
+            .body(Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x00")))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            body_bytes.as_ref() == b"upstream request failed"
+                || body_bytes.as_ref() == b"failed to read upstream response body",
+            "unexpected upstream connect failure body: {:?}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+    }
+
+    let grpc_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let healthy_req = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/good/helloworld.Greeter/SayHello?x=1",
+            proxy.listen_addr
+        ))
+        .header(header::HOST, proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(grpc_payload.clone()))
+        .unwrap();
+    let healthy_res = sender.send_request(healthy_req).await.unwrap();
+    assert_eq!(healthy_res.version(), hyper::Version::HTTP_2);
+    assert_eq!(healthy_res.status(), StatusCode::OK);
+    assert_eq!(
+        healthy_res.headers().get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        healthy_res.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let healthy_body = healthy_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&healthy_body[..], b"\x00\x00\x00\x00\x00");
+
+    let captured = healthy_upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.version, hyper::Version::HTTP_2);
+    assert_eq!(captured.uri.path(), "/good/helloworld.Greeter/SayHello");
+    assert_eq!(captured.uri.query(), Some("x=1"));
+    assert_eq!(
+        captured.headers.get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(captured.body, grpc_payload);
+
+    drop(sender);
+    let _ = connection_task.await;
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    proxy.shutdown().await;
+    let _ = healthy_upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn forward_proxy_connect_tunnels_grpc_over_http2_passthrough() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
 
@@ -2483,6 +2592,100 @@ preserve_timing = false
 }
 
 #[tokio::test]
+async fn https_connect_mitm_untrusted_tls_handshake_failures_recover_without_connection_leak() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ca_dir = temp_dir.path().join("ca");
+    let ca_paths = replayproxy::ca::generate_ca(&ca_dir, false).unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    let session = "default";
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        ca_paths.cert_path.display(),
+        ca_paths.key_path.display(),
+        storage_dir.display(),
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut admin_connector = HttpConnector::new();
+    admin_connector.enforce_http(false);
+    let admin_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(admin_connector);
+
+    let untrusted_tls_client_config = tls_client_config_without_trust_roots();
+    for _ in 0..5 {
+        let mut stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+        let connect_request = "CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\nProxy-Connection: keep-alive\r\n\r\n";
+        stream.write_all(connect_request.as_bytes()).await.unwrap();
+
+        let response_head = read_http_response_head(&mut stream).await;
+        assert!(
+            response_head.starts_with(b"HTTP/1.1 200"),
+            "unexpected CONNECT response: {}",
+            String::from_utf8_lossy(&response_head)
+        );
+
+        let connector = TlsConnector::from(Arc::clone(&untrusted_tls_client_config));
+        let tls_server_name = ServerName::try_from("api.example.test".to_owned()).unwrap();
+        let handshake_err = connector
+            .connect(tls_server_name, stream)
+            .await
+            .expect_err("untrusted TLS handshake should fail");
+        assert!(
+            !handshake_err.to_string().is_empty(),
+            "TLS handshake error should include context"
+        );
+    }
+
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    let trusted_tls_client_config = tls_client_config_for_ca_cert(&ca_paths.cert_path);
+    let (status, body) = send_https_get_via_connect(
+        proxy.listen_addr,
+        "api.example.test:443",
+        "api.example.test",
+        trusted_tls_client_config,
+        "/api/recover",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body, Bytes::from_static(b"upstream-body"));
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/recover");
+
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[tokio::test]
 async fn oversized_request_body_returns_413_without_hitting_upstream() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
@@ -2985,6 +3188,105 @@ mode = "record"
     let join = upstream_shutdown();
     join.abort();
     let _ = join.await;
+}
+
+#[tokio::test]
+async fn slow_and_idle_clients_disconnect_without_sticking_active_connections() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream_with_responses(vec![
+        Bytes::from_static(b"first-upstream"),
+        Bytes::from_static(b"second-upstream"),
+    ])
+    .await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut admin_connector = HttpConnector::new();
+    admin_connector.enforce_http(false);
+    let admin_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(admin_connector);
+
+    let mut proxy_connector = HttpConnector::new();
+    proxy_connector.enforce_http(false);
+    let proxy_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(proxy_connector);
+
+    let mut idle_streams = Vec::new();
+    for idx in 0..3 {
+        let mut stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+        let partial_request = format!(
+            "GET /api/slow-{idx} HTTP/1.1\r\nHost: {}\r\n",
+            proxy.listen_addr
+        );
+        stream.write_all(partial_request.as_bytes()).await.unwrap();
+        idle_streams.push(stream);
+    }
+
+    wait_for_active_connections(&admin_client, admin_addr, 3, Duration::from_secs(2)).await;
+
+    let first_uri: Uri = format!("http://{}/api/healthy", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(first_uri)
+        .header(header::CONNECTION, "close")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = proxy_client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::CREATED);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"first-upstream");
+
+    let first_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_captured.uri.path(), "/api/healthy");
+
+    drop(idle_streams);
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    let second_uri: Uri = format!("http://{}/api/after-idle", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let second_req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri)
+        .header(header::CONNECTION, "close")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let second_res = proxy_client.request(second_req).await.unwrap();
+    assert_eq!(second_res.status(), StatusCode::CREATED);
+    let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&second_body[..], b"second-upstream");
+
+    let second_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(second_captured.uri.path(), "/api/after-idle");
+    match timeout(Duration::from_millis(150), upstream_rx.recv()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(captured)) => panic!(
+            "idle/slow partial requests should not hit upstream, but captured path={}",
+            captured.uri.path()
+        ),
+    }
+
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
 }
 
 #[tokio::test]
@@ -7472,6 +7774,15 @@ fn tls_client_config_for_ca_cert(ca_cert_path: &Path) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
+fn tls_client_config_without_trust_roots() -> Arc<ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
 async fn send_https_get_via_connect(
     proxy_addr: SocketAddr,
     connect_authority: &str,
@@ -8029,6 +8340,38 @@ async fn wait_for_proxy_status(
             expected_status,
             status,
             uri
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_active_connections(
+    admin_client: &Client<HttpConnector, Full<Bytes>>,
+    admin_addr: SocketAddr,
+    expected_active_connections: u64,
+    timeout_window: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout_window;
+    loop {
+        let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+            .parse()
+            .unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(status_uri)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let res = admin_client.request(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let status = response_json(res).await;
+        let active_connections = status["stats"]["active_connections"].as_u64().unwrap();
+        if active_connections == expected_active_connections {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "timed out waiting for active_connections={} at admin={admin_addr}; last value={active_connections}",
+            expected_active_connections
         );
         sleep(Duration::from_millis(25)).await;
     }

@@ -7255,6 +7255,115 @@ active_session = "{session_name}"
 }
 
 #[tokio::test]
+async fn admin_session_prune_endpoint_prunes_retention_and_reports_deleted_count() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session_name = "default";
+    let session_db_path =
+        replayproxy::session::resolve_session_db_path(storage_dir.path(), session_name).unwrap();
+    let seed_storage = Storage::open(session_db_path).unwrap();
+    let now_unix_ms = Recording::now_unix_ms().unwrap();
+
+    seed_storage
+        .insert_recording(Recording {
+            match_key: "stale-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/stale".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"stale".to_vec(),
+            created_at_unix_ms: now_unix_ms - (2 * 60 * 60 * 1_000),
+        })
+        .await
+        .unwrap();
+    seed_storage
+        .insert_recording(Recording {
+            match_key: "fresh-key".to_owned(),
+            request_method: "GET".to_owned(),
+            request_uri: "/fresh".to_owned(),
+            request_headers: Vec::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: Vec::new(),
+            response_body: b"fresh".to_vec(),
+            created_at_unix_ms: now_unix_ms - (5 * 60 * 1_000),
+        })
+        .await
+        .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[storage]
+path = "{}"
+active_session = "{session_name}"
+max_age_hours = 1
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(
+        body["stats"]["active_session_recordings_total"].as_u64(),
+        Some(2)
+    );
+
+    let prune_uri: Uri = format!("http://{admin_addr}/_admin/sessions/{session_name}/prune")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(prune_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["session"].as_str(), Some(session_name));
+    assert_eq!(body["deleted_recordings"].as_u64(), Some(1));
+    assert_eq!(body["remaining_recordings"].as_u64(), Some(1));
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(
+        body["stats"]["active_session_recordings_total"].as_u64(),
+        Some(1)
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_recordings_endpoints_return_informative_errors() {
     let storage_dir = tempfile::tempdir().unwrap();
     let config_toml = format!(
@@ -7346,6 +7455,33 @@ active_session = "default"
             .unwrap()
             .contains("recording `9999` was not found")
     );
+
+    let missing_prune_uri: Uri = format!("http://{admin_addr}/_admin/sessions/missing/prune")
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(missing_prune_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = response_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("was not found"));
+
+    let invalid_prune_method_uri: Uri =
+        format!("http://{admin_addr}/_admin/sessions/default/prune")
+            .parse()
+            .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(invalid_prune_method_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body = response_json(res).await;
+    assert_eq!(body["error"].as_str(), Some("method not allowed"));
 
     proxy.shutdown().await;
 }

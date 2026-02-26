@@ -1220,6 +1220,13 @@ struct AdminSessionImportRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminSessionPruneResponse {
+    session: String,
+    deleted_recordings: u64,
+    remaining_recordings: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct AdminRecordingsResponse {
     session: String,
     offset: usize,
@@ -5874,6 +5881,18 @@ fn parse_admin_session_import_path(path: &str) -> Option<&str> {
     None
 }
 
+fn parse_admin_session_prune_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/_admin/sessions/")?;
+    let (session_name, prune_suffix) = rest.split_once("/prune")?;
+    if session_name.is_empty() || session_name.contains('/') {
+        return None;
+    }
+    if prune_suffix.is_empty() || prune_suffix == "/" {
+        return Some(session_name);
+    }
+    None
+}
+
 fn parse_admin_recordings_collection_path(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/_admin/sessions/")?;
     let (session_name, recordings_suffix) = rest.split_once("/recordings")?;
@@ -6426,6 +6445,69 @@ async fn admin_handler(
                 status_for_session_import_error(&err),
                 err.to_string(),
             )),
+        };
+    }
+
+    if let Some(session_name) = parse_admin_session_prune_path(&path) {
+        if method != hyper::Method::POST {
+            return Ok(admin_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+
+        let Some(session_manager) = state.session_manager.as_ref() else {
+            return Ok(admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage not configured; session management is unavailable",
+            ));
+        };
+
+        let storage = match session_manager.open_session_storage(session_name).await {
+            Ok(storage) => storage,
+            Err(err) => {
+                return Ok(admin_error_response(
+                    status_for_session_error(&err),
+                    err.to_string(),
+                ));
+            }
+        };
+
+        return match storage.prune_retention().await {
+            Ok(deleted_recordings) => {
+                let remaining_recordings = match storage.count_recordings().await {
+                    Ok(total) => total,
+                    Err(err) => {
+                        tracing::debug!(
+                            "failed to count recordings after retention prune for session `{session_name}`: {err}"
+                        );
+                        return Ok(admin_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to count recordings after retention prune",
+                        ));
+                    }
+                };
+
+                if state.status.active_session() == session_name {
+                    state
+                        .status
+                        .set_active_session_recordings_total(remaining_recordings);
+                }
+                state.status.invalidate_recordings_totals_cache();
+                let response = AdminSessionPruneResponse {
+                    session: session_name.to_owned(),
+                    deleted_recordings,
+                    remaining_recordings,
+                };
+                Ok(admin_json_response(StatusCode::OK, &response))
+            }
+            Err(err) => {
+                tracing::debug!("failed to prune retention for session `{session_name}`: {err}");
+                Ok(admin_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to prune retention",
+                ))
+            }
         };
     }
 

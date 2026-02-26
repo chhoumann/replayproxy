@@ -284,6 +284,7 @@ A companion CLI (`replayproxy`) with subcommands:
 | `replayproxy session delete <name>` | Delete a session and its recordings |
 | `replayproxy session export <name> --format <json\|yaml> --out ./dir` | Export session to files |
 | `replayproxy session import <name> --in ./dir` | Import files into an existing session |
+| `replayproxy session prune <name>` | Trigger retention pruning now and report deleted counts |
 | `replayproxy recording list [--session <name>]` | List recordings in a session |
 | `replayproxy recording search <query>` | Search recordings by URL, method, body content |
 | `replayproxy recording delete <id>` | Delete a specific recording |
@@ -307,6 +308,7 @@ Exposed on a configurable admin port under the `/_admin` path prefix:
 | `/_admin/sessions/:name/recordings/:id` | GET | Get a specific recording |
 | `/_admin/sessions/:name/recordings/:id` | DELETE | Delete a recording |
 | `/_admin/sessions/:name/export` | POST | Export session to files |
+| `/_admin/sessions/:name/prune` | POST | Trigger retention prune now and report deleted counts |
 | `/_admin/config/reload` | POST | Trigger config reload |
 | `/_admin/status` | GET | Proxy status, uptime, active session |
 

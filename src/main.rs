@@ -163,6 +163,8 @@ enum SessionCommand {
         #[arg(long = "in")]
         input: PathBuf,
     },
+    /// Trigger retention pruning for a session immediately.
+    Prune { name: String },
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -293,6 +295,11 @@ enum SessionCommandOutcome {
     },
     Imported {
         result: SessionImportResult,
+    },
+    Pruned {
+        name: String,
+        deleted: u64,
+        remaining: u64,
     },
 }
 
@@ -949,6 +956,19 @@ async fn run_session_command(
             .map_err(|err| anyhow::anyhow!("{err}"))?;
             Ok(SessionCommandOutcome::Imported { result })
         }
+        SessionCommand::Prune { name } => {
+            let storage = session_manager
+                .open_session_storage(&name)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            let deleted = storage.prune_retention().await?;
+            let remaining = storage.count_recordings().await?;
+            Ok(SessionCommandOutcome::Pruned {
+                name,
+                deleted,
+                remaining,
+            })
+        }
     }
 }
 
@@ -1198,6 +1218,15 @@ fn print_session_command_outcome(outcome: SessionCommandOutcome) {
                 result.session,
                 result.recordings_imported,
                 result.input_dir.display()
+            );
+        }
+        SessionCommandOutcome::Pruned {
+            name,
+            deleted,
+            remaining,
+        } => {
+            println!(
+                "pruned retention for session `{name}`: deleted {deleted} recordings; {remaining} remain"
             );
         }
     }
@@ -2125,6 +2154,23 @@ active_session = "{active_session}"
             action,
             SessionCommand::Delete {
                 name: "staging".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn session_prune_parses() {
+        let cli = Cli::try_parse_from(["replayproxy", "session", "prune", "staging"])
+            .expect("cli parse should work");
+        let (config, action) = match cli.command {
+            Command::Session { config, action } => (config, action),
+            other => panic!("expected session command, got {other:?}"),
+        };
+        assert_eq!(config, None);
+        assert_eq!(
+            action,
+            SessionCommand::Prune {
+                name: "staging".to_owned(),
             }
         );
     }
@@ -3477,6 +3523,75 @@ mode = "record"
             err.to_string().contains("storage not configured"),
             "error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn session_prune_applies_retention_policy_and_reports_deleted_count() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:8080"
+
+[storage]
+path = "{}"
+active_session = "default"
+max_age_hours = 1
+"#,
+            temp_dir.path().display()
+        ))
+        .expect("config should parse");
+
+        let session_db_path =
+            replayproxy::session::resolve_session_db_path(temp_dir.path(), "default")
+                .expect("session path should resolve");
+        let seed_storage = Storage::open(session_db_path).expect("seed storage should open");
+        let now_unix_ms = Recording::now_unix_ms().expect("timestamp should be available");
+        let stale = recording_fixture(
+            "stale-recording",
+            "GET",
+            "/stale",
+            now_unix_ms - (2 * 60 * 60 * 1_000),
+        );
+        let fresh = recording_fixture(
+            "fresh-recording",
+            "GET",
+            "/fresh",
+            now_unix_ms - (5 * 60 * 1_000),
+        );
+        seed_storage
+            .insert_recording(stale)
+            .await
+            .expect("stale seed insert should succeed");
+        seed_storage
+            .insert_recording(fresh)
+            .await
+            .expect("fresh seed insert should succeed");
+
+        let outcome = run_session_command(
+            &config,
+            SessionCommand::Prune {
+                name: "default".to_owned(),
+            },
+        )
+        .await
+        .expect("session prune should succeed");
+
+        assert_eq!(
+            outcome,
+            SessionCommandOutcome::Pruned {
+                name: "default".to_owned(),
+                deleted: 1,
+                remaining: 1,
+            }
+        );
+
+        let summaries = seed_storage
+            .list_recordings(0, 10)
+            .await
+            .expect("list after prune should succeed");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].request_uri, "/fresh");
     }
 
     #[tokio::test]

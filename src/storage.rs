@@ -475,6 +475,14 @@ impl Storage {
             .context("join count_recordings task")?
     }
 
+    pub async fn prune_retention(&self) -> anyhow::Result<u64> {
+        let db_path = self.db_path.clone();
+        let retention = self.retention;
+        tokio::task::spawn_blocking(move || prune_retention_blocking(&db_path, retention))
+            .await
+            .context("join prune_retention task")?
+    }
+
     fn init(&self) -> anyhow::Result<()> {
         let mut conn = open_connection(&self.db_path)?;
         migrate(&mut conn)?;
@@ -1233,7 +1241,7 @@ fn insert_recording_blocking(
         &request_query_norm,
         request_query_param_count,
     )?;
-    enforce_retention_policy(&tx, retention)?;
+    let _ = enforce_retention_policy(&tx, retention)?;
     tx.commit().context("commit recording insert transaction")?;
 
     Ok(recording_id)
@@ -1242,24 +1250,26 @@ fn insert_recording_blocking(
 fn enforce_retention_policy(
     tx: &rusqlite::Transaction<'_>,
     retention: StorageRetentionPolicy,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
+    let mut deleted = 0_u64;
     if let Some(max_recordings) = retention.max_recordings {
-        enforce_max_recordings(tx, max_recordings)?;
+        deleted = deleted.saturating_add(enforce_max_recordings(tx, max_recordings)?);
     }
     if let Some(max_age_ms) = retention.max_age_ms {
-        enforce_max_age(tx, max_age_ms)?;
+        deleted = deleted.saturating_add(enforce_max_age(tx, max_age_ms)?);
     }
-    Ok(())
+    Ok(deleted)
 }
 
 fn enforce_max_recordings(
     tx: &rusqlite::Transaction<'_>,
     max_recordings: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     let keep = i64::try_from(max_recordings)
         .context("`storage.max_recordings` exceeds sqlite integer range")?;
-    tx.execute(
-        r#"
+    let deleted = tx
+        .execute(
+            r#"
         DELETE FROM recordings
         WHERE id IN (
           SELECT id
@@ -1268,24 +1278,35 @@ fn enforce_max_recordings(
           LIMIT -1 OFFSET ?1
         )
         "#,
-        params![keep],
-    )
-    .context("enforce `storage.max_recordings` retention policy")?;
-    Ok(())
+            params![keep],
+        )
+        .context("enforce `storage.max_recordings` retention policy")?;
+    u64::try_from(deleted).context("convert max_recordings retention delete count")
 }
 
-fn enforce_max_age(tx: &rusqlite::Transaction<'_>, max_age_ms: i64) -> anyhow::Result<()> {
+fn enforce_max_age(tx: &rusqlite::Transaction<'_>, max_age_ms: i64) -> anyhow::Result<u64> {
     let now_unix_ms = Recording::now_unix_ms()?;
     let cutoff_unix_ms = now_unix_ms.saturating_sub(max_age_ms);
-    tx.execute(
-        r#"
+    let deleted = tx
+        .execute(
+            r#"
         DELETE FROM recordings
         WHERE created_at_unix_ms < ?1
         "#,
-        params![cutoff_unix_ms],
-    )
-    .context("enforce `storage.max_age_*` retention policy")?;
-    Ok(())
+            params![cutoff_unix_ms],
+        )
+        .context("enforce `storage.max_age_*` retention policy")?;
+    u64::try_from(deleted).context("convert max_age retention delete count")
+}
+
+fn prune_retention_blocking(path: &Path, retention: StorageRetentionPolicy) -> anyhow::Result<u64> {
+    let mut conn = open_connection(path)?;
+    let tx = conn
+        .transaction()
+        .context("open retention prune transaction")?;
+    let deleted = enforce_retention_policy(&tx, retention)?;
+    tx.commit().context("commit retention prune transaction")?;
+    Ok(deleted)
 }
 
 fn insert_response_chunks_blocking(
@@ -2329,6 +2350,35 @@ max_age_hours = 1
             .unwrap()
             .expect("fresh recording should remain after retention pruning");
         assert_eq!(replay_match.request_uri, "/fresh");
+    }
+
+    #[tokio::test]
+    async fn prune_retention_reports_deleted_rows() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("recordings.db");
+        let seed_storage = Storage::open(db_path.clone()).unwrap();
+        let now_unix_ms = Recording::now_unix_ms().unwrap();
+
+        let first = test_recording("/one", now_unix_ms);
+        let mut second = test_recording("/two", now_unix_ms + 1);
+        second.match_key = "retention-key-2".to_owned();
+        let mut third = test_recording("/three", now_unix_ms + 2);
+        third.match_key = "retention-key-3".to_owned();
+
+        seed_storage.insert_recording(first).await.unwrap();
+        seed_storage.insert_recording(second).await.unwrap();
+        seed_storage.insert_recording(third).await.unwrap();
+
+        let retention_storage = Storage::open_with_max_recordings(db_path, Some(1)).unwrap();
+        let deleted = retention_storage.prune_retention().await.unwrap();
+        assert_eq!(deleted, 2);
+
+        let summaries = retention_storage.list_recordings(0, 10).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].request_uri, "/three");
+
+        let deleted_again = retention_storage.prune_retention().await.unwrap();
+        assert_eq!(deleted_again, 0);
     }
 
     #[tokio::test]

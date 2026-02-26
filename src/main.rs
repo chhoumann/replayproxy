@@ -33,6 +33,7 @@ const USER_PRESETS_DIR_NAME: &str = "presets";
 #[derive(Debug, Clone, Copy)]
 struct BundledPreset {
     name: &'static str,
+    description: &'static str,
     source: &'static str,
     bytes: &'static [u8],
 }
@@ -40,11 +41,13 @@ struct BundledPreset {
 const BUNDLED_PRESETS: &[BundledPreset] = &[
     BundledPreset {
         name: "anthropic",
+        description: "Reverse-proxy route for Anthropic Messages API with API-key matching/redaction defaults.",
         source: "embedded:presets/anthropic.toml",
         bytes: include_bytes!("../presets/anthropic.toml"),
     },
     BundledPreset {
         name: "openai",
+        description: "Reverse-proxy route for OpenAI Chat Completions with auth/header/body matching defaults.",
         source: "embedded:presets/openai.toml",
         bytes: include_bytes!("../presets/openai.toml"),
     },
@@ -232,11 +235,20 @@ enum CaCommand {
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
 enum PresetCommand {
-    /// Import a bundled preset config into `~/.replayproxy/presets`.
+    /// List bundled preset names and descriptions.
+    List,
+    /// Copy a bundled preset into `~/.replayproxy/presets/<name>.toml`.
+    /// Existing files at the same path are overwritten; this command does not merge into your active config.
     Import {
         /// Preset name without extension (for example: `openai`).
         name: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresetMetadata {
+    name: String,
+    description: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +327,9 @@ enum CaCommandOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PresetCommandOutcome {
+    Listed {
+        presets: Vec<PresetMetadata>,
+    },
     Imported {
         name: String,
         source: String,
@@ -369,6 +384,19 @@ fn list_bundled_presets() -> Vec<&'static str> {
     preset_names.sort_unstable();
     preset_names.dedup();
     preset_names
+}
+
+fn list_bundled_preset_metadata() -> Vec<PresetMetadata> {
+    let mut metadata = BUNDLED_PRESETS
+        .iter()
+        .map(|preset| PresetMetadata {
+            name: preset.name.to_owned(),
+            description: preset.description.to_owned(),
+        })
+        .collect::<Vec<_>>();
+    metadata.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    metadata.dedup_by(|left, right| left.name == right.name);
+    metadata
 }
 
 fn resolve_bundled_preset(name: &str) -> anyhow::Result<&'static BundledPreset> {
@@ -902,6 +930,9 @@ fn run_ca_command(command: CaCommand) -> anyhow::Result<CaCommandOutcome> {
 
 fn run_preset_command(command: PresetCommand) -> anyhow::Result<PresetCommandOutcome> {
     match command {
+        PresetCommand::List => Ok(PresetCommandOutcome::Listed {
+            presets: list_bundled_preset_metadata(),
+        }),
         PresetCommand::Import { name } => {
             let preset = resolve_bundled_preset(&name)?;
             let output_dir = user_presets_dir()?;
@@ -1023,6 +1054,17 @@ fn print_ca_command_outcome(outcome: CaCommandOutcome) {
 
 fn print_preset_command_outcome(outcome: PresetCommandOutcome) {
     match outcome {
+        PresetCommandOutcome::Listed { presets } => {
+            if presets.is_empty() {
+                println!("no bundled presets available");
+                return;
+            }
+
+            println!("name\tdescription");
+            for preset in presets {
+                println!("{}\t{}", preset.name, preset.description);
+            }
+        }
         PresetCommandOutcome::Imported {
             name,
             source,
@@ -1817,6 +1859,18 @@ listen = "127.0.0.1:8080"
                         name: "openai".to_owned(),
                     }
                 );
+            }
+            other => panic!("expected preset command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preset_list_parses() {
+        let cli =
+            Cli::try_parse_from(["replayproxy", "preset", "list"]).expect("cli parse should work");
+        match cli.command {
+            Command::Preset { action } => {
+                assert_eq!(action, PresetCommand::List);
             }
             other => panic!("expected preset command, got {other:?}"),
         }

@@ -120,3 +120,29 @@ fn preset_import_unknown_name_shows_available_presets() {
         "stderr should list bundled presets\nstderr:\n{stderr}"
     );
 }
+
+#[test]
+fn preset_list_shows_names_and_descriptions() {
+    let sandbox = tempdir().expect("tempdir should be created");
+    let project_dir = sandbox.path().join("project");
+    let home_dir = sandbox.path().join("home");
+    fs::create_dir_all(&project_dir).expect("project dir should be created");
+    fs::create_dir_all(&home_dir).expect("home dir should be created");
+
+    let output = run_replayproxy(["preset", "list"], &project_dir, &home_dir);
+    assert_success(&output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("name\tdescription"),
+        "stdout should include table header\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("openai"),
+        "stdout should include openai preset\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("anthropic"),
+        "stdout should include anthropic preset\nstdout:\n{stdout}"
+    );
+}

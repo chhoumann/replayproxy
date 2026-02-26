@@ -215,6 +215,26 @@ curl https://example.com/
 
 If your client ignores proxy env vars, pass proxy settings explicitly in that client/tool.
 
+## Community presets
+
+Bundled presets provide starting configs for common upstream APIs.
+
+Discover available presets and intended use:
+
+```bash
+replayproxy preset list
+```
+
+Import behavior is **copy-only**:
+- `replayproxy preset import <name>` writes `~/.replayproxy/presets/<name>.toml`
+- Existing preset files at that path are overwritten
+- Your active `replayproxy.toml` is not merged or modified automatically
+
+Typical workflow:
+1. Import a preset.
+2. Copy or adapt routes from `~/.replayproxy/presets/<name>.toml` into your project config.
+3. Start replayproxy with your project config as usual.
+
 ## Troubleshooting
 
 ### `502 Gateway Not Recorded` in replay mode
@@ -324,6 +344,7 @@ replayproxy ca install
 replayproxy ca export --out ./replayproxy-ca.pem
 
 # bundled presets
+replayproxy preset list
 replayproxy preset import openai
 ```
 

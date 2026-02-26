@@ -7249,6 +7249,26 @@ query_params = ["token", "api_key"]
             && !stored_request_uri.contains("api%5Fkey=abc"),
         "stored_request_uri={stored_request_uri}"
     );
+    let stored_request_query_norm: String = conn
+        .query_row(
+            "SELECT request_query_norm FROM recordings LIMIT 1;",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored_request_query_norm.starts_with("h1|"),
+        "stored_request_query_norm={stored_request_query_norm}"
+    );
+    assert!(
+        !stored_request_query_norm.contains("secret-1")
+            && !stored_request_query_norm.contains("secret-2")
+            && !stored_request_query_norm.contains("api%5Fkey=abc")
+            && !stored_request_query_norm.contains("token")
+            && !stored_request_query_norm.contains("a=1")
+            && !stored_request_query_norm.contains("b=2"),
+        "stored_request_query_norm={stored_request_query_norm}"
+    );
 
     let session_manager = SessionManager::new(storage_dir.path().to_path_buf());
     let export_dir = storage_dir.path().join("export");

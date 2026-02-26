@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{config::Config, matching, session};
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const SQLITE_MAX_BIND_PARAMS: usize = 999;
 const QUERY_SUBSET_CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMS - 1;
 
@@ -579,22 +579,28 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
                   ON recording_websocket_frames(recording_id, frame_index);
                 "#,
             )
-            .context("create sqlite schema v4")?;
+            .context("create sqlite schema v5")?;
 
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-                .context("set PRAGMA user_version=4")?;
+                .context("set PRAGMA user_version=5")?;
             Ok(())
         }
         1 => {
             migrate_v1_to_v2(conn)?;
             migrate_v2_to_v3(conn)?;
-            migrate_v3_to_v4(conn)
+            migrate_v3_to_v4(conn)?;
+            migrate_v4_to_v5(conn)
         }
         2 => {
             migrate_v2_to_v3(conn)?;
-            migrate_v3_to_v4(conn)
+            migrate_v3_to_v4(conn)?;
+            migrate_v4_to_v5(conn)
         }
-        3 => migrate_v3_to_v4(conn),
+        3 => {
+            migrate_v3_to_v4(conn)?;
+            migrate_v4_to_v5(conn)
+        }
+        4 => migrate_v4_to_v5(conn),
         SCHEMA_VERSION => Ok(()),
         _ => anyhow::bail!(
             "unsupported recordings.db schema version {user_version} (expected {SCHEMA_VERSION})"
@@ -664,8 +670,16 @@ fn migrate_v3_to_v4(conn: &mut Connection) -> anyhow::Result<()> {
     )
     .context("migrate sqlite schema v3 -> v4")?;
 
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+    conn.pragma_update(None, "user_version", 4)
         .context("set PRAGMA user_version=4")?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(conn: &mut Connection) -> anyhow::Result<()> {
+    backfill_request_query_norm_fingerprints(conn)?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("set PRAGMA user_version=5")?;
     Ok(())
 }
 
@@ -824,6 +838,52 @@ fn backfill_request_query_norm(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn backfill_request_query_norm_fingerprints(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, request_query_norm
+            FROM recordings
+            "#,
+        )
+        .context("prepare select recordings for request_query_norm fingerprint migration")?;
+    let mut rows = stmt
+        .query([])
+        .context("query recordings for request_query_norm fingerprint migration")?;
+
+    let mut updates = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .context("iterate recordings for request_query_norm fingerprint migration")?
+    {
+        let id = row
+            .get::<_, i64>(0)
+            .context("deserialize id for request_query_norm fingerprint migration")?;
+        let request_query_norm = row
+            .get::<_, String>(1)
+            .context("deserialize request_query_norm for fingerprint migration")?;
+        let fingerprinted_query_norm =
+            matching::normalize_stored_query_norm_to_fingerprint(&request_query_norm);
+        if fingerprinted_query_norm != request_query_norm {
+            updates.push((id, fingerprinted_query_norm));
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    for (id, query_norm) in updates {
+        conn.execute(
+            "UPDATE recordings SET request_query_norm = ?1 WHERE id = ?2",
+            params![query_norm, id],
+        )
+        .with_context(|| {
+            format!("migrate request_query_norm fingerprint representation for recording id {id}")
+        })?;
+    }
+
+    Ok(())
+}
+
 fn insert_recording_blocking(
     path: &Path,
     recording: Recording,
@@ -832,6 +892,8 @@ fn insert_recording_blocking(
     let conn = open_connection(path)?;
     let request_query_norm = request_query_norm
         .unwrap_or_else(|| normalized_query_from_request_uri(&recording.request_uri));
+    let request_query_norm =
+        matching::normalize_stored_query_norm_to_fingerprint(&request_query_norm);
     let request_headers_json =
         serde_json::to_string(&recording.request_headers).context("serialize request headers")?;
     let response_headers_json =
@@ -1097,7 +1159,7 @@ fn recording_query_from_uri(uri: &str) -> Option<&str> {
 }
 
 fn normalized_query_from_request_uri(uri: &str) -> String {
-    matching::normalized_query(recording_query_from_uri(uri))
+    matching::normalized_query_fingerprint(recording_query_from_uri(uri))
 }
 
 fn validate_pagination(offset: usize, limit: usize) -> anyhow::Result<(i64, i64)> {
@@ -2263,7 +2325,7 @@ active_session = "default"
         base.created_at_unix_ms += 1;
         storage.insert_recording(base).await.unwrap();
 
-        let subset_query_norms = matching::subset_query_candidate_normalizations_with_limit(
+        let subset_query_norms = matching::subset_query_candidate_fingerprints_with_limit(
             Some("a=1&b=2&c=3"),
             usize::MAX,
         )
@@ -2478,7 +2540,7 @@ active_session = "default"
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 4);
+        assert_eq!(user_version, 5);
 
         let query_norm: String = conn
             .query_row(
@@ -2487,7 +2549,10 @@ active_session = "default"
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(query_norm, "a=1&b=2");
+        assert_eq!(
+            query_norm,
+            matching::normalized_query_fingerprint(Some("a=1&b=2"))
+        );
 
         let chunk_table_exists: i64 = conn
             .query_row(
@@ -2507,7 +2572,7 @@ active_session = "default"
             .unwrap();
         assert_eq!(websocket_frame_table_exists, 1);
 
-        let subset_query_norms = matching::subset_query_candidate_normalizations_with_limit(
+        let subset_query_norms = matching::subset_query_candidate_fingerprints_with_limit(
             Some("a=1&b=2&c=3"),
             usize::MAX,
         )
@@ -2520,7 +2585,7 @@ active_session = "default"
     }
 
     #[tokio::test]
-    async fn open_migrates_v2_schema_to_v4_streaming_and_websocket_tables() {
+    async fn open_migrates_v2_schema_to_v5_streaming_and_websocket_tables() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("recordings.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -2555,7 +2620,7 @@ active_session = "default"
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 4);
+        assert_eq!(user_version, 5);
 
         let chunk_table_exists: i64 = conn
             .query_row(
@@ -2577,7 +2642,7 @@ active_session = "default"
     }
 
     #[tokio::test]
-    async fn open_migrates_v3_schema_to_v4_websocket_frame_table() {
+    async fn open_migrates_v3_schema_to_v5_websocket_frame_table() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("recordings.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -2624,7 +2689,7 @@ active_session = "default"
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 4);
+        assert_eq!(user_version, 5);
 
         let websocket_frame_table_exists: i64 = conn
             .query_row(
@@ -2634,6 +2699,114 @@ active_session = "default"
             )
             .unwrap();
         assert_eq!(websocket_frame_table_exists, 1);
+    }
+
+    #[tokio::test]
+    async fn open_migrates_v4_schema_to_v5_query_norm_fingerprints() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("recordings.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE recordings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              match_key TEXT NOT NULL,
+              request_method TEXT NOT NULL,
+              request_uri TEXT NOT NULL,
+              request_query_norm TEXT NOT NULL DEFAULT '',
+              request_headers_json TEXT NOT NULL,
+              request_body BLOB NOT NULL,
+              response_status INTEGER NOT NULL,
+              response_headers_json TEXT NOT NULL,
+              response_body BLOB NOT NULL,
+              created_at_unix_ms INTEGER NOT NULL
+            );
+
+            CREATE INDEX recordings_match_key_idx ON recordings(match_key);
+            CREATE INDEX recordings_match_key_query_norm_idx
+              ON recordings(match_key, request_query_norm, id DESC);
+
+            CREATE TABLE recording_response_chunks (
+              recording_id INTEGER NOT NULL,
+              chunk_index INTEGER NOT NULL,
+              offset_ms INTEGER NOT NULL,
+              chunk_body BLOB NOT NULL,
+              PRIMARY KEY (recording_id, chunk_index),
+              FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX recording_response_chunks_replay_idx
+              ON recording_response_chunks(recording_id, chunk_index);
+
+            CREATE TABLE recording_websocket_frames (
+              recording_id INTEGER NOT NULL,
+              frame_index INTEGER NOT NULL,
+              direction TEXT NOT NULL CHECK(direction IN ('client-to-server', 'server-to-client')),
+              message_type TEXT NOT NULL CHECK(message_type IN ('text', 'binary')),
+              offset_ms INTEGER NOT NULL,
+              payload BLOB NOT NULL,
+              PRIMARY KEY (recording_id, frame_index),
+              FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX recording_websocket_frames_replay_idx
+              ON recording_websocket_frames(recording_id, frame_index);
+
+            PRAGMA user_version = 4;
+            "#,
+        )
+        .unwrap();
+
+        conn.execute(
+            r#"
+            INSERT INTO recordings (
+              match_key,
+              request_method,
+              request_uri,
+              request_query_norm,
+              request_headers_json,
+              request_body,
+              response_status,
+              response_headers_json,
+              response_body,
+              created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                "legacy-v4-key",
+                "GET",
+                "/api?b=2&a=1",
+                "b=2&a=1",
+                r#"[["x-request","legacy"]]"#,
+                Vec::<u8>::new(),
+                200i64,
+                r#"[["x-response","legacy"]]"#,
+                b"body".to_vec(),
+                Recording::now_unix_ms().unwrap(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = Storage::open(db_path).unwrap();
+        let conn = rusqlite::Connection::open(storage.db_path()).unwrap();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 5);
+
+        let query_norm: String = conn
+            .query_row(
+                "SELECT request_query_norm FROM recordings WHERE match_key = 'legacy-v4-key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            query_norm,
+            matching::normalized_query_fingerprint(Some("a=1&b=2"))
+        );
     }
 
     #[tokio::test]

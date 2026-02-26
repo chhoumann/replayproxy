@@ -6,6 +6,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::{QueryMatchMode, RouteMatchConfig};
 
+const QUERY_NORM_FINGERPRINT_PREFIX: &str = "h1|";
+const QUERY_PARAM_FINGERPRINT_LEN: usize = 64;
+
 #[derive(Debug)]
 pub enum MatchKeyError {
     InvalidJsonBody(serde_json::Error),
@@ -210,6 +213,40 @@ fn normalized_query_from_sorted(sorted: &[(&str, &str)]) -> String {
     normalized
 }
 
+fn query_param_fingerprint(name: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, b"query_param_fingerprint_v1");
+    hash_len_prefixed(&mut hasher, name.as_bytes());
+    hash_len_prefixed(&mut hasher, value.as_bytes());
+    let digest = hasher.finalize();
+    hex_encode(&digest)
+}
+
+fn is_query_param_fingerprint_segment(segment: &str) -> bool {
+    segment.len() == QUERY_PARAM_FINGERPRINT_LEN
+        && segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn normalized_query_fingerprint_from_segments(segments: &[&str]) -> String {
+    let mut normalized = String::from(QUERY_NORM_FINGERPRINT_PREFIX);
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx > 0 {
+            normalized.push('&');
+        }
+        normalized.push_str(segment);
+    }
+    normalized
+}
+
+fn normalized_query_fingerprint_from_sorted(sorted: &[(&str, &str)]) -> String {
+    let digests: Vec<String> = sorted
+        .iter()
+        .map(|(name, value)| query_param_fingerprint(name, value))
+        .collect();
+    let digest_segments: Vec<&str> = digests.iter().map(String::as_str).collect();
+    normalized_query_fingerprint_from_segments(&digest_segments)
+}
+
 fn append_subset_query_candidates<'a>(
     grouped: &[(&'a str, &'a str, usize)],
     group_idx: usize,
@@ -227,6 +264,31 @@ fn append_subset_query_candidates<'a>(
             current.push((name, value));
         }
         append_subset_query_candidates(grouped, group_idx + 1, current, out);
+        for _ in 0..selected {
+            current.pop();
+        }
+    }
+}
+
+fn append_subset_query_fingerprint_candidates<'a>(
+    grouped: &'a [(String, usize)],
+    group_idx: usize,
+    current: &mut Vec<&'a str>,
+    out: &mut Vec<String>,
+) {
+    if group_idx == grouped.len() {
+        out.push(normalized_query_fingerprint_from_segments(
+            current.as_slice(),
+        ));
+        return;
+    }
+
+    let (digest, count) = (&grouped[group_idx].0, grouped[group_idx].1);
+    for selected in 0..=count {
+        for _ in 0..selected {
+            current.push(digest.as_str());
+        }
+        append_subset_query_fingerprint_candidates(grouped, group_idx + 1, current, out);
         for _ in 0..selected {
             current.pop();
         }
@@ -263,20 +325,56 @@ fn subset_query_candidate_count(grouped: &[(&str, &str, usize)], limit: usize) -
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ParsedSubsetQuery<'a> {
     sorted: Vec<(&'a str, &'a str)>,
+    query_param_fingerprints: Vec<String>,
 }
 
 impl<'a> ParsedSubsetQuery<'a> {
     pub(crate) fn from_query(query: Option<&'a str>) -> Self {
+        let sorted = query_params_sorted(query);
+        let query_param_fingerprints = sorted
+            .iter()
+            .map(|(name, value)| query_param_fingerprint(name, value))
+            .collect();
         Self {
-            sorted: query_params_sorted(query),
+            sorted,
+            query_param_fingerprints,
         }
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn normalized_query(query: Option<&str>) -> String {
     normalized_query_from_sorted(&query_params_sorted(query))
 }
 
+pub(crate) fn normalized_query_fingerprint(query: Option<&str>) -> String {
+    normalized_query_fingerprint_from_sorted(&query_params_sorted(query))
+}
+
+pub(crate) fn normalize_stored_query_norm_to_fingerprint(stored_query_norm: &str) -> String {
+    if let Some(query_fingerprints) = stored_query_norm.strip_prefix(QUERY_NORM_FINGERPRINT_PREFIX)
+    {
+        if query_fingerprints.is_empty() {
+            return QUERY_NORM_FINGERPRINT_PREFIX.to_owned();
+        }
+
+        let mut normalized = String::from(QUERY_NORM_FINGERPRINT_PREFIX);
+        for (idx, segment) in query_fingerprints.split('&').enumerate() {
+            if !is_query_param_fingerprint_segment(segment) {
+                return normalized_query_fingerprint(Some(stored_query_norm));
+            }
+            if idx > 0 {
+                normalized.push('&');
+            }
+            normalized.push_str(&segment.to_ascii_lowercase());
+        }
+        return normalized;
+    }
+
+    normalized_query_fingerprint(Some(stored_query_norm))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn subset_query_candidate_normalizations_with_limit(
     query: Option<&str>,
     max_candidates: usize,
@@ -292,6 +390,28 @@ pub(crate) fn subset_query_candidate_normalizations_with_limit(
     let mut out = Vec::with_capacity(candidate_count);
     let mut current = Vec::new();
     append_subset_query_candidates(&grouped, 0, &mut current, &mut out);
+    Some(out)
+}
+
+pub(crate) fn subset_query_candidate_fingerprints_with_limit(
+    query: Option<&str>,
+    max_candidates: usize,
+) -> Option<Vec<String>> {
+    let sorted = query_params_sorted(query);
+    if sorted.is_empty() {
+        return (max_candidates >= 1).then_some(vec![QUERY_NORM_FINGERPRINT_PREFIX.to_owned()]);
+    }
+
+    let grouped = grouped_query_params(sorted);
+    let candidate_count = subset_query_candidate_count(&grouped, max_candidates)?;
+
+    let grouped_digests: Vec<(String, usize)> = grouped
+        .iter()
+        .map(|(name, value, multiplicity)| (query_param_fingerprint(name, value), *multiplicity))
+        .collect();
+    let mut out = Vec::with_capacity(candidate_count);
+    let mut current = Vec::new();
+    append_subset_query_fingerprint_candidates(&grouped_digests, 0, &mut current, &mut out);
     Some(out)
 }
 
@@ -327,20 +447,62 @@ pub(crate) fn subset_normalized_query_matches_parsed_request(
     recorded_query_norm: Option<&str>,
     request_query: &ParsedSubsetQuery<'_>,
 ) -> bool {
-    subset_normalized_query_matches_sorted_or_fallback(
-        recorded_query_norm,
-        request_query.sorted.as_slice(),
-    )
+    subset_normalized_query_matches_sorted_or_fallback(recorded_query_norm, request_query)
 }
 
 fn subset_normalized_query_matches_sorted_or_fallback(
     recorded_query_norm: Option<&str>,
-    candidate: &[(&str, &str)],
+    request_query: &ParsedSubsetQuery<'_>,
 ) -> bool {
     let Some(recorded_query_norm) = recorded_query_norm else {
         return true;
     };
 
+    if let Some(required_query_fingerprints) =
+        recorded_query_norm.strip_prefix(QUERY_NORM_FINGERPRINT_PREFIX)
+    {
+        return subset_query_fingerprint_matches_parsed_request(
+            required_query_fingerprints,
+            request_query.query_param_fingerprints.as_slice(),
+        );
+    }
+
+    subset_legacy_normalized_query_matches_sorted_or_fallback(
+        recorded_query_norm,
+        request_query.sorted.as_slice(),
+    )
+}
+
+fn subset_query_fingerprint_matches_parsed_request(
+    required_query_fingerprints: &str,
+    candidate_query_fingerprints: &[String],
+) -> bool {
+    let mut candidate_idx = 0usize;
+    if required_query_fingerprints.is_empty() {
+        return true;
+    }
+
+    for required in required_query_fingerprints.split('&') {
+        if !is_query_param_fingerprint_segment(required) {
+            return false;
+        }
+        while candidate_idx < candidate_query_fingerprints.len()
+            && !candidate_query_fingerprints[candidate_idx].eq_ignore_ascii_case(required)
+        {
+            candidate_idx += 1;
+        }
+        if candidate_idx == candidate_query_fingerprints.len() {
+            return false;
+        }
+        candidate_idx += 1;
+    }
+    true
+}
+
+fn subset_legacy_normalized_query_matches_sorted_or_fallback(
+    recorded_query_norm: &str,
+    candidate: &[(&str, &str)],
+) -> bool {
     let mut candidate_idx = 0usize;
     let mut previous_required = None;
 
@@ -484,8 +646,10 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        MatchKeyError, ParsedSubsetQuery, compute_match_key, normalized_query, query_params_match,
-        subset_normalized_query_matches_parsed_request,
+        MatchKeyError, ParsedSubsetQuery, compute_match_key,
+        normalize_stored_query_norm_to_fingerprint, normalized_query, normalized_query_fingerprint,
+        query_params_match, subset_normalized_query_matches_parsed_request,
+        subset_query_candidate_fingerprints_with_limit,
         subset_query_candidate_normalizations_with_limit, subset_query_matches_parsed_request,
     };
     use crate::config::{QueryMatchMode, RouteMatchConfig};
@@ -832,6 +996,33 @@ headers_ignore = ["Date", "X-Request-Id"]
     }
 
     #[test]
+    fn normalized_subset_query_matcher_supports_fingerprint_format() {
+        let request_query = Some("c=3&a=1&b=2&a=1");
+        let parsed = ParsedSubsetQuery::from_query(request_query);
+
+        let cases = [
+            (normalize_stored_query_norm_to_fingerprint(""), true),
+            (normalize_stored_query_norm_to_fingerprint("a=1"), true),
+            (
+                normalize_stored_query_norm_to_fingerprint("a=1&a=1&b=2"),
+                true,
+            ),
+            (
+                normalize_stored_query_norm_to_fingerprint("a=1&a=1&a=1"),
+                false,
+            ),
+            (normalize_stored_query_norm_to_fingerprint("d=4"), false),
+        ];
+
+        for (recorded_query_norm, expected) in cases {
+            assert_eq!(
+                subset_normalized_query_matches_parsed_request(Some(&recorded_query_norm), &parsed),
+                expected
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "benchmark-style profiling; run explicitly with --ignored --nocapture"]
     fn perf_normalized_subset_query_matcher_vs_legacy_sorting() {
         let request_query = Some("a=1&a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10&k=11&l=12");
@@ -847,6 +1038,10 @@ headers_ignore = ["Date", "X-Request-Id"]
             .collect();
         *recorded_queries.last_mut().unwrap() =
             "a=1&a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10&k=11&l=12".to_owned();
+        let recorded_query_fingerprints: Vec<String> = recorded_queries
+            .iter()
+            .map(|recorded_query| normalize_stored_query_norm_to_fingerprint(recorded_query))
+            .collect();
 
         let legacy_started = Instant::now();
         let mut legacy_matches = 0usize;
@@ -862,7 +1057,7 @@ headers_ignore = ["Date", "X-Request-Id"]
         let optimized_started = Instant::now();
         let mut optimized_matches = 0usize;
         for _ in 0..iterations {
-            for recorded_query in &recorded_queries {
+            for recorded_query in &recorded_query_fingerprints {
                 if subset_normalized_query_matches_parsed_request(
                     Some(recorded_query.as_str()),
                     &parsed,
@@ -889,6 +1084,15 @@ headers_ignore = ["Date", "X-Request-Id"]
     fn normalized_query_is_sorted_and_stable() {
         assert_eq!(normalized_query(Some("b=2&a=1&&a")), "a=&a=1&b=2");
         assert_eq!(normalized_query(Some("a&b=2&a=1")), "a=&a=1&b=2");
+    }
+
+    #[test]
+    fn normalized_query_fingerprint_obscures_raw_values() {
+        let fingerprint = normalized_query_fingerprint(Some("token=secret&a=1"));
+        assert!(fingerprint.starts_with("h1|"));
+        assert!(!fingerprint.contains("token"));
+        assert!(!fingerprint.contains("secret"));
+        assert!(!fingerprint.contains("a=1"));
     }
 
     #[test]
@@ -931,6 +1135,26 @@ headers_ignore = ["Date", "X-Request-Id"]
             "a=1&c=3".to_owned(),
             "b=2&c=3".to_owned(),
             "a=1&b=2&c=3".to_owned(),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn subset_query_candidate_fingerprints_cover_multiplicity() {
+        let mut actual =
+            subset_query_candidate_fingerprints_with_limit(Some("b=2&a=1&a=1"), usize::MAX)
+                .unwrap();
+        actual.sort_unstable();
+
+        let mut expected = vec![
+            normalize_stored_query_norm_to_fingerprint(""),
+            normalize_stored_query_norm_to_fingerprint("a=1"),
+            normalize_stored_query_norm_to_fingerprint("a=1&a=1"),
+            normalize_stored_query_norm_to_fingerprint("b=2"),
+            normalize_stored_query_norm_to_fingerprint("a=1&b=2"),
+            normalize_stored_query_norm_to_fingerprint("a=1&a=1&b=2"),
         ];
         expected.sort_unstable();
 

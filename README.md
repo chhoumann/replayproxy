@@ -444,6 +444,7 @@ Redaction:
 - Redaction runs before persistence.
 - Supports header, query-parameter, and JSONPath body redaction.
 - Matching still uses pre-redaction request values.
+- Internal subset-query lookup metadata is persisted as hashed query-parameter fingerprints.
 
 Replay miss behavior:
 

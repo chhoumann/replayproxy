@@ -4184,7 +4184,7 @@ async fn lookup_recording_for_request_with_subset_limit(
         .unwrap_or(0);
 
     if let Some(subset_query_normalizations) =
-        matching::subset_query_candidate_normalizations_with_limit(
+        matching::subset_query_candidate_fingerprints_with_limit(
             request_query,
             subset_candidate_limit,
         )
@@ -6530,7 +6530,7 @@ fn recording_query_from_uri(uri: &str) -> Option<&str> {
 }
 
 fn normalized_query_from_request_uri(uri: &str) -> String {
-    matching::normalized_query(recording_query_from_uri(uri))
+    matching::normalized_query_fingerprint(recording_query_from_uri(uri))
 }
 
 fn redact_recording_request_uri(uri: &str, redact: Option<&RedactConfig>) -> String {

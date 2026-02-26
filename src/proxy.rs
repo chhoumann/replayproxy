@@ -901,16 +901,14 @@ fn summarize_route_diff(
     }
 
     // Match equal routes that moved position so we can classify movement as remove+add.
-    for current_idx in 0..current.routes.len() {
+    for (current_idx, current_route) in current.routes.iter().enumerate() {
         if matched_current[current_idx] {
             continue;
         }
 
-        if let Some(next_idx) = find_unmatched_matching_route_index(
-            &current.routes[current_idx],
-            &next.routes,
-            &matched_next,
-        ) {
+        if let Some(next_idx) =
+            find_unmatched_matching_route_index(current_route, &next.routes, &matched_next)
+        {
             matched_current[current_idx] = true;
             matched_next[next_idx] = true;
             summary.removed.push(current_idx);
@@ -2124,17 +2122,21 @@ async fn lookup_recording_for_request_with_subset_limit(
         "subset candidate combinations exceeded limit; falling back to recording scan"
     );
 
-    let matched = storage
-        .get_latest_recording_by_match_key_and_query_subset_scan(match_key, request_query)
+    let fallback_result = storage
+        .get_latest_recording_by_match_key_and_query_subset_scan_with_stats(
+            match_key,
+            request_query,
+        )
         .await?;
     tracing::debug!(
         match_key = %sanitize_match_key(match_key),
         subset_candidate_limit,
         request_query_param_count,
-        matched = matched.is_some(),
+        matched = fallback_result.recording.is_some(),
+        scanned_rows = fallback_result.scanned_rows,
         "completed subset lookup fallback recording scan"
     );
-    Ok(matched)
+    Ok(fallback_result.recording)
 }
 
 fn build_upstream_uri(upstream_base: &Uri, original: &Uri) -> anyhow::Result<Uri> {

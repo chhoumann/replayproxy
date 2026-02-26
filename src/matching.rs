@@ -260,6 +260,19 @@ fn subset_query_candidate_count(grouped: &[(&str, &str, usize)], limit: usize) -
     Some(candidate_count)
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParsedSubsetQuery<'a> {
+    sorted: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> ParsedSubsetQuery<'a> {
+    pub(crate) fn from_query(query: Option<&'a str>) -> Self {
+        Self {
+            sorted: query_params_sorted(query),
+        }
+    }
+}
+
 pub(crate) fn normalized_query(query: Option<&str>) -> String {
     normalized_query_from_sorted(&query_params_sorted(query))
 }
@@ -282,6 +295,7 @@ pub(crate) fn subset_query_candidate_normalizations_with_limit(
     Some(out)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn query_params_match(
     mode: QueryMatchMode,
     recorded_query: Option<&str>,
@@ -292,27 +306,39 @@ pub(crate) fn query_params_match(
         QueryMatchMode::Exact => {
             query_params_sorted(recorded_query) == query_params_sorted(request_query)
         }
-        QueryMatchMode::Subset => {
-            let required = query_params_sorted(recorded_query);
-            let candidate = query_params_sorted(request_query);
+        QueryMatchMode::Subset => subset_query_matches_parsed_request(
+            recorded_query,
+            &ParsedSubsetQuery::from_query(request_query),
+        ),
+    }
+}
 
-            let mut required_idx = 0;
-            let mut candidate_idx = 0;
-            while required_idx < required.len() && candidate_idx < candidate.len() {
-                match required[required_idx].cmp(&candidate[candidate_idx]) {
-                    std::cmp::Ordering::Less => return false,
-                    std::cmp::Ordering::Equal => {
-                        required_idx += 1;
-                        candidate_idx += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        candidate_idx += 1;
-                    }
-                }
+pub(crate) fn subset_query_matches_parsed_request(
+    recorded_query: Option<&str>,
+    request_query: &ParsedSubsetQuery<'_>,
+) -> bool {
+    subset_query_matches_sorted(
+        &query_params_sorted(recorded_query),
+        request_query.sorted.as_slice(),
+    )
+}
+
+fn subset_query_matches_sorted(required: &[(&str, &str)], candidate: &[(&str, &str)]) -> bool {
+    let mut required_idx = 0;
+    let mut candidate_idx = 0;
+    while required_idx < required.len() && candidate_idx < candidate.len() {
+        match required[required_idx].cmp(&candidate[candidate_idx]) {
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {
+                required_idx += 1;
+                candidate_idx += 1;
             }
-            required_idx == required.len()
+            std::cmp::Ordering::Greater => {
+                candidate_idx += 1;
+            }
         }
     }
+    required_idx == required.len()
 }
 
 fn normalized_headers_sorted(
@@ -404,8 +430,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MatchKeyError, compute_match_key, normalized_query, query_params_match,
-        subset_query_candidate_normalizations_with_limit,
+        MatchKeyError, ParsedSubsetQuery, compute_match_key, normalized_query, query_params_match,
+        subset_query_candidate_normalizations_with_limit, subset_query_matches_parsed_request,
     };
     use crate::config::{QueryMatchMode, RouteMatchConfig};
     use serde_json::Value;
@@ -696,6 +722,31 @@ headers_ignore = ["Date", "X-Request-Id"]
             Some("a=1&a=1"),
             Some("a=1&b=2")
         ));
+    }
+
+    #[test]
+    fn parsed_subset_query_matcher_matches_direct_subset_api() {
+        let request_query = Some("c=3&a=1&b=2&a=1");
+        let parsed = ParsedSubsetQuery::from_query(request_query);
+
+        let cases = [
+            (None, true),
+            (Some("a=1"), true),
+            (Some("a=1&a=1&b=2"), true),
+            (Some("a=1&a=1&a=1"), false),
+            (Some("d=4"), false),
+        ];
+
+        for (recorded_query, expected) in cases {
+            assert_eq!(
+                subset_query_matches_parsed_request(recorded_query, &parsed),
+                expected
+            );
+            assert_eq!(
+                query_params_match(QueryMatchMode::Subset, recorded_query, request_query),
+                expected
+            );
+        }
     }
 
     #[test]

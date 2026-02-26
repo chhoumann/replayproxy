@@ -199,6 +199,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
             source_path: source_path.to_path_buf(),
             runtime_config: Arc::clone(&runtime_config),
             status: Arc::clone(&runtime_status),
+            admin_api_token: config.proxy.admin_api_token.clone(),
             reload_lock: AsyncMutex::new(()),
         })
     });
@@ -1132,6 +1133,7 @@ struct ConfigReloader {
     source_path: PathBuf,
     runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
     status: Arc<RuntimeStatus>,
+    admin_api_token: Option<String>,
     reload_lock: AsyncMutex<()>,
 }
 
@@ -1309,6 +1311,9 @@ struct AdminConfigReloadResponse {
     max_body_bytes_before: usize,
     max_body_bytes_after: usize,
     changed: bool,
+    admin_api_token_changed: bool,
+    restart_required: bool,
+    reload_hints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1742,6 +1747,19 @@ impl ConfigReloader {
         let config = Config::from_path(&self.source_path).map_err(|err| {
             anyhow::anyhow!("reload config from {}: {err}", self.source_path.display())
         })?;
+        let admin_api_token_changed = config.proxy.admin_api_token != self.admin_api_token;
+        let restart_required = admin_api_token_changed;
+        let mut reload_hints = Vec::new();
+        if admin_api_token_changed {
+            reload_hints.push(
+                "`proxy.admin_api_token` changed in config but is not hot-reloaded; restart replayproxy to apply it"
+                    .to_owned(),
+            );
+            tracing::warn!(
+                source = %self.source_path.display(),
+                "config reload detected `proxy.admin_api_token` change; restart required to apply admin API auth updates"
+            );
+        }
         let next_runtime = ProxyRuntimeConfig::from_config(&config)?;
 
         let (route_diff, routes_before, max_body_bytes_before, routes_after, max_body_bytes_after) = {
@@ -1777,6 +1795,8 @@ impl ConfigReloader {
             route_ids_changed = %format_route_indices(&route_diff.changed),
             max_body_bytes_before,
             max_body_bytes_after,
+            admin_api_token_changed,
+            restart_required,
             "applied config reload diff"
         );
 
@@ -1790,6 +1810,9 @@ impl ConfigReloader {
             max_body_bytes_before,
             max_body_bytes_after,
             changed,
+            admin_api_token_changed,
+            restart_required,
+            reload_hints,
         })
     }
 }

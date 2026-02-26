@@ -286,6 +286,7 @@ Security behavior:
 - If `admin_bind` is omitted, admin binds to loopback.
 - If `admin_api_token` is set, all admin endpoints (including `/metrics`) require header:
   - `x-replayproxy-admin-token: <token>`
+- `admin_api_token` is read at process start. `/_admin/config/reload` does not rotate admin auth tokens; restart the process to apply token changes.
 
 Core endpoints:
 
@@ -413,6 +414,7 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 
 - `409 config reload unavailable` means replayproxy does not have a config source path.
 - Default builds include file-watch reload with debounce; multiple rapid edits may coalesce.
+- `200` reload responses include `restart_required` and `reload_hints`; if `proxy.admin_api_token` changed, reload reports restart required and keeps the existing runtime token until restart.
 
 ## Known limitations (current)
 

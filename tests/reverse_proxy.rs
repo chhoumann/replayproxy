@@ -4645,6 +4645,12 @@ upstream = "http://{upstream_addr}"
     assert_eq!(body["max_body_bytes_before"].as_u64(), Some(64));
     assert_eq!(body["max_body_bytes_after"].as_u64(), Some(128));
     assert_eq!(body["changed"].as_bool(), Some(true));
+    assert_eq!(body["admin_api_token_changed"].as_bool(), Some(false));
+    assert_eq!(body["restart_required"].as_bool(), Some(false));
+    assert_eq!(
+        body["reload_hints"].as_array().map(|hints| hints.len()),
+        Some(0)
+    );
 
     let stale_route_uri: Uri = format!("http://{}/v1/after-reload", proxy.listen_addr)
         .parse()
@@ -4753,6 +4759,12 @@ upstream = "http://{upstream_addr}"
     assert_eq!(body["max_body_bytes_before"].as_u64(), Some(64));
     assert_eq!(body["max_body_bytes_after"].as_u64(), Some(64));
     assert_eq!(body["changed"].as_bool(), Some(true));
+    assert_eq!(body["admin_api_token_changed"].as_bool(), Some(false));
+    assert_eq!(body["restart_required"].as_bool(), Some(false));
+    assert_eq!(
+        body["reload_hints"].as_array().map(|hints| hints.len()),
+        Some(0)
+    );
 
     let reloaded_route_uri: Uri = format!("http://{}/v2/after-reload", proxy.listen_addr)
         .parse()
@@ -4770,6 +4782,99 @@ upstream = "http://{upstream_addr}"
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_config_reload_endpoint_reports_restart_required_for_admin_api_token_changes() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("replayproxy.toml");
+    let write_config = |token: &str| {
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+admin_api_token = "{token}"
+"#
+            ),
+        )
+        .unwrap();
+    };
+
+    write_config("super-secret");
+
+    let config = replayproxy::config::Config::from_path(&config_path).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let reload_uri: Uri = format!("http://{admin_addr}/_admin/config/reload")
+        .parse()
+        .unwrap();
+
+    write_config("rotated-secret");
+
+    let reload_req = Request::builder()
+        .method(Method::POST)
+        .uri(reload_uri)
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let reload_res = client.request(reload_req).await.unwrap();
+    assert_eq!(reload_res.status(), StatusCode::OK);
+    let reload_body = response_json(reload_res).await;
+    assert_eq!(reload_body["changed"].as_bool(), Some(false));
+    assert_eq!(reload_body["admin_api_token_changed"].as_bool(), Some(true));
+    assert_eq!(reload_body["restart_required"].as_bool(), Some(true));
+    assert!(
+        reload_body["reload_hints"]
+            .as_array()
+            .and_then(|hints| hints.first())
+            .and_then(|hint| hint.as_str())
+            .is_some_and(|hint| hint.contains("`proxy.admin_api_token`"))
+    );
+
+    let old_token_status_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let old_token_status_res = client.request(old_token_status_req).await.unwrap();
+    assert_eq!(old_token_status_res.status(), StatusCode::OK);
+    let _ = old_token_status_res
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let new_token_status_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .header(ADMIN_API_TOKEN_HEADER, "rotated-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let new_token_status_res = client.request(new_token_status_req).await.unwrap();
+    assert_eq!(new_token_status_res.status(), StatusCode::UNAUTHORIZED);
+    let _ = new_token_status_res
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    proxy.shutdown().await;
 }
 
 #[tokio::test]

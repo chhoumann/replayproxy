@@ -3,6 +3,7 @@ use std::{
     convert::Infallible,
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -25,6 +26,8 @@ use hyper_util::{
 };
 use replayproxy::storage::{Recording, ResponseChunk, Storage};
 use rusqlite::Connection;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -32,6 +35,8 @@ use tokio::{
     sync::mpsc,
     time::{sleep, timeout},
 };
+use tokio_rustls::TlsConnector;
+use x509_parser::pem::parse_x509_pem;
 
 const BINARY_HEADER_VALUE: &[u8] = b"\x80\xffok";
 const ADMIN_API_TOKEN_HEADER: &str = "x-replayproxy-admin-token";
@@ -248,6 +253,101 @@ path_prefix = "/"
     drop(stream);
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn https_connect_mitm_records_and_replays_requests() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ca_dir = temp_dir.path().join("ca");
+    let ca_paths = replayproxy::ca::generate_ca(&ca_dir, false).unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    let session = "default";
+
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        ca_paths.cert_path.display(),
+        ca_paths.key_path.display(),
+        storage_dir.display(),
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+    let tls_client_config = tls_client_config_for_ca_cert(&ca_paths.cert_path);
+
+    let (record_status, record_body) = send_https_get_via_connect(
+        record_proxy.listen_addr,
+        "api.example.test:443",
+        "api.example.test",
+        Arc::clone(&tls_client_config),
+        "/api/mitm?x=1",
+    )
+    .await;
+    assert_eq!(record_status, StatusCode::CREATED);
+    assert_eq!(record_body, Bytes::from_static(b"upstream-body"));
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/mitm");
+    assert_eq!(captured.uri.query(), Some("x=1"));
+
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+"#,
+        ca_paths.cert_path.display(),
+        ca_paths.key_path.display(),
+        storage_dir.display(),
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let (replay_status, replay_body) = send_https_get_via_connect(
+        replay_proxy.listen_addr,
+        "api.example.test:443",
+        "api.example.test",
+        tls_client_config,
+        "/api/mitm?x=1",
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::CREATED);
+    assert_eq!(replay_body, Bytes::from_static(b"upstream-body"));
+
+    replay_proxy.shutdown().await;
 }
 
 #[tokio::test]
@@ -4054,6 +4154,65 @@ async fn read_http_response_head(stream: &mut TcpStream) -> Vec<u8> {
         assert!(head.len() <= 16 * 1024, "response headers exceeded limit");
     }
     head
+}
+
+fn tls_client_config_for_ca_cert(ca_cert_path: &Path) -> Arc<ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_pem = fs::read(ca_cert_path).unwrap();
+    let (_, pem_block) = parse_x509_pem(&cert_pem).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(pem_block.contents)).unwrap();
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
+async fn send_https_get_via_connect(
+    proxy_addr: SocketAddr,
+    connect_authority: &str,
+    tls_server_name: &str,
+    tls_client_config: Arc<ClientConfig>,
+    request_uri: &str,
+) -> (StatusCode, Bytes) {
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let connect_request = format!(
+        "CONNECT {connect_authority} HTTP/1.1\r\nHost: {connect_authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(connect_request.as_bytes()).await.unwrap();
+
+    let response_head = read_http_response_head(&mut stream).await;
+    assert!(
+        response_head.starts_with(b"HTTP/1.1 200"),
+        "unexpected CONNECT response: {}",
+        String::from_utf8_lossy(&response_head)
+    );
+
+    let connector = TlsConnector::from(tls_client_config);
+    let tls_server_name = ServerName::try_from(tls_server_name.to_owned()).unwrap();
+    let tls_stream = connector.connect(tls_server_name, stream).await.unwrap();
+
+    let io = TokioIo::new(tls_stream);
+    let (mut sender, connection) = http1::handshake(io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(request_uri)
+        .header(header::HOST, connect_authority)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    let status = res.status();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+
+    drop(sender);
+    let _ = connection_task.await;
+
+    (status, body)
 }
 
 async fn spawn_upstream() -> (

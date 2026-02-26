@@ -56,6 +56,8 @@ pub enum CaInstallResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafCertMaterial {
     pub hostname: String,
+    pub cert_der: Vec<u8>,
+    pub key_der: Vec<u8>,
     pub cert_pem: String,
     pub key_pem: String,
 }
@@ -128,6 +130,8 @@ impl LeafCertGenerator {
 
         let material = Arc::new(LeafCertMaterial {
             hostname: normalized_hostname.clone(),
+            cert_der: cert.der().to_vec(),
+            key_der: leaf_key.serialize_der(),
             cert_pem: cert.pem(),
             key_pem: leaf_key.serialize_pem(),
         });

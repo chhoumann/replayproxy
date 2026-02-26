@@ -20,15 +20,19 @@ use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::{Frame, Incoming},
+    client::conn::http1,
     header::{self, HeaderName, HeaderValue},
+    http::uri::Authority,
     service::service_fn,
 };
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnectionBuilder,
 };
 use regex::Regex;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json_path::JsonPath;
@@ -39,6 +43,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, oneshot},
     time::{Instant as TokioInstant, Sleep},
 };
+use tokio_rustls::TlsAcceptor;
 
 use crate::{
     ca,
@@ -56,7 +61,8 @@ use crate::{
 };
 
 type ProxyBody = BoxBody<Bytes, Box<dyn StdError + Send + Sync>>;
-type HttpClient = Client<HttpConnector, ProxyBody>;
+type ProxyHttpsConnector = HttpsConnector<HttpConnector>;
+type HttpClient = Client<ProxyHttpsConnector, ProxyBody>;
 const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 const SUBSET_QUERY_CANDIDATE_LIMIT: usize = 4096;
 const ADMIN_RECORDINGS_DEFAULT_LIMIT: usize = 100;
@@ -109,6 +115,7 @@ impl ProxyHandle {
 }
 
 pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
+    ensure_rustls_crypto_provider()?;
     validate_tls_ca_material(config)?;
 
     let listener = TcpListener::bind(config.proxy.listen)
@@ -155,17 +162,18 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         .is_some_and(|metrics| metrics.enabled);
     let session_manager = SessionManager::from_config(config)?;
 
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(false);
-    let client: HttpClient = Client::builder(TokioExecutor::new()).build(connector);
+    let client = build_http_client()?;
+    let mitm_tls = build_mitm_tls_state(config)?;
     let runtime_mode_override = Arc::new(RwLock::new(None));
 
     let state = Arc::new(ProxyState::new(
+        listen_addr,
         Arc::clone(&runtime_config),
         client,
         Arc::clone(&runtime_status),
         Arc::clone(&session_runtime),
         Arc::clone(&runtime_mode_override),
+        mitm_tls,
     ));
     let config_reloader = config.source_path().map(|source_path| {
         Arc::new(ConfigReloader {
@@ -261,6 +269,53 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         config_watcher_shutdown_tx,
         config_watcher_join,
     })
+}
+
+fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+        && rustls::crypto::CryptoProvider::get_default().is_none()
+    {
+        return Err(anyhow::anyhow!("install rustls ring crypto provider"));
+    }
+    Ok(())
+}
+
+fn build_http_client() -> anyhow::Result<HttpClient> {
+    let connector = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .map_err(|err| anyhow::anyhow!("load native TLS root certificates: {err}"))?
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+fn build_mitm_tls_state(config: &Config) -> anyhow::Result<Option<Arc<MitmTlsState>>> {
+    let Some(tls) = config.proxy.tls.as_ref() else {
+        return Ok(None);
+    };
+    if !tls.enabled {
+        return Ok(None);
+    }
+
+    let cert_path = tls.ca_cert.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("`proxy.tls.ca_cert` is required when `proxy.tls.enabled = true`")
+    })?;
+    let key_path = tls.ca_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("`proxy.tls.ca_key` is required when `proxy.tls.enabled = true`")
+    })?;
+    let leaf_generator =
+        ca::LeafCertGenerator::from_ca_files(cert_path, key_path).map_err(|err| {
+            anyhow::anyhow!("initialize CONNECT MITM leaf certificate generator: {err}")
+        })?;
+    Ok(Some(Arc::new(MitmTlsState { leaf_generator })))
 }
 
 fn validate_tls_ca_material(config: &Config) -> anyhow::Result<()> {
@@ -1332,27 +1387,38 @@ fn absolute_watch_path(path: &std::path::Path) -> PathBuf {
 
 #[derive(Debug)]
 struct ProxyState {
+    proxy_listen_addr: SocketAddr,
     runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
     client: HttpClient,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     status: Arc<RuntimeStatus>,
     runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
+    mitm_tls: Option<Arc<MitmTlsState>>,
+}
+
+#[derive(Debug)]
+struct MitmTlsState {
+    leaf_generator: ca::LeafCertGenerator,
 }
 
 impl ProxyState {
     fn new(
+        proxy_listen_addr: SocketAddr,
         runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
         client: HttpClient,
         status: Arc<RuntimeStatus>,
         session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
         runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
+        mitm_tls: Option<Arc<MitmTlsState>>,
     ) -> Self {
         Self {
+            proxy_listen_addr,
             runtime_config,
             client,
             session_runtime,
             status,
             runtime_mode_override,
+            mitm_tls,
         }
     }
 
@@ -1746,7 +1812,7 @@ async fn proxy_handler(
     mode = Some(route.mode);
 
     if req.method() == Method::CONNECT {
-        let Some(authority) = req.uri().authority() else {
+        let Some(connect_authority) = req.uri().authority().cloned() else {
             respond!(
                 None,
                 proxy_simple_response(
@@ -1755,36 +1821,56 @@ async fn proxy_handler(
                 )
             );
         };
-        let tunnel_target = connect_tunnel_target(authority);
+        if let Some(mitm_tls) = state.mitm_tls.as_ref() {
+            let on_upgrade = hyper::upgrade::on(&mut req);
+            let mitm_tls = Arc::clone(mitm_tls);
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                if let Err(err) =
+                    mitm_upgraded_connection(on_upgrade, connect_authority, state, mitm_tls).await
+                {
+                    tracing::debug!("CONNECT MITM session finished: {err}");
+                }
+            });
 
-        state
-            .status
-            .upstream_requests_total
-            .fetch_add(1, Ordering::Relaxed);
-        let upstream_started_at = Instant::now();
-        let upstream_stream = match TcpStream::connect(tunnel_target.as_str()).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                let upstream_latency = upstream_started_at.elapsed();
-                tracing::debug!(target = %tunnel_target, "CONNECT upstream dial failed: {err}");
-                respond!(
-                    Some(upstream_latency),
-                    proxy_simple_response(StatusCode::BAD_GATEWAY, "CONNECT upstream dial failed",)
-                );
-            }
-        };
-        let upstream_latency = upstream_started_at.elapsed();
+            let mut response = Response::new(boxed_full(Bytes::new()));
+            *response.status_mut() = StatusCode::OK;
+            respond!(None, response);
+        } else {
+            let tunnel_target = connect_tunnel_target(&connect_authority);
 
-        let on_upgrade = hyper::upgrade::on(&mut req);
-        tokio::spawn(async move {
-            if let Err(err) = tunnel_upgraded_connection(on_upgrade, upstream_stream).await {
-                tracing::debug!(target = %tunnel_target, "CONNECT tunnel finished: {err}");
-            }
-        });
+            state
+                .status
+                .upstream_requests_total
+                .fetch_add(1, Ordering::Relaxed);
+            let upstream_started_at = Instant::now();
+            let upstream_stream = match TcpStream::connect(tunnel_target.as_str()).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let upstream_latency = upstream_started_at.elapsed();
+                    tracing::debug!(target = %tunnel_target, "CONNECT upstream dial failed: {err}");
+                    respond!(
+                        Some(upstream_latency),
+                        proxy_simple_response(
+                            StatusCode::BAD_GATEWAY,
+                            "CONNECT upstream dial failed",
+                        )
+                    );
+                }
+            };
+            let upstream_latency = upstream_started_at.elapsed();
 
-        let mut response = Response::new(boxed_full(Bytes::new()));
-        *response.status_mut() = StatusCode::OK;
-        respond!(Some(upstream_latency), response);
+            let on_upgrade = hyper::upgrade::on(&mut req);
+            tokio::spawn(async move {
+                if let Err(err) = tunnel_upgraded_connection(on_upgrade, upstream_stream).await {
+                    tracing::debug!(target = %tunnel_target, "CONNECT tunnel finished: {err}");
+                }
+            });
+
+            let mut response = Response::new(boxed_full(Bytes::new()));
+            *response.status_mut() = StatusCode::OK;
+            respond!(Some(upstream_latency), response);
+        }
     }
 
     let upstream_uri = if let Some(upstream_base) = route.upstream.as_ref() {
@@ -2529,6 +2615,192 @@ async fn tunnel_upgraded_connection(
         .await
         .map_err(|err| anyhow::anyhow!("copy tunnel bytes: {err}"))?;
     Ok(())
+}
+
+fn normalize_tunneled_https_request_uri(
+    connect_authority: &Authority,
+    request_uri: &Uri,
+) -> anyhow::Result<Uri> {
+    let has_scheme = request_uri.scheme().is_some();
+    let has_authority = request_uri.authority().is_some();
+    if has_scheme || has_authority {
+        if !(has_scheme && has_authority) {
+            anyhow::bail!(
+                "HTTPS CONNECT request target must be origin-form or absolute-form URI with authority"
+            );
+        }
+        if !matches!(request_uri.scheme_str(), Some("http" | "https")) {
+            anyhow::bail!("HTTPS CONNECT request target scheme must be `http` or `https`");
+        }
+        return Ok(request_uri.clone());
+    }
+
+    if request_uri.path() == "*" {
+        anyhow::bail!("HTTPS CONNECT request target `*` is not supported");
+    }
+    let path_and_query = request_uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/");
+    let uri = format!("https://{}{path_and_query}", connect_authority.as_str());
+    uri.parse()
+        .map_err(|err| anyhow::anyhow!("construct tunneled HTTPS request URI: {err}"))
+}
+
+fn normalize_tunneled_https_request(
+    mut req: Request<Incoming>,
+    connect_authority: &Authority,
+) -> anyhow::Result<Request<Incoming>> {
+    let normalized_uri = normalize_tunneled_https_request_uri(connect_authority, req.uri())?;
+    *req.uri_mut() = normalized_uri;
+    Ok(req)
+}
+
+fn build_leaf_tls_acceptor(leaf: &ca::LeafCertMaterial) -> anyhow::Result<TlsAcceptor> {
+    let cert_chain = vec![CertificateDer::from(leaf.cert_der.clone())];
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key_der.clone()));
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|err| anyhow::anyhow!("build TLS server certificate: {err}"))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+async fn mitm_upgraded_connection(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    connect_authority: Authority,
+    state: Arc<ProxyState>,
+    mitm_tls: Arc<MitmTlsState>,
+) -> anyhow::Result<()> {
+    let upgraded = on_upgrade
+        .await
+        .map_err(|err| anyhow::anyhow!("upgrade client CONNECT tunnel: {err}"))?;
+    let leaf = mitm_tls
+        .leaf_generator
+        .issue_for_host(connect_authority.host())
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "issue leaf certificate for CONNECT authority `{}`: {err}",
+                connect_authority.host()
+            )
+        })?;
+    let acceptor = build_leaf_tls_acceptor(&leaf)?;
+    let upgraded = TokioIo::new(upgraded);
+    let tls_stream = acceptor.accept(upgraded).await.map_err(|err| {
+        anyhow::anyhow!(
+            "TLS handshake for CONNECT authority `{connect_authority}` failed: {err}; ensure client trust includes the replayproxy CA certificate"
+        )
+    })?;
+
+    let io = TokioIo::new(tls_stream);
+    let service_connect_authority = connect_authority.clone();
+    let service = service_fn(move |req| {
+        let state = Arc::clone(&state);
+        let connect_authority = service_connect_authority.clone();
+        async move {
+            let response =
+                dispatch_tunneled_request_via_proxy_listener(req, state, &connect_authority).await;
+            Ok::<_, Infallible>(response)
+        }
+    });
+    let builder = ConnectionBuilder::new(TokioExecutor::new());
+    builder
+        .serve_connection_with_upgrades(io, service)
+        .await
+        .map_err(|err| anyhow::anyhow!("serve CONNECT tunneled HTTP session: {err}"))?;
+    Ok(())
+}
+
+async fn dispatch_tunneled_request_via_proxy_listener(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    connect_authority: &Authority,
+) -> Response<ProxyBody> {
+    let req = match normalize_tunneled_https_request(req, connect_authority) {
+        Ok(req) => req,
+        Err(err) => {
+            tracing::debug!(
+                authority = %connect_authority,
+                "failed to normalize CONNECT tunneled request: {err}"
+            );
+            return proxy_simple_response(
+                StatusCode::BAD_REQUEST,
+                "invalid HTTPS request target inside CONNECT tunnel",
+            );
+        }
+    };
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(err) => {
+            tracing::debug!("failed reading CONNECT tunneled request body: {err}");
+            return proxy_simple_response(
+                StatusCode::BAD_REQUEST,
+                "failed to read HTTPS request body inside CONNECT tunnel",
+            );
+        }
+    };
+
+    let stream = match TcpStream::connect(state.proxy_listen_addr).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::debug!(
+                proxy_listen = %state.proxy_listen_addr,
+                "failed opening internal proxy dispatch connection for CONNECT tunnel: {err}"
+            );
+            return proxy_simple_response(
+                StatusCode::BAD_GATEWAY,
+                "failed dispatching HTTPS request inside CONNECT tunnel",
+            );
+        }
+    };
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = match http1::handshake::<_, Full<Bytes>>(io).await {
+        Ok(handshake) => handshake,
+        Err(err) => {
+            tracing::debug!("failed internal proxy dispatch handshake for CONNECT tunnel: {err}");
+            return proxy_simple_response(
+                StatusCode::BAD_GATEWAY,
+                "failed dispatching HTTPS request inside CONNECT tunnel",
+            );
+        }
+    };
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let internal_request = Request::from_parts(parts, Full::new(body_bytes));
+    let response = match sender.send_request(internal_request).await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::debug!("internal proxy dispatch request for CONNECT tunnel failed: {err}");
+            connection_task.abort();
+            return proxy_simple_response(
+                StatusCode::BAD_GATEWAY,
+                "failed dispatching HTTPS request inside CONNECT tunnel",
+            );
+        }
+    };
+    drop(sender);
+
+    let (response_parts, response_body) = response.into_parts();
+    let response_body_bytes = match response_body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(err) => {
+            tracing::debug!("failed reading internal proxy dispatch response body: {err}");
+            connection_task.abort();
+            return proxy_simple_response(
+                StatusCode::BAD_GATEWAY,
+                "failed reading HTTPS response body inside CONNECT tunnel",
+            );
+        }
+    };
+
+    let _ = connection_task.await;
+    Response::from_parts(response_parts, boxed_full(response_body_bytes))
 }
 
 fn set_host_header(headers: &mut hyper::HeaderMap, uri: &Uri) {
@@ -3788,9 +4060,9 @@ mod tests {
     use super::{
         CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, connect_tunnel_target,
         emit_proxy_request_log, format_route_ref, forward_proxy_upstream_uri,
-        lookup_recording_for_request_with_subset_limit, mode_log_label, redact_recording_body_json,
-        redact_recording_headers, request_runtime_config_for_path, sanitize_match_key,
-        select_route, summarize_route_diff,
+        lookup_recording_for_request_with_subset_limit, mode_log_label,
+        normalize_tunneled_https_request_uri, redact_recording_body_json, redact_recording_headers,
+        request_runtime_config_for_path, sanitize_match_key, select_route, summarize_route_diff,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
@@ -3921,6 +4193,45 @@ mod tests {
         let authority: hyper::http::uri::Authority = "[::1]".parse().unwrap();
 
         assert_eq!(connect_tunnel_target(&authority), "[::1]:443");
+    }
+
+    #[test]
+    fn normalize_tunneled_https_request_uri_builds_absolute_uri_from_origin_form() {
+        let connect_authority: hyper::http::uri::Authority =
+            "api.example.test:443".parse().unwrap();
+        let request_uri: hyper::Uri = "/v1/chat/completions?x=1".parse().unwrap();
+
+        let normalized =
+            normalize_tunneled_https_request_uri(&connect_authority, &request_uri).unwrap();
+        assert_eq!(
+            normalized,
+            "https://api.example.test:443/v1/chat/completions?x=1"
+        );
+    }
+
+    #[test]
+    fn normalize_tunneled_https_request_uri_preserves_valid_absolute_form() {
+        let connect_authority: hyper::http::uri::Authority =
+            "api.example.test:443".parse().unwrap();
+        let request_uri: hyper::Uri = "https://other.example.test/v1/models".parse().unwrap();
+
+        let normalized =
+            normalize_tunneled_https_request_uri(&connect_authority, &request_uri).unwrap();
+        assert_eq!(normalized, request_uri);
+    }
+
+    #[test]
+    fn normalize_tunneled_https_request_uri_rejects_unsupported_absolute_scheme() {
+        let connect_authority: hyper::http::uri::Authority =
+            "api.example.test:443".parse().unwrap();
+        let request_uri: hyper::Uri = "ftp://api.example.test/v1/models".parse().unwrap();
+
+        let err =
+            normalize_tunneled_https_request_uri(&connect_authority, &request_uri).unwrap_err();
+        assert!(
+            err.to_string().contains("scheme must be `http` or `https`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

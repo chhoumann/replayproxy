@@ -112,9 +112,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 if git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
-  ahead_behind="$(git rev-list --left-right --count HEAD...@{upstream})"
-  ahead_count="${ahead_behind%% *}"
-  behind_count="${ahead_behind##* }"
+  read -r ahead_count behind_count <<<"$(git rev-list --left-right --count HEAD...@{upstream})"
   if [[ "${ahead_count}" != "0" || "${behind_count}" != "0" ]]; then
     echo "Branch is not up to date with upstream (ahead=${ahead_count}, behind=${behind_count})." >&2
     exit 1

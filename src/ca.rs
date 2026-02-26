@@ -1,12 +1,17 @@
 use std::{
+    collections::HashMap,
     env, fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, bail};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
 
 pub const DEFAULT_CA_SUBDIR: &str = ".replayproxy/ca";
@@ -46,6 +51,112 @@ pub enum CaInstallResult {
     Manual {
         details: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafCertMaterial {
+    pub hostname: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+#[derive(Debug)]
+pub struct LeafCertGenerator {
+    issuer: Issuer<'static, KeyPair>,
+    cache: Mutex<HashMap<String, Arc<LeafCertMaterial>>>,
+}
+
+impl LeafCertGenerator {
+    pub fn from_ca_dir(ca_dir: &Path) -> anyhow::Result<Self> {
+        let paths = ca_material_paths(ca_dir);
+        Self::from_ca_files(&paths.cert_path, &paths.key_path)
+    }
+
+    pub fn from_ca_files(cert_path: &Path, key_path: &Path) -> anyhow::Result<Self> {
+        validate_ca_material(cert_path, key_path)?;
+
+        let ca_cert_pem = fs::read_to_string(cert_path)
+            .with_context(|| format!("read CA certificate {}", cert_path.display()))?;
+        let ca_key_pem = fs::read_to_string(key_path)
+            .with_context(|| format!("read CA private key {}", key_path.display()))?;
+        Self::from_ca_pem(&ca_cert_pem, &ca_key_pem)
+    }
+
+    pub fn from_ca_pem(ca_cert_pem: &str, ca_key_pem: &str) -> anyhow::Result<Self> {
+        let key_pair =
+            KeyPair::from_pem(ca_key_pem).context("parse CA private key for leaf issuance")?;
+        let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, key_pair)
+            .context("parse CA certificate for leaf issuance")?;
+
+        Ok(Self {
+            issuer,
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn issue_for_host(&self, hostname: &str) -> anyhow::Result<Arc<LeafCertMaterial>> {
+        let normalized_hostname = normalize_leaf_hostname(hostname)?;
+
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = cache.get(&normalized_hostname) {
+            return Ok(Arc::clone(existing));
+        }
+
+        let mut params =
+            CertificateParams::new(vec![normalized_hostname.clone()]).with_context(|| {
+                format!("initialize leaf certificate parameters for `{normalized_hostname}`")
+            })?;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, normalized_hostname.clone());
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.is_ca = IsCa::NoCa;
+        params.use_authority_key_identifier_extension = true;
+
+        let leaf_key = KeyPair::generate()
+            .with_context(|| format!("generate leaf key for `{normalized_hostname}`"))?;
+        let cert = params
+            .signed_by(&leaf_key, &self.issuer)
+            .with_context(|| format!("sign leaf certificate for `{normalized_hostname}`"))?;
+
+        let material = Arc::new(LeafCertMaterial {
+            hostname: normalized_hostname.clone(),
+            cert_pem: cert.pem(),
+            key_pem: leaf_key.serialize_pem(),
+        });
+        cache.insert(normalized_hostname, Arc::clone(&material));
+        Ok(material)
+    }
+}
+
+fn normalize_leaf_hostname(hostname: &str) -> anyhow::Result<String> {
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        bail!("leaf certificate hostname must not be empty");
+    }
+
+    let mut normalized = if hostname.starts_with('[') && hostname.ends_with(']') {
+        hostname[1..hostname.len() - 1].to_owned()
+    } else {
+        hostname.to_owned()
+    };
+    if let Some(stripped) = normalized.strip_suffix('.')
+        && !stripped.is_empty()
+    {
+        normalized = stripped.to_owned();
+    }
+    if normalized.is_empty() {
+        bail!("leaf certificate hostname must not be empty");
+    }
+
+    Ok(normalized.to_ascii_lowercase())
 }
 
 pub fn default_ca_dir() -> anyhow::Result<PathBuf> {
@@ -450,13 +561,14 @@ fn trim_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, sync::Arc};
 
     use super::{
-        DEFAULT_CA_SUBDIR, default_ca_dir_from_home, export_ca_cert, generate_ca,
-        linux_manual_install_instructions, validate_ca_material,
+        DEFAULT_CA_SUBDIR, LeafCertGenerator, default_ca_dir_from_home, export_ca_cert,
+        generate_ca, linux_manual_install_instructions, validate_ca_material,
     };
     use tempfile::tempdir;
+    use x509_parser::extensions::GeneralName;
 
     #[test]
     fn default_ca_dir_from_home_appends_expected_subdir() {
@@ -597,6 +709,90 @@ mod tests {
             .expect_err("missing certificate should fail");
         assert!(
             err.to_string().contains("read CA certificate"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn leaf_generator_sets_cn_and_san_for_hostname() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let ca_dir = temp_dir.path().join("ca");
+        let generated = generate_ca(&ca_dir, false).expect("CA generation should succeed");
+
+        let generator = LeafCertGenerator::from_ca_files(&generated.cert_path, &generated.key_path)
+            .expect("leaf generator should initialize");
+        let leaf = generator
+            .issue_for_host("Api.Example.Test")
+            .expect("leaf cert issuance should succeed");
+
+        let (_, pem_block) =
+            super::parse_x509_pem(leaf.cert_pem.as_bytes()).expect("leaf cert PEM should parse");
+        let (_, certificate) = super::parse_x509_certificate(&pem_block.contents)
+            .expect("leaf certificate DER should parse");
+
+        let cn_values: Result<Vec<_>, _> = certificate
+            .subject()
+            .iter_common_name()
+            .map(|attr| attr.as_str())
+            .collect();
+        assert_eq!(
+            cn_values.expect("CN should decode"),
+            vec!["api.example.test"]
+        );
+
+        let san = certificate
+            .subject_alternative_name()
+            .expect("SAN extension lookup should succeed")
+            .expect("SAN extension should exist");
+        let has_matching_san = san.value.general_names.iter().any(|name| {
+            matches!(
+                name,
+                GeneralName::DNSName(value) if *value == "api.example.test"
+            )
+        });
+        assert!(
+            has_matching_san,
+            "leaf SAN should include requested host: {:?}",
+            san.value.general_names
+        );
+    }
+
+    #[test]
+    fn leaf_generator_caches_certificates_by_normalized_hostname() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let ca_dir = temp_dir.path().join("ca");
+        let generated = generate_ca(&ca_dir, false).expect("CA generation should succeed");
+
+        let generator = LeafCertGenerator::from_ca_files(&generated.cert_path, &generated.key_path)
+            .expect("leaf generator should initialize");
+        let first = generator
+            .issue_for_host("API.EXAMPLE.TEST")
+            .expect("first issuance should succeed");
+        let second = generator
+            .issue_for_host("api.example.test")
+            .expect("second issuance should succeed");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache should return same in-memory cert material instance"
+        );
+        assert_eq!(first.cert_pem, second.cert_pem);
+        assert_eq!(first.key_pem, second.key_pem);
+    }
+
+    #[test]
+    fn leaf_generator_rejects_empty_hostname() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let ca_dir = temp_dir.path().join("ca");
+        let generated = generate_ca(&ca_dir, false).expect("CA generation should succeed");
+
+        let generator = LeafCertGenerator::from_ca_files(&generated.cert_path, &generated.key_path)
+            .expect("leaf generator should initialize");
+        let err = generator
+            .issue_for_host("   ")
+            .expect_err("empty hostname should fail");
+        assert!(
+            err.to_string().contains("must not be empty"),
             "unexpected error: {err}"
         );
     }

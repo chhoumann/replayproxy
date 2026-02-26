@@ -9,6 +9,29 @@ use mlua::{Function, Lua, String as LuaString, Table, Value};
 
 pub const TRANSFORM_FUNCTION_NAME: &str = "transform";
 
+#[derive(Clone, Copy)]
+struct ScriptHook {
+    hook_name: &'static str,
+    global_name: &'static str,
+}
+
+const ON_REQUEST_HOOK: ScriptHook = ScriptHook {
+    hook_name: "on_request",
+    global_name: "request",
+};
+const ON_RESPONSE_HOOK: ScriptHook = ScriptHook {
+    hook_name: "on_response",
+    global_name: "response",
+};
+const ON_RECORD_HOOK: ScriptHook = ScriptHook {
+    hook_name: "on_record",
+    global_name: "recording",
+};
+const ON_REPLAY_HOOK: ScriptHook = ScriptHook {
+    hook_name: "on_replay",
+    global_name: "response",
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptRequest {
     pub method: String,
@@ -70,8 +93,7 @@ pub fn run_on_request_script(
 ) -> anyhow::Result<()> {
     let transformed = run_message_script(
         route_ref,
-        "on_request",
-        "request",
+        ON_REQUEST_HOOK,
         script_label,
         script_source,
         request,
@@ -90,8 +112,7 @@ pub fn run_on_response_script(
 ) -> anyhow::Result<()> {
     let transformed = run_message_script(
         route_ref,
-        "on_response",
-        "response",
+        ON_RESPONSE_HOOK,
         script_label,
         script_source,
         response,
@@ -110,8 +131,7 @@ pub fn run_on_record_script(
 ) -> anyhow::Result<()> {
     let transformed = run_message_script(
         route_ref,
-        "on_record",
-        "recording",
+        ON_RECORD_HOOK,
         script_label,
         script_source,
         recording,
@@ -130,8 +150,7 @@ pub fn run_on_replay_script(
 ) -> anyhow::Result<()> {
     let transformed = run_message_script(
         route_ref,
-        "on_replay",
-        "response",
+        ON_REPLAY_HOOK,
         script_label,
         script_source,
         response,
@@ -144,8 +163,7 @@ pub fn run_on_replay_script(
 
 fn run_message_script<T>(
     route_ref: &str,
-    hook_name: &str,
-    global_name: &str,
+    hook: ScriptHook,
     script_label: &str,
     script_source: &str,
     message: &T,
@@ -157,37 +175,51 @@ fn run_message_script<T>(
     let message_table = to_lua_table(&lua, message).map_err(|err| {
         script_context_error(
             route_ref,
-            hook_name,
+            hook.hook_name,
             script_label,
             "prepare script input",
             err,
         )
     })?;
     globals
-        .set(global_name, message_table.clone())
+        .set(hook.global_name, message_table.clone())
         .map_err(|err| {
-            script_context_error(route_ref, hook_name, script_label, "set globals", err)
+            script_context_error(route_ref, hook.hook_name, script_label, "set globals", err)
         })?;
 
     lua.load(script_source)
         .set_name(script_label)
         .exec()
-        .map_err(|err| script_context_error(route_ref, hook_name, script_label, "execute", err))?;
+        .map_err(|err| {
+            script_context_error(route_ref, hook.hook_name, script_label, "execute", err)
+        })?;
 
     let transform_fn: Option<Function> = globals.get(TRANSFORM_FUNCTION_NAME).map_err(|err| {
-        script_context_error(route_ref, hook_name, script_label, "load transform()", err)
+        script_context_error(
+            route_ref,
+            hook.hook_name,
+            script_label,
+            "load transform()",
+            err,
+        )
     })?;
     if let Some(transform_fn) = transform_fn {
         let result: Value = transform_fn.call(message_table).map_err(|err| {
-            script_context_error(route_ref, hook_name, script_label, "call transform()", err)
+            script_context_error(
+                route_ref,
+                hook.hook_name,
+                script_label,
+                "call transform()",
+                err,
+            )
         })?;
         match result {
             Value::Nil => {}
             Value::Table(table) => {
-                globals.set(global_name, table).map_err(|err| {
+                globals.set(hook.global_name, table).map_err(|err| {
                     script_context_error(
                         route_ref,
-                        hook_name,
+                        hook.hook_name,
                         script_label,
                         "apply transform() result",
                         err,
@@ -196,16 +228,17 @@ fn run_message_script<T>(
             }
             _ => {
                 bail!(
-                    "lua `{hook_name}` script failed for route `{route_ref}` in `{script_label}`: `{TRANSFORM_FUNCTION_NAME}` must return a table or nil"
+                    "lua `{}` script failed for route `{route_ref}` in `{script_label}`: `{TRANSFORM_FUNCTION_NAME}` must return a table or nil",
+                    hook.hook_name
                 );
             }
         }
     }
 
-    let transformed_table: Table = globals.get(global_name).map_err(|err| {
+    let transformed_table: Table = globals.get(hook.global_name).map_err(|err| {
         script_context_error(
             route_ref,
-            hook_name,
+            hook.hook_name,
             script_label,
             "read transformed value",
             err,
@@ -214,7 +247,7 @@ fn run_message_script<T>(
     from_lua_table(transformed_table).map_err(|err| {
         script_context_error(
             route_ref,
-            hook_name,
+            hook.hook_name,
             script_label,
             "decode transformed value",
             err,

@@ -2326,19 +2326,18 @@ async fn proxy_handler(
     let mut body_bytes = body_bytes;
 
     #[cfg(feature = "scripting")]
-    if let Some(script) = route.transform.on_request.as_ref() {
-        if let Err(err) =
+    if let Some(script) = route.transform.on_request.as_ref()
+        && let Err(err) =
             apply_on_request_script(&route.route_ref, script, &mut parts, &mut body_bytes)
-        {
-            tracing::debug!("failed to run on_request script: {err}");
-            respond!(
-                None,
-                proxy_simple_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "on_request script failed"
-                )
-            );
-        }
+    {
+        tracing::debug!("failed to run on_request script: {err}");
+        respond!(
+            None,
+            proxy_simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "on_request script failed"
+            )
+        );
     }
 
     #[cfg(not(feature = "scripting"))]
@@ -2654,19 +2653,18 @@ async fn proxy_handler(
     let mut body_bytes = body_bytes;
 
     #[cfg(feature = "scripting")]
-    if let Some(script) = route.transform.on_response.as_ref() {
-        if let Err(err) =
+    if let Some(script) = route.transform.on_response.as_ref()
+        && let Err(err) =
             apply_on_response_script(&route.route_ref, script, &mut parts, &mut body_bytes)
-        {
-            tracing::debug!("failed to run on_response script: {err}");
-            respond!(
-                Some(upstream_latency),
-                proxy_simple_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "on_response script failed"
-                )
-            );
-        }
+    {
+        tracing::debug!("failed to run on_response script: {err}");
+        respond!(
+            Some(upstream_latency),
+            proxy_simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "on_response script failed"
+            )
+        );
     }
 
     let record_response_status = should_record.then(|| parts.status.as_u16());
@@ -2735,17 +2733,14 @@ async fn proxy_handler(
         }
 
         #[cfg(feature = "scripting")]
-        if let Some(script) = route.transform.on_record.as_ref() {
-            if let Err(err) = apply_on_record_script(&route.route_ref, script, &mut recording) {
-                tracing::debug!("failed to run on_record script: {err}");
-                respond!(
-                    Some(upstream_latency),
-                    proxy_simple_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "on_record script failed"
-                    )
-                );
-            }
+        if let Some(script) = route.transform.on_record.as_ref()
+            && let Err(err) = apply_on_record_script(&route.route_ref, script, &mut recording)
+        {
+            tracing::debug!("failed to run on_record script: {err}");
+            respond!(
+                Some(upstream_latency),
+                proxy_simple_response(StatusCode::INTERNAL_SERVER_ERROR, "on_record script failed")
+            );
         }
 
         let pre_redaction_response_body = recording.response_body.clone();
@@ -2962,19 +2957,16 @@ async fn response_from_stored_recording(
     }
 
     #[cfg(feature = "scripting")]
-    if let Some(script) = route.transform.on_replay.as_ref() {
-        if let Err(err) = apply_on_replay_script(
+    if let Some(script) = route.transform.on_replay.as_ref()
+        && let Err(err) = apply_on_replay_script(
             &route.route_ref,
             script,
             &mut recording,
             &mut response_chunks,
-        ) {
-            tracing::debug!("failed to run on_replay script: {err}");
-            return proxy_simple_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "on_replay script failed",
-            );
-        }
+        )
+    {
+        tracing::debug!("failed to run on_replay script: {err}");
+        return proxy_simple_response(StatusCode::INTERNAL_SERVER_ERROR, "on_replay script failed");
     }
 
     response_from_recording(recording, response_chunks, preserve_timing)

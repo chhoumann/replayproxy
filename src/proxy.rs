@@ -2657,9 +2657,7 @@ async fn proxy_handler(
             .and_then(|websocket| websocket.recording_mode)
             .unwrap_or(WebSocketRecordingMode::Bidirectional);
         let pending_websocket_recording =
-            if matches!(route.mode, RouteMode::Record | RouteMode::PassthroughCache)
-                && websocket_recording_mode == WebSocketRecordingMode::ServerOnly
-            {
+            if matches!(route.mode, RouteMode::Record | RouteMode::PassthroughCache) {
                 let ActiveSessionRuntime {
                     active_session: _,
                     storage: active_storage,

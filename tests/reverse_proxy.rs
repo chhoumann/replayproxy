@@ -1568,6 +1568,131 @@ recording_mode = "server-only"
 }
 
 #[tokio::test]
+async fn websocket_record_mode_bidirectional_records_both_directions_and_frame_types() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_websocket_bidirectional_upstream().await;
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.websocket]
+recording_mode = "bidirectional"
+"#,
+        storage_dir.path().display(),
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let ws_url = format!("ws://{}/ws/echo", proxy.listen_addr);
+    let (mut ws_stream, response) = connect_async(ws_url).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(greeting))) = ws_stream.next().await else {
+        panic!("expected upstream greeting frame");
+    };
+    assert_eq!(greeting.to_string(), "upstream-ready");
+
+    let Some(Ok(Message::Binary(banner))) = ws_stream.next().await else {
+        panic!("expected upstream binary banner frame");
+    };
+    assert_eq!(banner.to_vec(), vec![0x01, 0x02, 0x03]);
+
+    ws_stream
+        .send(Message::Text("hello-proxy".into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(ack_text))) = ws_stream.next().await else {
+        panic!("expected upstream text ack frame");
+    };
+    assert_eq!(ack_text.to_string(), "ack:hello-proxy");
+
+    ws_stream
+        .send(Message::Binary(vec![0x10, 0x20].into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Binary(ack_binary))) = ws_stream.next().await else {
+        panic!("expected upstream binary ack frame");
+    };
+    assert_eq!(ack_binary.to_vec(), vec![0xaa, 0xbb, 0xcc]);
+
+    let captured_text = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured_text, b"hello-proxy".to_vec());
+    let captured_binary = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured_binary, vec![0x10, 0x20]);
+
+    ws_stream.close(None).await.unwrap();
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let storage = Storage::open(db_path).unwrap();
+    let mut recordings = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..40 {
+        recordings = storage.list_recordings(0, 10).await.unwrap();
+        if let Some(recording) = recordings.first() {
+            frames = storage.get_websocket_frames(recording.id).await.unwrap();
+            if frames.len() == 6 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(frames.len(), 6);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.frame_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5]
+    );
+    assert!(
+        frames
+            .windows(2)
+            .all(|pair| pair[0].offset_ms <= pair[1].offset_ms)
+    );
+
+    assert_eq!(frames[0].direction, WebSocketFrameDirection::ServerToClient);
+    assert_eq!(frames[0].message_type, WebSocketMessageType::Text);
+    assert_eq!(frames[0].payload, b"upstream-ready".to_vec());
+
+    assert_eq!(frames[1].direction, WebSocketFrameDirection::ServerToClient);
+    assert_eq!(frames[1].message_type, WebSocketMessageType::Binary);
+    assert_eq!(frames[1].payload, vec![0x01, 0x02, 0x03]);
+
+    assert_eq!(frames[2].direction, WebSocketFrameDirection::ClientToServer);
+    assert_eq!(frames[2].message_type, WebSocketMessageType::Text);
+    assert_eq!(frames[2].payload, b"hello-proxy".to_vec());
+
+    assert_eq!(frames[3].direction, WebSocketFrameDirection::ServerToClient);
+    assert_eq!(frames[3].message_type, WebSocketMessageType::Text);
+    assert_eq!(frames[3].payload, b"ack:hello-proxy".to_vec());
+
+    assert_eq!(frames[4].direction, WebSocketFrameDirection::ClientToServer);
+    assert_eq!(frames[4].message_type, WebSocketMessageType::Binary);
+    assert_eq!(frames[4].payload, vec![0x10, 0x20]);
+
+    assert_eq!(frames[5].direction, WebSocketFrameDirection::ServerToClient);
+    assert_eq!(frames[5].message_type, WebSocketMessageType::Binary);
+    assert_eq!(frames[5].payload, vec![0xaa, 0xbb, 0xcc]);
+}
+
+#[tokio::test]
 async fn https_connect_mitm_records_and_replays_requests() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
     let temp_dir = tempfile::tempdir().unwrap();
@@ -6356,6 +6481,55 @@ async fn spawn_websocket_upstream() -> (
 
         websocket
             .send(Message::Text(format!("ack:{text}").into()))
+            .await
+            .unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn spawn_websocket_bidirectional_upstream() -> (
+    SocketAddr,
+    mpsc::Receiver<Vec<u8>>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(2);
+
+    let join = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket
+            .send(Message::Text("upstream-ready".into()))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Binary(vec![0x01, 0x02, 0x03].into()))
+            .await
+            .unwrap();
+
+        let Some(Ok(first_message)) = websocket.next().await else {
+            panic!("expected first client frame");
+        };
+        let Message::Text(first_text) = first_message else {
+            panic!("expected first client frame to be text");
+        };
+        tx.send(first_text.to_string().into_bytes()).await.unwrap();
+        websocket
+            .send(Message::Text(format!("ack:{first_text}").into()))
+            .await
+            .unwrap();
+
+        let Some(Ok(second_message)) = websocket.next().await else {
+            panic!("expected second client frame");
+        };
+        let Message::Binary(second_payload) = second_message else {
+            panic!("expected second client frame to be binary");
+        };
+        tx.send(second_payload.to_vec()).await.unwrap();
+        websocket
+            .send(Message::Binary(vec![0xaa, 0xbb, 0xcc].into()))
             .await
             .unwrap();
     });

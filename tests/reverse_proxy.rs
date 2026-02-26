@@ -5678,6 +5678,199 @@ timeout_ms = 100
     let _ = upstream_shutdown().await;
 }
 
+#[tokio::test]
+async fn replay_mode_rate_limit_returns_429_with_retry_after() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    seed_replay_get_recording(
+        storage_dir.path(),
+        session,
+        "/api/limited",
+        b"replayed-body",
+    )
+    .await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+
+[routes.rate_limit]
+requests_per_second = 1
+burst = 1
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/limited", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(first_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::OK);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"replayed-body");
+
+    let second_uri: Uri = format!("http://{}/api/limited", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let second_req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let second_res = client.request(second_req).await.unwrap();
+    assert_eq!(second_res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        second_res
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let second_body = String::from_utf8(
+        second_res
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(second_body.contains("replay mode simulated rate limit"));
+
+    sleep(Duration::from_millis(1100)).await;
+
+    let third_uri: Uri = format!("http://{}/api/limited", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let third_req = Request::builder()
+        .method(Method::GET)
+        .uri(third_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let third_res = client.request(third_req).await.unwrap();
+    assert_eq!(third_res.status(), StatusCode::OK);
+    let third_body = third_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&third_body[..], b"replayed-body");
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn replay_mode_rate_limit_rejections_are_deterministic() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    seed_replay_get_recording(
+        storage_dir.path(),
+        session,
+        "/api/limited",
+        b"replayed-body",
+    )
+    .await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+
+[routes.rate_limit]
+requests_per_second = 1
+burst = 1
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/limited", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(first_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::OK);
+    let _ = first_res.into_body().collect().await.unwrap();
+
+    let second_uri: Uri = format!("http://{}/api/limited", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let second_req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let second_res = client.request(second_req).await.unwrap();
+    assert_eq!(second_res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        second_res
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let _ = second_res.into_body().collect().await.unwrap();
+
+    let third_uri: Uri = format!("http://{}/api/limited", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let third_req = Request::builder()
+        .method(Method::GET)
+        .uri(third_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let third_res = client.request(third_req).await.unwrap();
+    assert_eq!(third_res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        third_res
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let _ = third_res.into_body().collect().await.unwrap();
+
+    proxy.shutdown().await;
+}
+
 async fn spawn_connect_upstream() -> (
     SocketAddr,
     mpsc::Receiver<Bytes>,
@@ -6064,6 +6257,37 @@ async fn spawn_upstream_with_response_chunks(
     });
 
     (addr, rx, move || join)
+}
+
+async fn seed_replay_get_recording(
+    storage_root: &std::path::Path,
+    session: &str,
+    request_uri: &str,
+    response_body: &[u8],
+) {
+    let storage = Storage::open(storage_root.join(session).join("recordings.db")).unwrap();
+    let request_uri: Uri = request_uri.parse().unwrap();
+    let match_key = replayproxy::matching::compute_match_key(
+        None,
+        &Method::GET,
+        &request_uri,
+        &hyper::HeaderMap::new(),
+        &[],
+    )
+    .unwrap();
+
+    let recording = Recording {
+        match_key,
+        request_method: "GET".to_owned(),
+        request_uri: request_uri.to_string(),
+        request_headers: Vec::new(),
+        request_body: Vec::new(),
+        response_status: 200,
+        response_headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
+        response_body: response_body.to_vec(),
+        created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+    };
+    storage.insert_recording(recording).await.unwrap();
 }
 
 async fn seed_streaming_replay_recording(storage_root: &std::path::Path, session: &str) {

@@ -493,9 +493,16 @@ struct ProxyRuntimeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RateLimitScopeMode {
+    Record,
+    Replay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RecordRateLimitKey {
     route_ref: String,
     upstream_authority: String,
+    mode: RateLimitScopeMode,
 }
 
 #[derive(Debug)]
@@ -568,6 +575,29 @@ impl RecordTokenBucket {
             self.queue_depth,
             self.timeout,
         )
+    }
+
+    async fn reserve_replay_request(&self) -> Result<(), Duration> {
+        let mut state = self.state.lock().await;
+        match reserve_delay_for_bucket_with_limits(
+            &mut state,
+            Instant::now(),
+            self.tokens_per_second,
+            self.burst_tokens,
+            None,
+            Some(Duration::ZERO),
+        ) {
+            Ok(delay) => {
+                debug_assert!(delay.is_zero());
+                Ok(())
+            }
+            Err(RecordRateLimitRejection::QueueTimeoutExceeded { required_delay, .. }) => {
+                Err(required_delay)
+            }
+            Err(RecordRateLimitRejection::QueueDepthExceeded { .. }) => {
+                unreachable!("queue depth is disabled for replay reservation")
+            }
+        }
     }
 }
 
@@ -2600,6 +2630,12 @@ async fn proxy_handler(
             should_record = active_storage.is_some();
         }
         RouteMode::Replay => {
+            if let Some(required_delay) =
+                maybe_reject_for_replay_rate_limit(state.as_ref(), &route, &upstream_uri).await
+            {
+                respond!(None, replay_rate_limit_rejection_response(required_delay));
+            }
+
             let Some(storage) = active_storage.as_ref() else {
                 respond!(
                     None,
@@ -3364,6 +3400,7 @@ async fn maybe_wait_for_record_rate_limit(
         RecordRateLimitKey {
             route_ref: route.route_ref.clone(),
             upstream_authority: upstream_authority.clone(),
+            mode: RateLimitScopeMode::Record,
         },
         rate_limit,
     );
@@ -3381,6 +3418,46 @@ async fn maybe_wait_for_record_rate_limit(
     );
     tokio::time::sleep(delay).await;
     Ok(())
+}
+
+async fn maybe_reject_for_replay_rate_limit(
+    state: &ProxyState,
+    route: &ProxyRoute,
+    upstream_uri: &Uri,
+) -> Option<Duration> {
+    if route.mode != RouteMode::Replay {
+        return None;
+    }
+    let Some(rate_limit) = route.rate_limit.as_ref() else {
+        return None;
+    };
+    let Some(upstream_authority) = upstream_authority_for_rate_limit_scope(upstream_uri) else {
+        return None;
+    };
+
+    let limiter = state.record_rate_limiters.limiter(
+        RecordRateLimitKey {
+            route_ref: route.route_ref.clone(),
+            upstream_authority: upstream_authority.clone(),
+            mode: RateLimitScopeMode::Replay,
+        },
+        rate_limit,
+    );
+    let required_delay = match limiter.reserve_replay_request().await {
+        Ok(()) => return None,
+        Err(required_delay) => required_delay,
+    };
+
+    let required_delay_ms = u64::try_from(required_delay.as_millis()).unwrap_or(u64::MAX);
+    let retry_after_seconds = retry_after_seconds_from_delay(required_delay);
+    tracing::debug!(
+        route = %route.route_ref,
+        upstream = %upstream_authority,
+        required_delay_ms,
+        retry_after_seconds,
+        "replay mode rate limiter rejected request"
+    );
+    Some(required_delay)
 }
 
 fn connect_tunnel_target(authority: &hyper::http::uri::Authority) -> String {
@@ -3947,6 +4024,36 @@ fn record_rate_limit_rejection_response(error: RecordRateLimitRejection) -> Resp
                 ),
             )
         }
+    }
+}
+
+fn replay_rate_limit_rejection_response(required_delay: Duration) -> Response<ProxyBody> {
+    let retry_after_seconds = retry_after_seconds_from_delay(required_delay);
+    let required_delay_ms = required_delay.as_millis();
+    let mut response = proxy_simple_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        &format!(
+            "replay mode simulated rate limit exceeded (required_delay_ms={required_delay_ms}); retry later"
+        ),
+    );
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&retry_after_seconds.to_string())
+            .expect("Retry-After delta seconds should be a valid header value"),
+    );
+    response
+}
+
+fn retry_after_seconds_from_delay(delay: Duration) -> u64 {
+    if delay.is_zero() {
+        return 1;
+    }
+
+    let seconds = delay.as_secs();
+    if delay.subsec_nanos() > 0 {
+        seconds.saturating_add(1)
+    } else {
+        seconds.max(1)
     }
 }
 
@@ -5347,6 +5454,50 @@ mod tests {
             })
         );
         assert_eq!(state.available_tokens, 0.0);
+    }
+
+    #[tokio::test]
+    async fn reserve_replay_request_rejects_without_consuming_tokens() {
+        let rate_limit = super::RouteRateLimit {
+            requests_per_second: 1,
+            burst: 1,
+            queue_depth: None,
+            timeout: None,
+        };
+        let bucket = super::RecordTokenBucket::new(&rate_limit);
+
+        assert_eq!(bucket.reserve_replay_request().await, Ok(()));
+        let first_retry_after = bucket
+            .reserve_replay_request()
+            .await
+            .expect_err("second request should be throttled in replay mode");
+        let second_retry_after = bucket
+            .reserve_replay_request()
+            .await
+            .expect_err("throttled replay requests should continue to be rejected");
+
+        assert!(first_retry_after >= Duration::from_millis(900));
+        assert!(second_retry_after >= Duration::from_millis(900));
+        assert!(
+            second_retry_after < Duration::from_millis(1100),
+            "rejected replay requests should not consume additional tokens"
+        );
+    }
+
+    #[test]
+    fn retry_after_seconds_rounds_up_subsecond_delay() {
+        assert_eq!(
+            super::retry_after_seconds_from_delay(Duration::from_millis(1)),
+            1
+        );
+        assert_eq!(
+            super::retry_after_seconds_from_delay(Duration::from_millis(1001)),
+            2
+        );
+        assert_eq!(
+            super::retry_after_seconds_from_delay(Duration::from_secs(3)),
+            3
+        );
     }
 
     #[test]

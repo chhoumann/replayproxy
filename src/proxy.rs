@@ -56,8 +56,9 @@ use crate::scripting::{
 use crate::{
     ca,
     config::{
-        BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RateLimitConfig, RedactConfig,
-        RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig, WebSocketConfig,
+        BodyOversizePolicy, CacheMissPolicy, Config, GrpcConfig, QueryMatchMode, RateLimitConfig,
+        RedactConfig, RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig,
+        WebSocketConfig,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
@@ -446,6 +447,9 @@ struct ProxyRoute {
     match_config: Option<RouteMatchConfig>,
     streaming: Option<StreamingConfig>,
     websocket: Option<WebSocketConfig>,
+    // Consumed by upcoming gRPC route matching steps.
+    #[allow(dead_code)]
+    grpc: Option<RouteGrpcDescriptors>,
     rate_limit: Option<RouteRateLimit>,
     // Consumed by upcoming redaction storage steps.
     #[allow(dead_code)]
@@ -484,6 +488,18 @@ struct RouteTransformScripts {
 struct LoadedScript {
     path: PathBuf,
     source: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteGrpcDescriptors {
+    match_fields: Vec<String>,
+    proto_files: Vec<LoadedGrpcProtoFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedGrpcProtoFile {
+    path: PathBuf,
+    descriptor_bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone)]
@@ -710,6 +726,11 @@ impl ProxyRuntimeConfig {
                 match_config: route.match_.clone(),
                 streaming: route.streaming.clone(),
                 websocket: route.websocket.clone(),
+                grpc: load_route_grpc_descriptors(
+                    &route_ref,
+                    route.grpc.as_ref(),
+                    config.source_path(),
+                )?,
                 rate_limit: route.rate_limit.as_ref().map(RouteRateLimit::from_config),
                 redact: route.redact.clone(),
                 transform: load_route_transform_scripts(
@@ -764,6 +785,105 @@ fn load_route_transform_scripts(
     })
 }
 
+fn load_route_grpc_descriptors(
+    route_ref: &str,
+    grpc: Option<&GrpcConfig>,
+    config_source_path: Option<&Path>,
+) -> anyhow::Result<Option<RouteGrpcDescriptors>> {
+    let Some(grpc) = grpc else {
+        return Ok(None);
+    };
+
+    let mut proto_files = Vec::with_capacity(grpc.proto_files.len());
+    let mut proto_source_paths = Vec::new();
+    for proto_file in &grpc.proto_files {
+        if proto_file.as_os_str().is_empty() {
+            anyhow::bail!("{route_ref}: `routes.grpc.proto_files` entries must not be empty");
+        }
+
+        let resolved_path = resolve_config_relative_path(proto_file, config_source_path);
+        let descriptor_bytes = std::fs::read(&resolved_path).map_err(|err| {
+            anyhow::anyhow!(
+                "{route_ref}: load `routes.grpc.proto_files` entry {}: {err}",
+                resolved_path.display()
+            )
+        })?;
+        if descriptor_bytes.is_empty() {
+            anyhow::bail!(
+                "{route_ref}: load `routes.grpc.proto_files` entry {}: file is empty",
+                resolved_path.display()
+            );
+        }
+
+        let is_proto_source = proto_file_extension_is_proto(resolved_path.as_path());
+        proto_files.push(LoadedGrpcProtoFile {
+            path: resolved_path.clone(),
+            descriptor_bytes: Arc::from(descriptor_bytes),
+        });
+
+        if is_proto_source {
+            proto_source_paths.push(resolved_path);
+        }
+    }
+
+    validate_grpc_proto_sources(route_ref, &proto_source_paths, config_source_path)?;
+
+    Ok(Some(RouteGrpcDescriptors {
+        match_fields: grpc.match_fields.clone(),
+        proto_files,
+    }))
+}
+
+fn validate_grpc_proto_sources(
+    route_ref: &str,
+    proto_source_paths: &[PathBuf],
+    config_source_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    if proto_source_paths.is_empty() {
+        return Ok(());
+    }
+
+    let include_paths = grpc_proto_include_paths(proto_source_paths, config_source_path);
+    protox::compile(
+        proto_source_paths.iter().map(PathBuf::as_path),
+        include_paths.iter().map(PathBuf::as_path),
+    )
+    .map_err(|err| {
+        anyhow::anyhow!("{route_ref}: compile `routes.grpc.proto_files` .proto descriptors: {err}")
+    })?;
+
+    Ok(())
+}
+
+fn grpc_proto_include_paths(
+    proto_source_paths: &[PathBuf],
+    config_source_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut include_paths = Vec::new();
+
+    if let Some(config_dir) = config_source_path.and_then(Path::parent) {
+        include_paths.push(config_dir.to_path_buf());
+    }
+
+    for proto_source_path in proto_source_paths {
+        let Some(parent) = proto_source_path.parent() else {
+            continue;
+        };
+        if include_paths.iter().any(|existing| existing == parent) {
+            continue;
+        }
+        include_paths.push(parent.to_path_buf());
+    }
+
+    include_paths
+}
+
+fn proto_file_extension_is_proto(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("proto"))
+}
+
 fn load_transform_script_for_hook(
     route_ref: &str,
     hook_name: &str,
@@ -798,17 +918,21 @@ fn resolve_transform_script_path(
     config_source_path: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     let expanded = expand_tilde_path(Path::new(script_path))?;
-    if expanded.is_absolute() {
-        return Ok(expanded);
+    Ok(resolve_config_relative_path(&expanded, config_source_path))
+}
+
+fn resolve_config_relative_path(path: &Path, config_source_path: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
     }
 
     if let Some(config_source_path) = config_source_path
         && let Some(config_dir) = config_source_path.parent()
     {
-        return Ok(config_dir.join(expanded));
+        return config_dir.join(path);
     }
 
-    Ok(expanded)
+    path.to_path_buf()
 }
 
 fn expand_tilde_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -1447,6 +1571,7 @@ fn proxy_route_configs_equal(current: &ProxyRoute, next: &ProxyRoute) -> bool {
         && current.body_oversize == next.body_oversize
         && route_match_configs_equal(current.match_config.as_ref(), next.match_config.as_ref())
         && streaming_configs_equal(current.streaming.as_ref(), next.streaming.as_ref())
+        && current.grpc == next.grpc
         && rate_limit_configs_equal(current.rate_limit.as_ref(), next.rate_limit.as_ref())
         && redact_configs_equal(current.redact.as_ref(), next.redact.as_ref())
         && current.transform == next.transform
@@ -5283,6 +5408,7 @@ mod tests {
             match_config: None,
             streaming: None,
             websocket: None,
+            grpc: None,
             rate_limit: None,
             redact: None,
             transform: super::RouteTransformScripts::default(),
@@ -5797,6 +5923,149 @@ on_request = "scripts/missing.lua"
         );
         assert!(
             message.contains("scripts/missing.lua"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn runtime_config_loads_grpc_proto_files_relative_to_config_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let protos_dir = temp_dir.path().join("protos");
+        fs::create_dir_all(&protos_dir).expect("proto dir should be created");
+        let proto_path = protos_dir.join("inference.proto");
+        let proto_source = r#"
+syntax = "proto3";
+package inference;
+
+message InferenceRequest {
+  string model_name = 1;
+}
+"#;
+        fs::write(&proto_path, proto_source).expect("proto file should be written");
+        let config_path = temp_dir.path().join("replayproxy.toml");
+        fs::write(
+            &config_path,
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+name = "grpc-route"
+path_prefix = "/inference.InferenceService"
+upstream = "http://127.0.0.1:1234"
+
+[routes.grpc]
+proto_files = ["protos/inference.proto"]
+match_fields = ["model_name"]
+"#,
+        )
+        .expect("config should be written");
+
+        let config = Config::from_path(&config_path).expect("config should parse");
+        let runtime =
+            super::ProxyRuntimeConfig::from_config(&config).expect("runtime config should load");
+        let route = runtime.routes.first().expect("expected one route");
+        let grpc = route
+            .grpc
+            .as_ref()
+            .expect("grpc descriptors should be loaded");
+
+        assert_eq!(grpc.match_fields, vec!["model_name"]);
+        assert_eq!(grpc.proto_files.len(), 1);
+        assert_eq!(grpc.proto_files[0].path, proto_path);
+        assert_eq!(
+            grpc.proto_files[0].descriptor_bytes.as_ref(),
+            proto_source.as_bytes()
+        );
+    }
+
+    #[test]
+    fn runtime_config_fails_fast_when_grpc_proto_file_is_missing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = temp_dir.path().join("replayproxy.toml");
+        fs::write(
+            &config_path,
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+name = "grpc-route"
+path_prefix = "/inference.InferenceService"
+upstream = "http://127.0.0.1:1234"
+
+[routes.grpc]
+proto_files = ["protos/missing.proto"]
+"#,
+        )
+        .expect("config should be written");
+
+        let config = Config::from_path(&config_path).expect("config should parse");
+        let err = super::ProxyRuntimeConfig::from_config(&config)
+            .expect_err("missing proto file should fail fast");
+        let message = err.to_string();
+        assert!(
+            message.contains("routes[0] (grpc-route)"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("routes.grpc.proto_files"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("protos/missing.proto"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn runtime_config_fails_fast_when_grpc_proto_file_is_invalid() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let protos_dir = temp_dir.path().join("protos");
+        fs::create_dir_all(&protos_dir).expect("proto dir should be created");
+        let proto_path = protos_dir.join("invalid.proto");
+        fs::write(
+            &proto_path,
+            r#"
+syntax = "proto3";
+message Broken {
+  string value = ;
+}
+"#,
+        )
+        .expect("proto file should be written");
+        let config_path = temp_dir.path().join("replayproxy.toml");
+        fs::write(
+            &config_path,
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+name = "grpc-route"
+path_prefix = "/inference.InferenceService"
+upstream = "http://127.0.0.1:1234"
+
+[routes.grpc]
+proto_files = ["protos/invalid.proto"]
+"#,
+        )
+        .expect("config should be written");
+
+        let config = Config::from_path(&config_path).expect("config should parse");
+        let err = super::ProxyRuntimeConfig::from_config(&config)
+            .expect_err("invalid proto file should fail fast");
+        let message = err.to_string();
+        assert!(
+            message.contains("routes[0] (grpc-route)"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("routes.grpc.proto_files"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("proto descriptors"),
             "unexpected error: {message}"
         );
     }

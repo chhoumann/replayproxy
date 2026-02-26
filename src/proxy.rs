@@ -187,13 +187,10 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         .as_ref()
         .is_some_and(|metrics| metrics.enabled);
     let session_manager = SessionManager::from_config(config)?;
-    let retention_prune_interval = config.storage.as_ref().and_then(|storage| {
-        if storage.retention_enabled() {
-            storage.retention_prune_interval()
-        } else {
-            None
-        }
-    });
+    let retention_prune_interval = config
+        .storage
+        .as_ref()
+        .and_then(|storage| storage.effective_retention_prune_interval());
     if let Some(storage) = config.storage.as_ref()
         && storage.retention_prune_interval().is_some()
         && !storage.retention_enabled()

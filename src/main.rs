@@ -798,7 +798,8 @@ active_session = "default"
 # optional: time-based retention window (choose one)
 # max_age_days = 30
 # max_age_hours = 12
-# optional: prune idle sessions on an interval (milliseconds)
+# optional: override background retention prune interval (milliseconds)
+# default is 3600000 (1 hour) when max_recordings or max_age_* is set
 # retention_prune_interval_ms = 3600000
 
 [logging]

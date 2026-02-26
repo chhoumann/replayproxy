@@ -371,6 +371,8 @@ pub struct StorageConfig {
     pub retention_prune_interval_ms: Option<u64>,
 }
 
+const DEFAULT_RETENTION_PRUNE_INTERVAL_MS: u64 = 60 * 60 * 1_000;
+
 impl StorageConfig {
     fn normalize_and_validate(&mut self) -> anyhow::Result<()> {
         self.path = expand_tilde(&self.path)?;
@@ -427,6 +429,21 @@ impl StorageConfig {
 
     pub(crate) fn retention_prune_interval(&self) -> Option<Duration> {
         self.retention_prune_interval_ms.map(Duration::from_millis)
+    }
+
+    pub(crate) fn effective_retention_prune_interval(&self) -> Option<Duration> {
+        if !self.retention_enabled() {
+            return None;
+        }
+
+        Some(
+            self.retention_prune_interval()
+                .unwrap_or_else(Self::default_retention_prune_interval),
+        )
+    }
+
+    pub(crate) fn default_retention_prune_interval() -> Duration {
+        Duration::from_millis(DEFAULT_RETENTION_PRUNE_INTERVAL_MS)
     }
 }
 
@@ -1081,11 +1098,11 @@ mod tests {
         env, fs,
         net::{IpAddr, Ipv4Addr},
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::{
-        Config, LogFormat, RequestUrlLogMode, RouteMode, TransformOversizeBehavior,
+        Config, LogFormat, RequestUrlLogMode, RouteMode, StorageConfig, TransformOversizeBehavior,
         WebSocketRecordingMode,
     };
     use tempfile::tempdir;
@@ -2068,6 +2085,72 @@ path = "/tmp/replayproxy-tests"
                 .and_then(|storage| storage.retention_prune_interval_ms),
             None
         );
+    }
+
+    #[test]
+    fn storage_effective_retention_prune_interval_defaults_when_retention_is_enabled() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+max_recordings = 10
+"#,
+        )
+        .unwrap();
+
+        let storage = config.storage.as_ref().unwrap();
+        assert_eq!(storage.retention_prune_interval(), None);
+        assert_eq!(
+            storage.effective_retention_prune_interval(),
+            Some(StorageConfig::default_retention_prune_interval())
+        );
+    }
+
+    #[test]
+    fn storage_effective_retention_prune_interval_uses_explicit_override() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+max_age_hours = 1
+retention_prune_interval_ms = 5000
+"#,
+        )
+        .unwrap();
+
+        let storage = config.storage.as_ref().unwrap();
+        assert_eq!(
+            storage.effective_retention_prune_interval(),
+            Some(Duration::from_millis(5_000))
+        );
+    }
+
+    #[test]
+    fn storage_effective_retention_prune_interval_is_none_without_retention_policy() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+retention_prune_interval_ms = 5000
+"#,
+        )
+        .unwrap();
+
+        let storage = config.storage.as_ref().unwrap();
+        assert_eq!(
+            storage.retention_prune_interval(),
+            Some(Duration::from_millis(5_000))
+        );
+        assert_eq!(storage.effective_retention_prune_interval(), None);
     }
 
     #[test]

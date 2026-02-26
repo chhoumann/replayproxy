@@ -334,6 +334,17 @@ REPLAYPROXY_LIVE_TESTS=1 cargo test --test live_api_validation -- --ignored
 Detailed environment variables, matrix coverage, and release pass/fail checklist are documented in
 `docs/live-api-validation.md`.
 
+## Performance harness (opt-in)
+
+Run the benchmark-style harness for record/replay/passthrough-cache scenarios:
+
+```bash
+cargo test --test performance_harness -- --ignored --nocapture
+```
+
+Configuration knobs, output fields, and guardrail guidance are documented in
+`docs/performance.md`.
+
 ## Common commands
 
 ```bash

@@ -48,6 +48,11 @@ Prerequisite: stable Rust toolchain.
 # build
 cargo build --release
 
+# optional feature builds
+cargo build --release --features grpc
+cargo build --release --features scripting
+cargo build --release --features grpc,scripting
+
 # run directly
 ./target/release/replayproxy --help
 
@@ -55,6 +60,11 @@ cargo build --release
 cargo install --path .
 replayproxy --help
 ```
+
+Feature notes:
+
+- `grpc` enables proto-aware matching via `[routes.grpc]`.
+- `scripting` enables Lua hooks via `[routes.transform]`.
 
 ## Config discovery and examples
 
@@ -78,6 +88,12 @@ Lua hooks require a build with scripting enabled:
 
 ```bash
 cargo run --features scripting -- serve --config ./examples/replayproxy.llm-redacted.toml
+```
+
+Proto-aware gRPC matching via `[routes.grpc]` requires the `grpc` feature:
+
+```bash
+cargo run --features grpc -- serve --config ./replayproxy.toml
 ```
 
 ## Quickstart: record then replay (reverse proxy)
@@ -117,7 +133,7 @@ Expected: upstream success (`HTTP/1.1 200 OK`) and response body from httpbin.
 3. Confirm recording was stored:
 
 ```bash
-replayproxy recording list --config ./replayproxy.toml
+replayproxy recording --config ./replayproxy.toml list
 ```
 
 Expected: output contains `session \`default\`` and at least one row in the `id method status uri` table.
@@ -125,7 +141,7 @@ Expected: output contains `session \`default\`` and at least one row in the `id 
 4. Switch runtime mode to replay:
 
 ```bash
-replayproxy mode set replay --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
+replayproxy mode --config ./replayproxy.toml set replay --admin-addr 127.0.0.1:8081
 ```
 
 Expected: output like `set runtime mode override via admin 127.0.0.1:8081: \`replay\``.
@@ -180,7 +196,13 @@ replayproxy ca install
 
 If automatic install does not complete, run the manual command printed by replayproxy.
 
-3. Configure forward proxy + TLS interception:
+3. Export CA cert for manual trust installation (optional):
+
+```bash
+replayproxy ca export --out ./replayproxy-ca-cert.pem
+```
+
+4. Configure forward proxy + TLS interception:
 
 ```toml
 [proxy]
@@ -201,7 +223,7 @@ name = "forward-all"
 path_prefix = "/"
 ```
 
-4. Start proxy and route client traffic:
+5. Start proxy and route client traffic:
 
 ```bash
 replayproxy serve --config ./replayproxy.toml
@@ -220,25 +242,25 @@ Notes:
 Session commands:
 
 ```bash
-replayproxy session list --config ./replayproxy.toml
-replayproxy session create test-session --config ./replayproxy.toml
-replayproxy session switch test-session --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
-replayproxy session delete old-session --config ./replayproxy.toml
+replayproxy session --config ./replayproxy.toml list
+replayproxy session --config ./replayproxy.toml create test-session
+replayproxy session --config ./replayproxy.toml switch test-session --admin-addr 127.0.0.1:8081
+replayproxy session --config ./replayproxy.toml delete old-session
 ```
 
 Export/import:
 
 ```bash
-replayproxy session export default --format yaml --out ./exports/default --config ./replayproxy.toml
-replayproxy session import recovered --in ./exports/default --config ./replayproxy.toml
+replayproxy session --config ./replayproxy.toml export default --format yaml --out ./exports/default
+replayproxy session --config ./replayproxy.toml import recovered --in ./exports/default
 ```
 
 Recording commands:
 
 ```bash
-replayproxy recording list --config ./replayproxy.toml
-replayproxy recording search "POST /v1/chat body:gpt" --config ./replayproxy.toml
-replayproxy recording delete 42 --config ./replayproxy.toml
+replayproxy recording --config ./replayproxy.toml list
+replayproxy recording --config ./replayproxy.toml search "POST /v1/chat body:gpt"
+replayproxy recording --config ./replayproxy.toml delete 42
 ```
 
 Operational notes:
@@ -282,9 +304,9 @@ Core endpoints:
 Mode workflow from CLI:
 
 ```bash
-replayproxy mode show --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
-replayproxy mode set replay --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
-replayproxy mode set record --config ./replayproxy.toml --admin-addr 127.0.0.1:8081 --persist
+replayproxy mode --config ./replayproxy.toml show --admin-addr 127.0.0.1:8081
+replayproxy mode --config ./replayproxy.toml set replay --admin-addr 127.0.0.1:8081
+replayproxy mode --config ./replayproxy.toml set record --admin-addr 127.0.0.1:8081 --persist
 ```
 
 `mode set --persist` updates `proxy.mode` in the loaded config file.
@@ -354,9 +376,9 @@ Import behavior is copy-only:
 Checks:
 
 ```bash
-replayproxy mode show --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
-replayproxy recording list --config ./replayproxy.toml
-replayproxy recording search "GET /get" --config ./replayproxy.toml
+replayproxy mode --config ./replayproxy.toml show --admin-addr 127.0.0.1:8081
+replayproxy recording --config ./replayproxy.toml list
+replayproxy recording --config ./replayproxy.toml search "GET /get"
 curl -sS http://127.0.0.1:8081/_admin/status
 ```
 
@@ -370,7 +392,7 @@ Common fixes:
 ### `mode` or `session switch` commands fail
 
 - Ensure admin listener is enabled via `proxy.admin_port` or pass explicit `--admin-addr`.
-- If `admin_api_token` is configured, send the matching token.
+- If `admin_api_token` is configured, ensure the loaded config has the matching token (CLI admin calls forward it automatically).
 - `mode set --persist` requires a config file path source.
 
 ### CA/TLS issues
@@ -394,9 +416,7 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 
 ## Known limitations (current)
 
-- WebSocket capture/replay is not implemented yet.
-- gRPC capture/replay is not implemented yet.
-- Session export/import moves recording objects but not streaming chunk metadata.
+- gRPC proto-aware matching (`routes.grpc.match_fields`) requires a build with `--features grpc`; without it, matching falls back to opaque request-body behavior.
 - No built-in TTL/retention/eviction policy for stored recordings.
 - Query `subset` matching can fall back to scan-heavy behavior on very large candidate sets.
 - `body_oversize = "bypass-cache"` does not bypass in replay mode, and does not bypass when `on_request` or `on_response` transforms are configured.

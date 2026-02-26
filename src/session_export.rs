@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     legacy_redaction, session,
-    storage::{Recording, ResponseChunk, SessionManager, SessionManagerError, Storage},
+    storage::{
+        Recording, ResponseChunk, SessionManager, SessionManagerError, Storage, WebSocketFrame,
+    },
 };
 
 const EXPORT_LIST_PAGE_SIZE: usize = 256;
@@ -116,6 +118,7 @@ struct ExportRecording {
     id: i64,
     recording: Recording,
     response_chunks: Vec<ResponseChunk>,
+    websocket_frames: Vec<WebSocketFrame>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +147,8 @@ struct ExportRecordingDocument {
     recording: Recording,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     response_chunks: Vec<ResponseChunk>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    websocket_frames: Vec<WebSocketFrame>,
 }
 
 pub async fn export_session(
@@ -250,6 +255,7 @@ fn write_export(
             id,
             recording,
             response_chunks,
+            websocket_frames,
         } = export_recording;
         let file_name = recording_file_name(
             index,
@@ -270,6 +276,7 @@ fn write_export(
             id,
             recording,
             response_chunks,
+            websocket_frames,
         };
         let document_bytes = serialize_export_bytes(format, &document).map_err(|err| {
             SessionExportError::Internal(format!(
@@ -370,10 +377,20 @@ async fn collect_recordings_for_export(
                     summary.id
                 ))
             })?;
+        let websocket_frames = storage
+            .get_websocket_frames(summary.id)
+            .await
+            .map_err(|err| {
+                SessionExportError::Internal(format!(
+                    "read websocket frames for recording `{}` from session `{session_name}`: {err}",
+                    summary.id
+                ))
+            })?;
         recordings.push(ExportRecording {
             id: summary.id,
             recording,
             response_chunks,
+            websocket_frames,
         });
     }
 

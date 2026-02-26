@@ -1247,7 +1247,10 @@ mod tests {
     use replayproxy::{
         config::{Config, RouteMode},
         session_export::{CURRENT_EXPORT_MANIFEST_VERSION, SessionExportFormat},
-        storage::{Recording, RecordingSearch, ResponseChunk, SessionManager, Storage},
+        storage::{
+            Recording, RecordingSearch, ResponseChunk, SessionManager, Storage, WebSocketFrame,
+            WebSocketFrameDirection, WebSocketMessageType,
+        },
     };
     use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
@@ -1359,6 +1362,8 @@ active_session = "{active_session}"
         recording: Recording,
         #[serde(default)]
         response_chunks: Vec<ResponseChunk>,
+        #[serde(default)]
+        websocket_frames: Vec<WebSocketFrame>,
     }
 
     #[derive(Debug, Serialize)]
@@ -1387,6 +1392,8 @@ active_session = "{active_session}"
         recording: Recording,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         response_chunks: Vec<ResponseChunk>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        websocket_frames: Vec<WebSocketFrame>,
     }
 
     fn header_value<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
@@ -1455,6 +1462,33 @@ active_session = "{active_session}"
             .insert_response_chunks(recording_id, expected_chunks.clone())
             .await
             .expect("response chunks should insert");
+        let expected_websocket_frames = vec![
+            WebSocketFrame {
+                frame_index: 0,
+                offset_ms: 0,
+                direction: WebSocketFrameDirection::ServerToClient,
+                message_type: WebSocketMessageType::Text,
+                payload: b"upstream-ready".to_vec(),
+            },
+            WebSocketFrame {
+                frame_index: 1,
+                offset_ms: 15,
+                direction: WebSocketFrameDirection::ClientToServer,
+                message_type: WebSocketMessageType::Text,
+                payload: b"hello-proxy".to_vec(),
+            },
+            WebSocketFrame {
+                frame_index: 2,
+                offset_ms: 29,
+                direction: WebSocketFrameDirection::ServerToClient,
+                message_type: WebSocketMessageType::Text,
+                payload: b"ack:hello-proxy".to_vec(),
+            },
+        ];
+        default_storage
+            .insert_websocket_frames(recording_id, expected_websocket_frames.clone())
+            .await
+            .expect("websocket frames should insert");
 
         let export_dir = temp_dir
             .path()
@@ -1519,6 +1553,11 @@ active_session = "{active_session}"
             .await
             .expect("imported response chunks should load");
         assert_eq!(imported_chunks, expected_chunks);
+        let imported_websocket_frames = staging_storage
+            .get_websocket_frames(summaries[0].id)
+            .await
+            .expect("imported websocket frames should load");
+        assert_eq!(imported_websocket_frames, expected_websocket_frames);
     }
 
     async fn assert_session_import_accepts_v1_export_without_response_chunks(
@@ -1546,6 +1585,7 @@ active_session = "{active_session}"
             id: 1,
             recording,
             response_chunks: Vec::new(),
+            websocket_frames: Vec::new(),
         };
         fs::write(
             import_dir.join(&relative_recording_path),
@@ -1603,6 +1643,11 @@ active_session = "{active_session}"
             .await
             .expect("v1 import should not fail chunk lookup");
         assert!(chunks.is_empty());
+        let websocket_frames = staging_storage
+            .get_websocket_frames(summaries[0].id)
+            .await
+            .expect("v1 import should not fail websocket frame lookup");
+        assert!(websocket_frames.is_empty());
     }
 
     #[test]
@@ -2681,6 +2726,7 @@ mode = "record"
         let exported: ExportedRecordingDocument =
             serde_json::from_slice(&recording_bytes).expect("recording should parse");
         assert!(exported.response_chunks.is_empty());
+        assert!(exported.websocket_frames.is_empty());
 
         assert_eq!(
             header_value(&exported.recording.request_headers, "authorization"),
@@ -2930,6 +2976,7 @@ mode = "record"
             id: 1,
             recording: legacy_recording,
             response_chunks: Vec::new(),
+            websocket_frames: Vec::new(),
         };
         fs::write(
             import_dir.join(relative_recording_path),

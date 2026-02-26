@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     legacy_redaction, session,
     session_export::{EXPORT_MANIFEST_VERSION_V1, EXPORT_MANIFEST_VERSION_V2, SessionExportFormat},
-    storage::{Recording, ResponseChunk, SessionManager, SessionManagerError},
+    storage::{Recording, ResponseChunk, SessionManager, SessionManagerError, WebSocketFrame},
 };
 
 #[derive(Debug, Clone)]
@@ -83,6 +83,8 @@ struct ImportRecordingDocument {
     recording: Recording,
     #[serde(default)]
     response_chunks: Vec<ResponseChunk>,
+    #[serde(default)]
+    websocket_frames: Vec<WebSocketFrame>,
 }
 
 #[derive(Debug)]
@@ -97,6 +99,7 @@ struct ParsedImportRecording {
     source: String,
     recording: Recording,
     response_chunks: Vec<ResponseChunk>,
+    websocket_frames: Vec<WebSocketFrame>,
 }
 
 pub async fn import_session(
@@ -144,6 +147,17 @@ pub async fn import_session(
                     ))
                 })?;
         }
+        if !parsed_recording.websocket_frames.is_empty() {
+            storage
+                .insert_websocket_frames(recording_id, parsed_recording.websocket_frames)
+                .await
+                .map_err(|err| {
+                    SessionImportError::Internal(format!(
+                        "insert websocket frames from `{}` into session `{}`: {err}",
+                        parsed_recording.source, session_name
+                    ))
+                })?;
+        }
     }
 
     Ok(SessionImportResult {
@@ -176,10 +190,12 @@ fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError
         let mut document = read_recording_document(&recording_path, entry, manifest.format)?;
         legacy_redaction::scrub_recording_for_legacy_redaction(&mut document.recording);
         let response_chunks = document.response_chunks;
+        let websocket_frames = document.websocket_frames;
         recordings.push(ParsedImportRecording {
             source: recording_path.to_string_lossy().into_owned(),
             recording: document.recording,
             response_chunks,
+            websocket_frames,
         });
     }
 

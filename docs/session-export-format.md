@@ -100,15 +100,22 @@ Optional fields:
   - `chunk_index` (`number`): zero-based chunk order.
   - `offset_ms` (`number`): elapsed milliseconds from stream start.
   - `chunk_body` (`bytes`): response bytes for the chunk.
+- `websocket_frames` (`array`): websocket replay transcript metadata. Present when the source recording has stored websocket frames.
+  - `frame_index` (`number`): zero-based frame order.
+  - `offset_ms` (`number`): elapsed milliseconds from websocket session start.
+  - `direction` (`string`): `"client-to-server"` or `"server-to-client"`.
+  - `message_type` (`string`): `"text"` or `"binary"`.
+  - `payload` (`bytes`): websocket frame payload.
 
 When `response_chunks` is missing or empty, replay falls back to non-stream chunked-body reconstruction.
+When `websocket_frames` is missing or empty, websocket replay has no transcript frames to serve.
 
 ## Versioning And Compatibility
 
 - Export currently writes manifest `version: 2`.
 - Import accepts both `version: 1` and `version: 2`.
-- `version: 1` bundles do not include `response_chunks`.
-- `version: 2` bundles may include optional `response_chunks` per recording.
+- `version: 1` bundles do not include `response_chunks` or `websocket_frames`.
+- `version: 2` bundles may include optional `response_chunks` and `websocket_frames` per recording.
 
 ## Deterministic Ordering And Filenames
 

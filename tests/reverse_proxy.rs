@@ -26,7 +26,8 @@ use hyper_util::{
     server::conn::auto::Builder as ConnectionBuilder,
 };
 use replayproxy::storage::{
-    Recording, ResponseChunk, Storage, WebSocketFrameDirection, WebSocketMessageType,
+    Recording, ResponseChunk, SessionManager, Storage, WebSocketFrameDirection,
+    WebSocketMessageType,
 };
 use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -1809,6 +1810,128 @@ listen = "127.0.0.1:0"
 [storage]
 path = "{}"
 active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+
+[routes.websocket]
+recording_mode = "bidirectional"
+"#,
+        storage_dir.path().display(),
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let replay_ws_url = format!("ws://{}/ws/echo", replay_proxy.listen_addr);
+    let (mut replay_ws_stream, replay_response) = connect_async(replay_ws_url).await.unwrap();
+    assert_eq!(replay_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(greeting))) = replay_ws_stream.next().await else {
+        panic!("expected replayed greeting frame");
+    };
+    assert_eq!(greeting.to_string(), "upstream-ready");
+
+    let Some(Ok(Message::Binary(banner))) = replay_ws_stream.next().await else {
+        panic!("expected replayed binary banner frame");
+    };
+    assert_eq!(banner.to_vec(), vec![0x01, 0x02, 0x03]);
+
+    replay_ws_stream
+        .send(Message::Text("hello-proxy".into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(ack_text))) = replay_ws_stream.next().await else {
+        panic!("expected replayed text ack frame");
+    };
+    assert_eq!(ack_text.to_string(), "ack:hello-proxy");
+
+    replay_ws_stream
+        .send(Message::Binary(vec![0x10, 0x20].into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Binary(ack_binary))) = replay_ws_stream.next().await else {
+        panic!("expected replayed binary ack frame");
+    };
+    assert_eq!(ack_binary.to_vec(), vec![0xaa, 0xbb, 0xcc]);
+
+    let _ = replay_ws_stream.close(None).await;
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_export_import_round_trip_replays_from_imported_session() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let source_session = "source";
+    let imported_session = "imported";
+    record_bidirectional_websocket_session(storage_dir.path(), source_session).await;
+
+    let manager_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{source_session}"
+"#,
+        storage_dir.path().display()
+    );
+    let manager_config = replayproxy::config::Config::from_toml_str(&manager_config_toml).unwrap();
+    let session_manager = SessionManager::from_config(&manager_config)
+        .unwrap()
+        .expect("session storage should be configured");
+    session_manager
+        .create_session(imported_session)
+        .await
+        .expect("import session should be created");
+
+    let export_dir = storage_dir.path().join("_exports").join("ws-export");
+    let export_result = replayproxy::session_export::export_session(
+        &session_manager,
+        replayproxy::session_export::SessionExportRequest {
+            session_name: source_session.to_owned(),
+            out_dir: Some(export_dir.clone()),
+            format: replayproxy::session_export::SessionExportFormat::Json,
+        },
+    )
+    .await
+    .expect("session export should succeed");
+    assert_eq!(export_result.recordings_exported, 1);
+
+    let import_result = replayproxy::session_import::import_session(
+        &session_manager,
+        replayproxy::session_import::SessionImportRequest {
+            session_name: imported_session.to_owned(),
+            in_dir: export_dir.clone(),
+        },
+    )
+    .await
+    .expect("session import should succeed");
+    assert_eq!(import_result.recordings_imported, 1);
+
+    let imported_storage = session_manager
+        .open_session_storage(imported_session)
+        .await
+        .expect("imported session storage should open");
+    let summaries = imported_storage.list_recordings(0, 10).await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    let imported_frames = imported_storage
+        .get_websocket_frames(summaries[0].id)
+        .await
+        .expect("imported websocket frames should load");
+    assert_eq!(imported_frames.len(), 6);
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{imported_session}"
 
 [[routes]]
 path_prefix = "/ws"

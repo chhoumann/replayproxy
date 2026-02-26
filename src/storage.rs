@@ -82,6 +82,18 @@ pub struct SubsetScanLookupResult {
     pub scanned_rows: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRecording {
+    pub id: i64,
+    pub recording: Recording,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsetScanLookupResultWithId {
+    pub recording: Option<StoredRecording>,
+    pub scanned_rows: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordingSearch {
     pub method: Option<String>,
@@ -181,13 +193,21 @@ impl Storage {
         &self,
         match_key: &str,
     ) -> anyhow::Result<Option<Recording>> {
+        let result = self.get_recording_with_id_by_match_key(match_key).await?;
+        Ok(result.map(|stored| stored.recording))
+    }
+
+    pub async fn get_recording_with_id_by_match_key(
+        &self,
+        match_key: &str,
+    ) -> anyhow::Result<Option<StoredRecording>> {
         let db_path = self.db_path.clone();
         let match_key = match_key.to_owned();
         tokio::task::spawn_blocking(move || {
-            get_recording_by_match_key_blocking(&db_path, &match_key)
+            get_recording_with_id_by_match_key_blocking(&db_path, &match_key)
         })
         .await
-        .context("join get_recording_by_match_key task")?
+        .context("join get_recording_with_id_by_match_key task")?
     }
 
     pub async fn get_recordings_by_match_key(
@@ -228,17 +248,31 @@ impl Storage {
         match_key: &str,
         subset_query_normalizations: Vec<String>,
     ) -> anyhow::Result<Option<Recording>> {
+        let result = self
+            .get_latest_recording_with_id_by_match_key_and_query_subset(
+                match_key,
+                subset_query_normalizations,
+            )
+            .await?;
+        Ok(result.map(|stored| stored.recording))
+    }
+
+    pub async fn get_latest_recording_with_id_by_match_key_and_query_subset(
+        &self,
+        match_key: &str,
+        subset_query_normalizations: Vec<String>,
+    ) -> anyhow::Result<Option<StoredRecording>> {
         let db_path = self.db_path.clone();
         let match_key = match_key.to_owned();
         tokio::task::spawn_blocking(move || {
-            get_latest_recording_by_match_key_and_query_subset_blocking(
+            get_latest_recording_with_id_by_match_key_and_query_subset_blocking(
                 &db_path,
                 &match_key,
                 &subset_query_normalizations,
             )
         })
         .await
-        .context("join get_latest_recording_by_match_key_and_query_subset task")?
+        .context("join get_latest_recording_with_id_by_match_key_and_query_subset task")?
     }
 
     pub async fn get_latest_recording_by_match_key_and_query_subset_scan(
@@ -260,18 +294,37 @@ impl Storage {
         match_key: &str,
         request_query: Option<&str>,
     ) -> anyhow::Result<SubsetScanLookupResult> {
+        let result = self
+            .get_latest_recording_with_id_by_match_key_and_query_subset_scan_with_stats(
+                match_key,
+                request_query,
+            )
+            .await?;
+        Ok(SubsetScanLookupResult {
+            recording: result.recording.map(|stored| stored.recording),
+            scanned_rows: result.scanned_rows,
+        })
+    }
+
+    pub async fn get_latest_recording_with_id_by_match_key_and_query_subset_scan_with_stats(
+        &self,
+        match_key: &str,
+        request_query: Option<&str>,
+    ) -> anyhow::Result<SubsetScanLookupResultWithId> {
         let db_path = self.db_path.clone();
         let match_key = match_key.to_owned();
         let request_query = request_query.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
-            get_latest_recording_by_match_key_and_query_subset_scan_with_stats_blocking(
+            get_latest_recording_with_id_by_match_key_and_query_subset_scan_with_stats_blocking(
                 &db_path,
                 &match_key,
                 request_query.as_deref(),
             )
         })
         .await
-        .context("join get_latest_recording_by_match_key_and_query_subset_scan_with_stats task")?
+        .context(
+            "join get_latest_recording_with_id_by_match_key_and_query_subset_scan_with_stats task",
+        )?
     }
 
     pub async fn list_recordings(
@@ -857,6 +910,17 @@ fn deserialize_recording_at(row: &rusqlite::Row<'_>, offset: usize) -> anyhow::R
     })
 }
 
+fn deserialize_stored_recording_at(
+    row: &rusqlite::Row<'_>,
+    id_offset: usize,
+) -> anyhow::Result<StoredRecording> {
+    let id = row
+        .get::<_, i64>(id_offset)
+        .context("deserialize recording id")?;
+    let recording = deserialize_recording_at(row, id_offset + 1)?;
+    Ok(StoredRecording { id, recording })
+}
+
 fn deserialize_recording_summary_at(
     row: &rusqlite::Row<'_>,
     offset: usize,
@@ -890,16 +954,17 @@ fn deserialize_recording_summary_at(
     })
 }
 
-fn get_recording_by_match_key_blocking(
+fn get_recording_with_id_by_match_key_blocking(
     path: &Path,
     match_key: &str,
-) -> anyhow::Result<Option<Recording>> {
+) -> anyhow::Result<Option<StoredRecording>> {
     let conn = open_connection(path)?;
 
     let mut stmt = conn
         .prepare(
             r#"
             SELECT
+              id,
               match_key,
               request_method,
               request_uri,
@@ -928,7 +993,7 @@ fn get_recording_by_match_key_blocking(
         return Ok(None);
     };
 
-    Ok(Some(deserialize_recording_at(row, 0)?))
+    Ok(Some(deserialize_stored_recording_at(row, 0)?))
 }
 
 fn get_recording_by_id_blocking(
@@ -974,11 +1039,11 @@ fn get_recording_by_id_from_conn(
     Ok(Some(deserialize_recording_at(row, 0)?))
 }
 
-fn get_latest_recording_by_match_key_and_query_subset_scan_with_stats_blocking(
+fn get_latest_recording_with_id_by_match_key_and_query_subset_scan_with_stats_blocking(
     path: &Path,
     match_key: &str,
     request_query: Option<&str>,
-) -> anyhow::Result<SubsetScanLookupResult> {
+) -> anyhow::Result<SubsetScanLookupResultWithId> {
     let conn = open_connection(path)?;
     let mut stmt = conn
         .prepare(
@@ -1026,48 +1091,53 @@ fn get_latest_recording_by_match_key_and_query_subset_scan_with_stats_blocking(
     drop(stmt);
 
     let Some(matched_recording_id) = matched_recording_id else {
-        return Ok(SubsetScanLookupResult {
+        return Ok(SubsetScanLookupResultWithId {
             recording: None,
             scanned_rows,
         });
     };
 
-    Ok(SubsetScanLookupResult {
-        recording: get_recording_by_id_from_conn(&conn, matched_recording_id)?,
+    Ok(SubsetScanLookupResultWithId {
+        recording: get_recording_by_id_from_conn(&conn, matched_recording_id)?.map(|recording| {
+            StoredRecording {
+                id: matched_recording_id,
+                recording,
+            }
+        }),
         scanned_rows,
     })
 }
 
-fn get_latest_recording_by_match_key_and_query_subset_blocking(
+fn get_latest_recording_with_id_by_match_key_and_query_subset_blocking(
     path: &Path,
     match_key: &str,
     subset_query_normalizations: &[String],
-) -> anyhow::Result<Option<Recording>> {
+) -> anyhow::Result<Option<StoredRecording>> {
     if subset_query_normalizations.is_empty() {
         return Ok(None);
     }
 
     let conn = open_connection(path)?;
-    let mut latest: Option<(i64, Recording)> = None;
+    let mut latest: Option<StoredRecording> = None;
 
     for subset_chunk in subset_query_normalizations.chunks(QUERY_SUBSET_CHUNK_SIZE) {
         let maybe_row = get_latest_recording_for_subset_chunk(&conn, match_key, subset_chunk)?;
-        if let Some((recording_id, recording)) = maybe_row {
+        if let Some(recording) = maybe_row {
             match latest.as_ref() {
-                Some((latest_id, _)) if *latest_id >= recording_id => {}
-                _ => latest = Some((recording_id, recording)),
+                Some(latest_recording) if latest_recording.id >= recording.id => {}
+                _ => latest = Some(recording),
             }
         }
     }
 
-    Ok(latest.map(|(_, recording)| recording))
+    Ok(latest)
 }
 
 fn get_latest_recording_for_subset_chunk(
     conn: &Connection,
     match_key: &str,
     subset_chunk: &[String],
-) -> anyhow::Result<Option<(i64, Recording)>> {
+) -> anyhow::Result<Option<StoredRecording>> {
     let placeholders = (2..(subset_chunk.len() + 2))
         .map(|idx| format!("?{idx}"))
         .collect::<Vec<_>>()
@@ -1110,11 +1180,7 @@ fn get_latest_recording_for_subset_chunk(
         return Ok(None);
     };
 
-    let id = row
-        .get::<_, i64>(0)
-        .context("deserialize recording id for subset lookup")?;
-    let recording = deserialize_recording_at(row, 1)?;
-    Ok(Some((id, recording)))
+    Ok(Some(deserialize_stored_recording_at(row, 0)?))
 }
 
 fn get_recordings_by_match_key_blocking(

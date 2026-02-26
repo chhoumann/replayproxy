@@ -37,20 +37,21 @@ use tokio::sync::mpsc;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, oneshot},
+    time::{Instant as TokioInstant, Sleep},
 };
 
 use crate::{
     ca,
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RedactConfig,
-        RouteMatchConfig, RouteMode,
+        RouteMatchConfig, RouteMode, StreamingConfig,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
     session_import::{self, SessionImportError, SessionImportRequest},
     storage::{
         Recording, RecordingSearch, RecordingSummary, ResponseChunk, SessionManager,
-        SessionManagerError, Storage,
+        SessionManagerError, Storage, StoredRecording,
     },
 };
 
@@ -360,6 +361,7 @@ struct ProxyRoute {
     cache_miss: CacheMissPolicy,
     body_oversize: BodyOversizePolicy,
     match_config: Option<RouteMatchConfig>,
+    streaming: Option<StreamingConfig>,
     // Consumed by upcoming redaction storage steps.
     #[allow(dead_code)]
     redact: Option<RedactConfig>,
@@ -408,6 +410,7 @@ impl ProxyRuntimeConfig {
                 cache_miss,
                 body_oversize: route.body_oversize.unwrap_or(BodyOversizePolicy::Error),
                 match_config: route.match_.clone(),
+                streaming: route.streaming.clone(),
                 redact: route.redact.clone(),
             });
         }
@@ -1037,6 +1040,7 @@ fn proxy_route_configs_equal(current: &ProxyRoute, next: &ProxyRoute) -> bool {
         && current.cache_miss == next.cache_miss
         && current.body_oversize == next.body_oversize
         && route_match_configs_equal(current.match_config.as_ref(), next.match_config.as_ref())
+        && streaming_configs_equal(current.streaming.as_ref(), next.streaming.as_ref())
         && redact_configs_equal(current.redact.as_ref(), next.redact.as_ref())
 }
 
@@ -1066,6 +1070,17 @@ fn redact_configs_equal(current: Option<&RedactConfig>, next: Option<&RedactConf
                 && current.body_json == next.body_json
                 && current.placeholder == next.placeholder
         }
+        _ => false,
+    }
+}
+
+fn streaming_configs_equal(
+    current: Option<&StreamingConfig>,
+    next: Option<&StreamingConfig>,
+) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(current), Some(next)) => current.preserve_timing == next.preserve_timing,
         _ => false,
     }
 }
@@ -1578,6 +1593,70 @@ impl hyper::body::Body for PrefixedIncomingBody {
     }
 }
 
+struct ReplayChunkBody {
+    chunks: VecDeque<ResponseChunk>,
+    preserve_timing: bool,
+    started_at: TokioInstant,
+    pending_chunk: Option<ResponseChunk>,
+    delay: Option<Pin<Box<Sleep>>>,
+}
+
+impl ReplayChunkBody {
+    fn new(chunks: Vec<ResponseChunk>, preserve_timing: bool) -> Self {
+        Self {
+            chunks: chunks.into(),
+            preserve_timing,
+            started_at: TokioInstant::now(),
+            pending_chunk: None,
+            delay: None,
+        }
+    }
+}
+
+impl hyper::body::Body for ReplayChunkBody {
+    type Data = Bytes;
+    type Error = Box<dyn StdError + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.pending_chunk.is_none() {
+            this.pending_chunk = this.chunks.pop_front();
+        }
+
+        let Some(chunk) = this.pending_chunk.as_ref() else {
+            return Poll::Ready(None);
+        };
+
+        if this.preserve_timing {
+            let deadline = this.started_at + Duration::from_millis(chunk.offset_ms);
+            if TokioInstant::now() < deadline {
+                if this.delay.is_none() {
+                    this.delay = Some(Box::pin(tokio::time::sleep_until(deadline)));
+                }
+                if let Some(delay) = this.delay.as_mut() {
+                    match delay.as_mut().poll(cx) {
+                        Poll::Ready(()) => {
+                            this.delay = None;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            } else {
+                this.delay = None;
+            }
+        }
+
+        let chunk = this
+            .pending_chunk
+            .take()
+            .expect("pending chunk must exist after readiness checks");
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk.chunk_body)))))
+    }
+}
+
 fn parse_content_length(headers: &hyper::HeaderMap) -> Option<u64> {
     headers
         .get(header::CONTENT_LENGTH)
@@ -1602,6 +1681,10 @@ fn boxed_incoming(body: Incoming) -> ProxyBody {
 
 fn boxed_prefetched_incoming(prefetched: Vec<Bytes>, body: Incoming) -> ProxyBody {
     PrefixedIncomingBody::new(prefetched, body).boxed()
+}
+
+fn boxed_replay_chunks(chunks: Vec<ResponseChunk>, preserve_timing: bool) -> ProxyBody {
+    ReplayChunkBody::new(chunks, preserve_timing).boxed()
 }
 
 async fn proxy_handler(
@@ -1914,7 +1997,9 @@ async fn proxy_handler(
                         .status
                         .cache_hits_total
                         .fetch_add(1, Ordering::Relaxed);
-                    respond!(None, response_from_recording(recording));
+                    let replay_response =
+                        response_from_stored_recording(storage, &route, recording).await;
+                    respond!(None, replay_response);
                 }
                 Ok(None) => {
                     cache_outcome = CacheLogOutcome::Miss;
@@ -1961,7 +2046,9 @@ async fn proxy_handler(
                             .status
                             .cache_hits_total
                             .fetch_add(1, Ordering::Relaxed);
-                        respond!(None, response_from_recording(recording));
+                        let replay_response =
+                            response_from_stored_recording(storage, &route, recording).await;
+                        respond!(None, replay_response);
                     }
                     Ok(None) => {
                         cache_outcome = CacheLogOutcome::Miss;
@@ -2255,13 +2342,54 @@ fn mode_log_label(mode: Option<RouteMode>) -> &'static str {
     }
 }
 
-fn response_from_recording(recording: Recording) -> Response<ProxyBody> {
-    let body = boxed_full(Bytes::from(recording.response_body));
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::from_u16(recording.response_status)
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+async fn response_from_stored_recording(
+    storage: &Storage,
+    route: &ProxyRoute,
+    stored_recording: StoredRecording,
+) -> Response<ProxyBody> {
+    let preserve_timing = route
+        .streaming
+        .as_ref()
+        .map(|streaming| streaming.preserve_timing)
+        .unwrap_or(false);
+    let response_chunks = if route.streaming.is_some() {
+        match storage.get_response_chunks(stored_recording.id).await {
+            Ok(chunks) => Some(chunks).filter(|chunks| !chunks.is_empty()),
+            Err(err) => {
+                tracing::debug!(
+                    route = %route.route_ref,
+                    recording_id = stored_recording.id,
+                    "failed to read replay response chunks: {err}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    response_from_recording(stored_recording.recording, response_chunks, preserve_timing)
+}
 
-    for (name, value) in recording.response_headers {
+fn response_from_recording(
+    recording: Recording,
+    response_chunks: Option<Vec<ResponseChunk>>,
+    preserve_timing: bool,
+) -> Response<ProxyBody> {
+    let Recording {
+        response_status,
+        response_headers,
+        response_body,
+        ..
+    } = recording;
+    let body = match response_chunks {
+        Some(chunks) if !chunks.is_empty() => boxed_replay_chunks(chunks, preserve_timing),
+        _ => boxed_full(Bytes::from(response_body)),
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() =
+        StatusCode::from_u16(response_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    for (name, value) in response_headers {
         let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
             tracing::debug!("invalid header name in recording");
             continue;
@@ -2285,7 +2413,7 @@ async fn lookup_recording_for_request(
     route_match: Option<&RouteMatchConfig>,
     request_uri: &Uri,
     match_key: &str,
-) -> anyhow::Result<Option<Recording>> {
+) -> anyhow::Result<Option<StoredRecording>> {
     lookup_recording_for_request_with_subset_limit(
         storage,
         route_match,
@@ -2302,13 +2430,13 @@ async fn lookup_recording_for_request_with_subset_limit(
     request_uri: &Uri,
     match_key: &str,
     subset_candidate_limit: usize,
-) -> anyhow::Result<Option<Recording>> {
+) -> anyhow::Result<Option<StoredRecording>> {
     let query_mode = route_match
         .map(|route_match| route_match.query)
         .unwrap_or(QueryMatchMode::Exact);
 
     if query_mode != QueryMatchMode::Subset {
-        return storage.get_recording_by_match_key(match_key).await;
+        return storage.get_recording_with_id_by_match_key(match_key).await;
     }
 
     let request_query = request_uri.query();
@@ -2319,7 +2447,7 @@ async fn lookup_recording_for_request_with_subset_limit(
         )
     {
         return storage
-            .get_latest_recording_by_match_key_and_query_subset(
+            .get_latest_recording_with_id_by_match_key_and_query_subset(
                 match_key,
                 subset_query_normalizations,
             )
@@ -2342,7 +2470,7 @@ async fn lookup_recording_for_request_with_subset_limit(
     );
 
     let fallback_result = storage
-        .get_latest_recording_by_match_key_and_query_subset_scan_with_stats(
+        .get_latest_recording_with_id_by_match_key_and_query_subset_scan_with_stats(
             match_key,
             request_query,
         )
@@ -3687,6 +3815,7 @@ mod tests {
             cache_miss: CacheMissPolicy::Forward,
             body_oversize: BodyOversizePolicy::Error,
             match_config: None,
+            streaming: None,
             redact: None,
         }
     }
@@ -4035,8 +4164,8 @@ ca_key = "{}"
         .unwrap()
         .unwrap();
 
-        assert_eq!(fetched.request_uri, "/api?a=1&b=2");
-        assert_eq!(fetched.response_body, b"newer-matching");
+        assert_eq!(fetched.recording.request_uri, "/api?a=1&b=2");
+        assert_eq!(fetched.recording.response_body, b"newer-matching");
     }
 
     #[test]

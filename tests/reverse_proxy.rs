@@ -23,7 +23,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnectionBuilder,
 };
-use replayproxy::storage::{Recording, Storage};
+use replayproxy::storage::{Recording, ResponseChunk, Storage};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::{
@@ -750,6 +750,30 @@ mode = "record"
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn replay_streaming_preserve_timing_replays_slower_than_fast_mode() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    seed_streaming_replay_recording(storage_dir.path(), session).await;
+
+    let (preserve_elapsed, preserve_body) =
+        replay_streaming_elapsed(storage_dir.path(), session, true).await;
+    let (fast_elapsed, fast_body) =
+        replay_streaming_elapsed(storage_dir.path(), session, false).await;
+
+    let expected_body = Bytes::from_static(b"data: first\n\ndata: second\n\ndata: done\n\n");
+    assert_eq!(preserve_body, expected_body);
+    assert_eq!(fast_body, expected_body);
+    assert!(
+        preserve_elapsed >= Duration::from_millis(180),
+        "expected preserve_timing replay to take at least ~180ms, got {preserve_elapsed:?}"
+    );
+    assert!(
+        preserve_elapsed > fast_elapsed + Duration::from_millis(100),
+        "expected preserve_timing replay to be noticeably slower; preserve={preserve_elapsed:?}, fast={fast_elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -4202,6 +4226,106 @@ async fn spawn_upstream_with_response_chunks(
     });
 
     (addr, rx, move || join)
+}
+
+async fn seed_streaming_replay_recording(storage_root: &std::path::Path, session: &str) {
+    let storage = Storage::open(storage_root.join(session).join("recordings.db")).unwrap();
+    let request_uri: Uri = "/api/stream".parse().unwrap();
+    let match_key = replayproxy::matching::compute_match_key(
+        None,
+        &Method::GET,
+        &request_uri,
+        &hyper::HeaderMap::new(),
+        &[],
+    )
+    .unwrap();
+    let response_body = b"data: first\n\ndata: second\n\ndata: done\n\n".to_vec();
+    let recording = Recording {
+        match_key,
+        request_method: "GET".to_owned(),
+        request_uri: "/api/stream".to_owned(),
+        request_headers: Vec::new(),
+        request_body: Vec::new(),
+        response_status: 200,
+        response_headers: vec![("content-type".to_owned(), b"text/event-stream".to_vec())],
+        response_body,
+        created_at_unix_ms: Recording::now_unix_ms().unwrap(),
+    };
+    let recording_id = storage.insert_recording(recording).await.unwrap();
+    storage
+        .insert_response_chunks(
+            recording_id,
+            vec![
+                ResponseChunk {
+                    chunk_index: 0,
+                    offset_ms: 0,
+                    chunk_body: b"data: first\n\n".to_vec(),
+                },
+                ResponseChunk {
+                    chunk_index: 1,
+                    offset_ms: 120,
+                    chunk_body: b"data: second\n\n".to_vec(),
+                },
+                ResponseChunk {
+                    chunk_index: 2,
+                    offset_ms: 240,
+                    chunk_body: b"data: done\n\n".to_vec(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+async fn replay_streaming_elapsed(
+    storage_root: &std::path::Path,
+    session: &str,
+    preserve_timing: bool,
+) -> (Duration, Bytes) {
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+
+[routes.streaming]
+preserve_timing = {}
+"#,
+        storage_root.display(),
+        preserve_timing
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+    let proxy_uri: Uri = format!("http://{}/api/stream", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(proxy_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let started_at = std::time::Instant::now();
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let elapsed = started_at.elapsed();
+
+    proxy.shutdown().await;
+    (elapsed, body)
 }
 
 async fn response_json(response: Response<Incoming>) -> Value {

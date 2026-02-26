@@ -368,6 +368,115 @@ mode = "record"
 }
 
 #[tokio::test]
+async fn direct_http2_route_dns_resolution_failures_recover_without_connection_leak() {
+    let (healthy_upstream_addr, mut healthy_upstream_rx, healthy_upstream_shutdown) =
+        spawn_grpc_upstream().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[[routes]]
+path_prefix = "/bad"
+upstream = "http://nonexistent.invalid:443"
+mode = "record"
+
+[[routes]]
+path_prefix = "/good"
+upstream = "http://{healthy_upstream_addr}"
+mode = "record"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut admin_connector = HttpConnector::new();
+    admin_connector.enforce_http(false);
+    let admin_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(admin_connector);
+
+    let stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    for attempt in 0..4 {
+        let req = Request::builder()
+            .method(Method::POST)
+            .version(hyper::Version::HTTP_2)
+            .uri(format!(
+                "http://{}/bad/unresolved-{attempt}",
+                proxy.listen_addr
+            ))
+            .header(header::HOST, proxy.listen_addr.to_string())
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header("te", "trailers")
+            .body(Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x00")))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            body_bytes.as_ref() == b"upstream request failed"
+                || body_bytes.as_ref() == b"failed to read upstream response body",
+            "unexpected DNS failure body: {:?}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+    }
+
+    let grpc_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let healthy_req = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/good/helloworld.Greeter/SayHello?x=1",
+            proxy.listen_addr
+        ))
+        .header(header::HOST, proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(grpc_payload.clone()))
+        .unwrap();
+    let healthy_res = sender.send_request(healthy_req).await.unwrap();
+    assert_eq!(healthy_res.version(), hyper::Version::HTTP_2);
+    assert_eq!(healthy_res.status(), StatusCode::OK);
+    assert_eq!(
+        healthy_res.headers().get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        healthy_res.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let healthy_body = healthy_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&healthy_body[..], b"\x00\x00\x00\x00\x00");
+
+    let captured = healthy_upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.version, hyper::Version::HTTP_2);
+    assert_eq!(captured.uri.path(), "/good/helloworld.Greeter/SayHello");
+    assert_eq!(captured.uri.query(), Some("x=1"));
+    assert_eq!(
+        captured.headers.get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(captured.body, grpc_payload);
+
+    drop(sender);
+    let _ = connection_task.await;
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    proxy.shutdown().await;
+    let _ = healthy_upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn direct_http2_route_truncated_upstream_response_returns_502_and_recovers() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) =
         spawn_grpc_upstream_truncated_then_success().await;
@@ -1918,6 +2027,94 @@ path_prefix = "/"
 }
 
 #[tokio::test]
+async fn forward_proxy_connect_dual_stack_failures_recover_without_connection_leak() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_connect_upstream().await;
+
+    let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_port = unavailable_listener.local_addr().unwrap().port();
+    drop(unavailable_listener);
+
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[[routes]]
+path_prefix = "/"
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut admin_connector = HttpConnector::new();
+    admin_connector.enforce_http(false);
+    let admin_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(admin_connector);
+
+    let failure_authorities = vec![
+        format!("localhost:{unavailable_port}"),
+        format!("127.0.0.1:{unavailable_port}"),
+        format!("[::1]:{unavailable_port}"),
+    ];
+    for attempt in 0..6 {
+        let authority = &failure_authorities[attempt % failure_authorities.len()];
+        let mut stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+        let connect_request = format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+        );
+        stream.write_all(connect_request.as_bytes()).await.unwrap();
+
+        let response_head = read_http_response_head(&mut stream).await;
+        assert!(
+            response_head.starts_with(b"HTTP/1.1 502"),
+            "unexpected CONNECT failure response for {authority}: {}",
+            String::from_utf8_lossy(&response_head)
+        );
+    }
+
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    let recovery_authority = format!("localhost:{}", upstream_addr.port());
+    let mut stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let connect_request = format!(
+        "CONNECT {recovery_authority} HTTP/1.1\r\nHost: {recovery_authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(connect_request.as_bytes()).await.unwrap();
+
+    let response_head = read_http_response_head(&mut stream).await;
+    assert!(
+        response_head.starts_with(b"HTTP/1.1 200"),
+        "unexpected CONNECT recovery response: {}",
+        String::from_utf8_lossy(&response_head)
+    );
+
+    stream.write_all(b"hello").await.unwrap();
+    let mut first_reply = [0u8; 5];
+    stream.read_exact(&mut first_reply).await.unwrap();
+    assert_eq!(&first_reply, b"world");
+
+    stream.write_all(b"ping").await.unwrap();
+    let mut second_reply = [0u8; 4];
+    stream.read_exact(&mut second_reply).await.unwrap();
+    assert_eq!(&second_reply, b"pong");
+
+    let first_capture = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_capture.as_ref(), b"hello");
+    let second_capture = upstream_rx.recv().await.unwrap();
+    assert_eq!(second_capture.as_ref(), b"ping");
+
+    drop(stream);
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn websocket_upgrade_route_relays_frames_bidirectionally() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_websocket_upstream().await;
 
@@ -2818,6 +3015,91 @@ mode = "record"
             !handshake_err.to_string().is_empty(),
             "TLS handshake error should include context"
         );
+    }
+
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    let trusted_tls_client_config = tls_client_config_for_ca_cert(&ca_paths.cert_path);
+    let (status, body) = send_https_get_via_connect(
+        proxy.listen_addr,
+        "api.example.test:443",
+        "api.example.test",
+        trusted_tls_client_config,
+        "/api/recover",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body, Bytes::from_static(b"upstream-body"));
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/recover");
+
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[tokio::test]
+async fn https_connect_mitm_client_disconnects_before_tls_handshake_recover_without_connection_leak()
+ {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ca_dir = temp_dir.path().join("ca");
+    let ca_paths = replayproxy::ca::generate_ca(&ca_dir, false).unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    let session = "default";
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        ca_paths.cert_path.display(),
+        ca_paths.key_path.display(),
+        storage_dir.display(),
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut admin_connector = HttpConnector::new();
+    admin_connector.enforce_http(false);
+    let admin_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(admin_connector);
+
+    for _ in 0..5 {
+        let mut stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+        let connect_request = "CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\nProxy-Connection: keep-alive\r\n\r\n";
+        stream.write_all(connect_request.as_bytes()).await.unwrap();
+
+        let response_head = read_http_response_head(&mut stream).await;
+        assert!(
+            response_head.starts_with(b"HTTP/1.1 200"),
+            "unexpected CONNECT response: {}",
+            String::from_utf8_lossy(&response_head)
+        );
+
+        stream.shutdown().await.unwrap();
     }
 
     wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;

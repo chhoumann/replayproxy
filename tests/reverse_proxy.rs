@@ -465,6 +465,213 @@ cache_miss = "error"
 }
 
 #[tokio::test]
+async fn grpc_export_import_round_trip_replays_from_imported_session() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let source_session = "source";
+    let imported_session = "imported";
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{source_session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        storage_dir.path().display()
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+
+    let stream = TcpStream::connect(record_proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let recorded_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let record_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/helloworld.Greeter/SayHello",
+            record_proxy.listen_addr
+        ))
+        .header(header::HOST, record_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(recorded_payload.clone()))
+        .unwrap();
+    let record_response = sender.send_request(record_request).await.unwrap();
+    assert_eq!(record_response.status(), StatusCode::OK);
+    assert_eq!(
+        record_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        record_response.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let record_body = record_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&record_body[..], b"\x00\x00\x00\x00\x00");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.version, hyper::Version::HTTP_2);
+    assert_eq!(captured.uri.path(), "/helloworld.Greeter/SayHello");
+    assert_eq!(captured.body, recorded_payload.clone());
+
+    drop(sender);
+    let _ = connection_task.await;
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let manager_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{source_session}"
+"#,
+        storage_dir.path().display()
+    );
+    let manager_config = replayproxy::config::Config::from_toml_str(&manager_config_toml).unwrap();
+    let session_manager = SessionManager::from_config(&manager_config)
+        .unwrap()
+        .expect("session storage should be configured");
+    session_manager
+        .create_session(imported_session)
+        .await
+        .expect("import session should be created");
+
+    let export_dir = storage_dir.path().join("_exports").join("grpc-export");
+    let export_result = replayproxy::session_export::export_session(
+        &session_manager,
+        replayproxy::session_export::SessionExportRequest {
+            session_name: source_session.to_owned(),
+            out_dir: Some(export_dir.clone()),
+            format: replayproxy::session_export::SessionExportFormat::Json,
+        },
+    )
+    .await
+    .expect("session export should succeed");
+    assert_eq!(export_result.recordings_exported, 1);
+
+    let import_result = replayproxy::session_import::import_session(
+        &session_manager,
+        replayproxy::session_import::SessionImportRequest {
+            session_name: imported_session.to_owned(),
+            in_dir: export_dir,
+        },
+    )
+    .await
+    .expect("session import should succeed");
+    assert_eq!(import_result.recordings_imported, 1);
+
+    let imported_storage = session_manager
+        .open_session_storage(imported_session)
+        .await
+        .expect("imported session storage should open");
+    let summaries = imported_storage.list_recordings(0, 10).await.unwrap();
+    assert_eq!(summaries.len(), 1);
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{imported_session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://127.0.0.1:9"
+mode = "replay"
+cache_miss = "error"
+"#,
+        storage_dir.path().display()
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let stream = TcpStream::connect(replay_proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let replay_hit_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/helloworld.Greeter/SayHello",
+            replay_proxy.listen_addr
+        ))
+        .header(header::HOST, replay_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(recorded_payload.clone()))
+        .unwrap();
+    let replay_hit_response = sender.send_request(replay_hit_request).await.unwrap();
+    assert_eq!(replay_hit_response.status(), StatusCode::OK);
+    assert_eq!(
+        replay_hit_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        replay_hit_response.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let replay_hit_body = replay_hit_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&replay_hit_body[..], b"\x00\x00\x00\x00\x00");
+
+    let replay_miss_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/helloworld.Greeter/SayHello",
+            replay_proxy.listen_addr
+        ))
+        .header(header::HOST, replay_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x05jello")))
+        .unwrap();
+    let replay_miss_response = sender.send_request(replay_miss_request).await.unwrap();
+    assert_eq!(replay_miss_response.status(), StatusCode::BAD_GATEWAY);
+    let miss_body = response_json(replay_miss_response).await;
+    assert_eq!(miss_body["error"], "Gateway Not Recorded");
+
+    drop(sender);
+    let _ = connection_task.await;
+    replay_proxy.shutdown().await;
+}
+
+#[tokio::test]
 #[cfg(feature = "grpc")]
 async fn grpc_proto_aware_record_then_replay_matches_selected_fields() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
@@ -2707,6 +2914,80 @@ mode = "record"
 }
 
 #[tokio::test]
+async fn record_mode_upstream_reset_returns_502_and_subsequent_requests_recover() {
+    let (upstream_addr, upstream_shutdown) = spawn_upstream_reset_then_success().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        storage_dir.path().display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/reset-first", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::POST)
+        .uri(first_uri)
+        .body(Full::new(Bytes::from_static(b"trigger-reset")))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::BAD_GATEWAY);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        first_body.as_ref() == b"upstream request failed"
+            || first_body.as_ref() == b"failed to read upstream response body",
+        "unexpected upstream reset body: {:?}",
+        String::from_utf8_lossy(&first_body)
+    );
+
+    let second_uri: Uri = format!("http://{}/api/healthy-second", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let second_req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let second_res = client.request(second_req).await.unwrap();
+    assert_eq!(second_res.status(), StatusCode::CREATED);
+    let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&second_body[..], b"upstream-body");
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    proxy.shutdown().await;
+    let join = upstream_shutdown();
+    join.abort();
+    let _ = join.await;
+}
+
+#[tokio::test]
 async fn oversized_response_body_can_bypass_cache_per_route() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
 
@@ -2918,6 +3199,87 @@ mode = "record"
 }
 
 #[tokio::test]
+async fn streaming_export_import_round_trip_replays_from_imported_session() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let source_session = "source";
+    let imported_session = "imported";
+    seed_streaming_replay_recording(storage_dir.path(), source_session).await;
+
+    let manager_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{source_session}"
+"#,
+        storage_dir.path().display()
+    );
+    let manager_config = replayproxy::config::Config::from_toml_str(&manager_config_toml).unwrap();
+    let session_manager = SessionManager::from_config(&manager_config)
+        .unwrap()
+        .expect("session storage should be configured");
+    session_manager
+        .create_session(imported_session)
+        .await
+        .expect("import session should be created");
+
+    let export_dir = storage_dir.path().join("_exports").join("streaming-export");
+    let export_result = replayproxy::session_export::export_session(
+        &session_manager,
+        replayproxy::session_export::SessionExportRequest {
+            session_name: source_session.to_owned(),
+            out_dir: Some(export_dir.clone()),
+            format: replayproxy::session_export::SessionExportFormat::Json,
+        },
+    )
+    .await
+    .expect("session export should succeed");
+    assert_eq!(export_result.recordings_exported, 1);
+
+    let import_result = replayproxy::session_import::import_session(
+        &session_manager,
+        replayproxy::session_import::SessionImportRequest {
+            session_name: imported_session.to_owned(),
+            in_dir: export_dir,
+        },
+    )
+    .await
+    .expect("session import should succeed");
+    assert_eq!(import_result.recordings_imported, 1);
+
+    let imported_storage = session_manager
+        .open_session_storage(imported_session)
+        .await
+        .expect("imported session storage should open");
+    let summaries = imported_storage.list_recordings(0, 10).await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    let imported_chunks = imported_storage
+        .get_response_chunks(summaries[0].id)
+        .await
+        .expect("imported streaming chunks should load");
+    assert_eq!(imported_chunks.len(), 3);
+
+    let (preserve_elapsed, preserve_body) =
+        replay_streaming_elapsed(storage_dir.path(), imported_session, true).await;
+    let (fast_elapsed, fast_body) =
+        replay_streaming_elapsed(storage_dir.path(), imported_session, false).await;
+
+    let expected_body = Bytes::from_static(b"data: first\n\ndata: second\n\ndata: done\n\n");
+    assert_eq!(preserve_body, expected_body);
+    assert_eq!(fast_body, expected_body);
+    assert!(
+        preserve_elapsed >= Duration::from_millis(180),
+        "expected preserve_timing replay to take at least ~180ms, got {preserve_elapsed:?}"
+    );
+    assert!(
+        preserve_elapsed > fast_elapsed + Duration::from_millis(100),
+        "expected preserve_timing replay to be noticeably slower; preserve={preserve_elapsed:?}, fast={fast_elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn replay_streaming_preserve_timing_replays_slower_than_fast_mode() {
     let storage_dir = tempfile::tempdir().unwrap();
     let session = "default";
@@ -3099,6 +3461,134 @@ enabled = true
         .unwrap();
     let metrics_res = client.request(metrics_req).await.unwrap();
     assert_eq!(metrics_res.status(), StatusCode::OK);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_config_reload_recovers_from_admin_api_token_misconfiguration() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("replayproxy.toml");
+    let write_config = |token_line: &str| {
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+{token_line}
+"#
+            ),
+        )
+        .unwrap();
+    };
+
+    write_config(r#"admin_api_token = "super-secret""#);
+
+    let config = replayproxy::config::Config::from_path(&config_path).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+    let status_uri: Uri = format!("http://{admin_addr}/_admin/status")
+        .parse()
+        .unwrap();
+    let reload_uri: Uri = format!("http://{admin_addr}/_admin/config/reload")
+        .parse()
+        .unwrap();
+
+    let initial_status_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let initial_status_res = client.request(initial_status_req).await.unwrap();
+    assert_eq!(initial_status_res.status(), StatusCode::OK);
+    let _ = initial_status_res
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    write_config(r#"admin_api_token = """#);
+
+    let invalid_reload_req = Request::builder()
+        .method(Method::POST)
+        .uri(reload_uri.clone())
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let invalid_reload_res = client.request(invalid_reload_req).await.unwrap();
+    assert_eq!(invalid_reload_res.status(), StatusCode::BAD_REQUEST);
+    let invalid_reload_body = response_json(invalid_reload_res).await;
+    assert!(
+        invalid_reload_body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`proxy.admin_api_token` must not be empty"))
+    );
+
+    let status_after_failure_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let status_after_failure_res = client.request(status_after_failure_req).await.unwrap();
+    assert_eq!(status_after_failure_res.status(), StatusCode::OK);
+    let _ = status_after_failure_res
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    write_config(r#"admin_api_token = "super-secret""#);
+
+    let recovery_reload_req = Request::builder()
+        .method(Method::POST)
+        .uri(reload_uri)
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let recovery_reload_res = client.request(recovery_reload_req).await.unwrap();
+    assert_eq!(recovery_reload_res.status(), StatusCode::OK);
+    let _ = recovery_reload_res
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let status_after_recovery_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri.clone())
+        .header(ADMIN_API_TOKEN_HEADER, "super-secret")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let status_after_recovery_res = client.request(status_after_recovery_req).await.unwrap();
+    assert_eq!(status_after_recovery_res.status(), StatusCode::OK);
+    let _ = status_after_recovery_res
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let unauth_req = Request::builder()
+        .method(Method::GET)
+        .uri(status_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let unauth_res = client.request(unauth_req).await.unwrap();
+    assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
 
     proxy.shutdown().await;
 }
@@ -7114,6 +7604,65 @@ async fn spawn_upstream() -> (
     });
 
     (addr, rx, move || join)
+}
+
+async fn spawn_upstream_reset_then_success()
+-> (SocketAddr, impl FnOnce() -> tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let join = tokio::spawn(async move {
+        let (mut first_stream, _peer) = listener.accept().await.unwrap();
+        let request_head = read_http_response_head(&mut first_stream).await;
+        let content_length = String::from_utf8_lossy(&request_head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        if content_length > 0 {
+            let mut body = vec![0_u8; content_length];
+            first_stream.read_exact(&mut body).await.unwrap();
+        }
+        let _ = first_stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort")
+            .await;
+        let _ = first_stream.shutdown().await;
+
+        loop {
+            let (mut stream, _peer) = listener.accept().await.unwrap();
+            let request_head = read_http_response_head(&mut stream).await;
+            let content_length = String::from_utf8_lossy(&request_head)
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if content_length > 0 {
+                let mut body = vec![0_u8; content_length];
+                stream.read_exact(&mut body).await.unwrap();
+            }
+
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 13\r\nConnection: close\r\n\r\nupstream-body",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    (addr, move || join)
 }
 
 async fn spawn_grpc_upstream() -> (

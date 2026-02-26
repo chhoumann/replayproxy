@@ -889,22 +889,71 @@ fn summarize_route_diff(
     next: &ProxyRuntimeConfig,
 ) -> RouteDiffSummary {
     let mut summary = RouteDiffSummary::default();
-    let route_count = current.routes.len().max(next.routes.len());
+    let overlap_count = current.routes.len().min(next.routes.len());
+    let mut matched_current = vec![false; current.routes.len()];
+    let mut matched_next = vec![false; next.routes.len()];
 
-    for idx in 0..route_count {
-        match (current.routes.get(idx), next.routes.get(idx)) {
-            (None, Some(_)) => summary.added.push(idx),
-            (Some(_), None) => summary.removed.push(idx),
-            (Some(current_route), Some(next_route)) => {
-                if !proxy_route_configs_equal(current_route, next_route) {
-                    summary.changed.push(idx);
-                }
-            }
-            (None, None) => {}
+    for idx in 0..overlap_count {
+        if proxy_route_configs_equal(&current.routes[idx], &next.routes[idx]) {
+            matched_current[idx] = true;
+            matched_next[idx] = true;
         }
     }
 
+    // Match equal routes that moved position so we can classify movement as remove+add.
+    for current_idx in 0..current.routes.len() {
+        if matched_current[current_idx] {
+            continue;
+        }
+
+        if let Some(next_idx) = find_unmatched_matching_route_index(
+            &current.routes[current_idx],
+            &next.routes,
+            &matched_next,
+        ) {
+            matched_current[current_idx] = true;
+            matched_next[next_idx] = true;
+            summary.removed.push(current_idx);
+            summary.added.push(next_idx);
+        }
+    }
+
+    for idx in 0..overlap_count {
+        if !matched_current[idx] && !matched_next[idx] {
+            matched_current[idx] = true;
+            matched_next[idx] = true;
+            summary.changed.push(idx);
+        }
+    }
+
+    for (idx, matched) in matched_current.iter().enumerate() {
+        if !matched {
+            summary.removed.push(idx);
+        }
+    }
+    for (idx, matched) in matched_next.iter().enumerate() {
+        if !matched {
+            summary.added.push(idx);
+        }
+    }
+
+    summary.added.sort_unstable();
+    summary.removed.sort_unstable();
+    summary.changed.sort_unstable();
+
     summary
+}
+
+fn find_unmatched_matching_route_index(
+    route: &ProxyRoute,
+    routes: &[ProxyRoute],
+    matched: &[bool],
+) -> Option<usize> {
+    routes
+        .iter()
+        .enumerate()
+        .find(|(idx, candidate)| !matched[*idx] && proxy_route_configs_equal(route, candidate))
+        .map(|(idx, _)| idx)
 }
 
 fn proxy_route_configs_equal(current: &ProxyRoute, next: &ProxyRoute) -> bool {
@@ -3478,6 +3527,32 @@ mod tests {
         assert_eq!(summary.changed, vec![1, 2]);
         assert_eq!(summary.added, vec![3]);
         assert!(summary.removed.is_empty());
+        assert!(summary.has_changes());
+    }
+
+    #[test]
+    fn summarize_route_diff_classifies_reordered_routes_as_add_remove() {
+        let current = super::ProxyRuntimeConfig {
+            routes: vec![
+                test_route(Some("/v1/alpha"), None, None),
+                test_route(Some("/v1/bravo"), None, None),
+                test_route(Some("/v1/charlie"), None, None),
+            ],
+            max_body_bytes: 64,
+        };
+        let next = super::ProxyRuntimeConfig {
+            routes: vec![
+                test_route(Some("/v1/charlie"), None, None),
+                test_route(Some("/v1/alpha"), None, None),
+                test_route(Some("/v1/bravo"), None, None),
+            ],
+            max_body_bytes: 64,
+        };
+
+        let summary = summarize_route_diff(&current, &next);
+        assert_eq!(summary.removed, vec![0, 1, 2]);
+        assert_eq!(summary.added, vec![0, 1, 2]);
+        assert!(summary.changed.is_empty());
         assert!(summary.has_changes());
     }
 

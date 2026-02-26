@@ -5426,6 +5426,210 @@ burst = 1
     let _ = upstream_shutdown().await;
 }
 
+#[tokio::test]
+async fn record_mode_rate_limit_queue_depth_rejects_when_full() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream_with_responses(vec![
+        Bytes::from_static(b"first-upstream"),
+        Bytes::from_static(b"queued-upstream"),
+    ])
+    .await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.rate_limit]
+requests_per_second = 1
+burst = 1
+queue_depth = 1
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/first", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(first_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::CREATED);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"first-upstream");
+
+    let queued_client = client.clone();
+    let queued_uri: Uri = format!("http://{}/api/queued", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let queued_task = tokio::spawn(async move {
+        let queued_req = Request::builder()
+            .method(Method::GET)
+            .uri(queued_uri)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let queued_started_at = Instant::now();
+        let queued_res = queued_client.request(queued_req).await.unwrap();
+        let queued_elapsed = queued_started_at.elapsed();
+        let queued_status = queued_res.status();
+        let queued_body = queued_res.into_body().collect().await.unwrap().to_bytes();
+        (queued_status, queued_body, queued_elapsed)
+    });
+
+    sleep(Duration::from_millis(50)).await;
+
+    let overflow_uri: Uri = format!("http://{}/api/overflow", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let overflow_req = Request::builder()
+        .method(Method::GET)
+        .uri(overflow_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let overflow_started_at = Instant::now();
+    let overflow_res = client.request(overflow_req).await.unwrap();
+    let overflow_elapsed = overflow_started_at.elapsed();
+    assert!(
+        overflow_elapsed < Duration::from_millis(400),
+        "overflow request should fail fast when queue is full; elapsed={overflow_elapsed:?}"
+    );
+    assert_eq!(overflow_res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let overflow_body = String::from_utf8(
+        overflow_res
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(overflow_body.contains("queue is full"));
+    assert!(overflow_body.contains("queue_depth=1"));
+
+    let (queued_status, queued_body, queued_elapsed) = queued_task.await.unwrap();
+    assert_eq!(queued_status, StatusCode::CREATED);
+    assert_eq!(&queued_body[..], b"queued-upstream");
+    assert!(
+        queued_elapsed >= Duration::from_millis(800),
+        "queued request should be delayed by the limiter; elapsed={queued_elapsed:?}"
+    );
+
+    let first_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_captured.uri.path(), "/api/first");
+    let queued_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(queued_captured.uri.path(), "/api/queued");
+    match timeout(Duration::from_millis(150), upstream_rx.recv()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(captured)) => panic!(
+            "overflow request should not reach upstream, but captured path={}",
+            captured.uri.path()
+        ),
+    }
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn record_mode_rate_limit_queue_timeout_returns_gateway_timeout() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_with_responses(vec![Bytes::from_static(b"first-upstream")]).await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.rate_limit]
+requests_per_second = 1
+burst = 1
+queue_depth = 4
+timeout_ms = 100
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/first", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(first_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::CREATED);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"first-upstream");
+
+    let timeout_uri: Uri = format!("http://{}/api/timeout", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let timeout_req = Request::builder()
+        .method(Method::GET)
+        .uri(timeout_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let timeout_started_at = Instant::now();
+    let timeout_res = client.request(timeout_req).await.unwrap();
+    let timeout_elapsed = timeout_started_at.elapsed();
+    assert!(
+        timeout_elapsed < Duration::from_millis(400),
+        "queue timeout rejection should happen before full limiter delay; elapsed={timeout_elapsed:?}"
+    );
+    assert_eq!(timeout_res.status(), StatusCode::GATEWAY_TIMEOUT);
+    let timeout_body = String::from_utf8(
+        timeout_res
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(timeout_body.contains("queue timeout"));
+    assert!(timeout_body.contains("timeout_ms=100"));
+
+    let first_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_captured.uri.path(), "/api/first");
+    match timeout(Duration::from_millis(150), upstream_rx.recv()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(captured)) => panic!(
+            "timed-out request should not reach upstream, but captured path={}",
+            captured.uri.path()
+        ),
+    }
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
 async fn spawn_connect_upstream() -> (
     SocketAddr,
     mpsc::Receiver<Bytes>,

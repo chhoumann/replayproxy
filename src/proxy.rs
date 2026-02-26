@@ -456,6 +456,8 @@ struct ProxyRoute {
 struct RouteRateLimit {
     requests_per_second: u64,
     burst: u64,
+    queue_depth: Option<usize>,
+    timeout: Option<Duration>,
 }
 
 impl RouteRateLimit {
@@ -463,6 +465,8 @@ impl RouteRateLimit {
         Self {
             requests_per_second: config.requests_per_second,
             burst: config.burst.unwrap_or(config.requests_per_second),
+            queue_depth: config.queue_depth,
+            timeout: config.timeout_ms.map(Duration::from_millis),
         }
     }
 }
@@ -534,6 +538,8 @@ struct RecordTokenBucket {
     state: AsyncMutex<RecordTokenBucketState>,
     tokens_per_second: f64,
     burst_tokens: f64,
+    queue_depth: Option<usize>,
+    timeout: Option<Duration>,
 }
 
 impl RecordTokenBucket {
@@ -546,16 +552,20 @@ impl RecordTokenBucket {
             }),
             tokens_per_second: config.requests_per_second as f64,
             burst_tokens,
+            queue_depth: config.queue_depth,
+            timeout: config.timeout,
         }
     }
 
-    async fn reserve_delay(&self) -> Duration {
+    async fn reserve_delay(&self) -> Result<Duration, RecordRateLimitRejection> {
         let mut state = self.state.lock().await;
-        reserve_delay_for_bucket(
+        reserve_delay_for_bucket_with_limits(
             &mut state,
             Instant::now(),
             self.tokens_per_second,
             self.burst_tokens,
+            self.queue_depth,
+            self.timeout,
         )
     }
 }
@@ -566,14 +576,27 @@ struct RecordTokenBucketState {
     last_refill: Instant,
 }
 
-fn reserve_delay_for_bucket(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordRateLimitRejection {
+    QueueDepthExceeded {
+        queue_depth: usize,
+    },
+    QueueTimeoutExceeded {
+        timeout: Duration,
+        required_delay: Duration,
+    },
+}
+
+fn reserve_delay_for_bucket_with_limits(
     state: &mut RecordTokenBucketState,
     now: Instant,
     tokens_per_second: f64,
     burst_tokens: f64,
-) -> Duration {
+    queue_depth: Option<usize>,
+    timeout: Option<Duration>,
+) -> Result<Duration, RecordRateLimitRejection> {
     if !(tokens_per_second.is_finite() && tokens_per_second > 0.0) {
-        return Duration::ZERO;
+        return Ok(Duration::ZERO);
     }
 
     let elapsed = now.saturating_duration_since(state.last_refill);
@@ -581,12 +604,39 @@ fn reserve_delay_for_bucket(
 
     let replenished = elapsed.as_secs_f64() * tokens_per_second;
     state.available_tokens = (state.available_tokens + replenished).min(burst_tokens);
+    let available_tokens_before_reservation = state.available_tokens;
     state.available_tokens -= 1.0;
     if state.available_tokens >= 0.0 {
-        return Duration::ZERO;
+        return Ok(Duration::ZERO);
     }
 
-    Duration::from_secs_f64(-state.available_tokens / tokens_per_second)
+    let delay = Duration::from_secs_f64(-state.available_tokens / tokens_per_second);
+    if let Some(queue_depth) = queue_depth {
+        let queued = queued_requests_from_available_tokens(state.available_tokens);
+        if queued > queue_depth {
+            state.available_tokens = available_tokens_before_reservation;
+            return Err(RecordRateLimitRejection::QueueDepthExceeded { queue_depth });
+        }
+    }
+    if let Some(timeout) = timeout
+        && delay > timeout
+    {
+        state.available_tokens = available_tokens_before_reservation;
+        return Err(RecordRateLimitRejection::QueueTimeoutExceeded {
+            timeout,
+            required_delay: delay,
+        });
+    }
+
+    Ok(delay)
+}
+
+fn queued_requests_from_available_tokens(available_tokens: f64) -> usize {
+    if available_tokens >= 0.0 {
+        return 0;
+    }
+
+    (-available_tokens).ceil() as usize
 }
 
 impl ProxyRuntimeConfig {
@@ -1685,6 +1735,7 @@ struct MitmTlsState {
 }
 
 impl ProxyState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
         client: HttpClient,
@@ -2215,7 +2266,17 @@ async fn proxy_handler(
                 );
             }
         };
-        maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
+        if let Err(err) =
+            maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await
+        {
+            tracing::debug!(
+                route = %route.route_ref,
+                upstream = %upstream_uri,
+                error = ?err,
+                "record mode rate limiter rejected upstream request"
+            );
+            respond!(None, record_rate_limit_rejection_response(err));
+        }
         parts.uri = upstream_uri.clone();
         set_host_header(&mut parts.headers, &upstream_uri);
         let upstream_req = Request::from_parts(parts, boxed_incoming(body));
@@ -2281,7 +2342,17 @@ async fn proxy_handler(
                         );
                     }
                 };
-                maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
+                if let Err(err) =
+                    maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await
+                {
+                    tracing::debug!(
+                        route = %route.route_ref,
+                        upstream = %upstream_uri,
+                        error = ?err,
+                        "record mode rate limiter rejected upstream request"
+                    );
+                    respond!(None, record_rate_limit_rejection_response(err));
+                }
                 parts.uri = upstream_uri.clone();
                 set_host_header(&mut parts.headers, &upstream_uri);
                 let upstream_req =
@@ -2531,7 +2602,16 @@ async fn proxy_handler(
     let record_match_key = should_record.then(|| match_key.unwrap_or_default());
     let record_request_body = should_record.then(|| body_bytes.to_vec());
 
-    maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
+    if let Err(err) = maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await
+    {
+        tracing::debug!(
+            route = %route.route_ref,
+            upstream = %upstream_uri,
+            error = ?err,
+            "record mode rate limiter rejected upstream request"
+        );
+        respond!(None, record_rate_limit_rejection_response(err));
+    }
     parts.uri = upstream_uri.clone();
     set_host_header(&mut parts.headers, &upstream_uri);
 
@@ -2944,6 +3024,7 @@ async fn response_from_stored_recording(
         .as_ref()
         .map(|streaming| streaming.preserve_timing)
         .unwrap_or(false);
+    #[cfg_attr(not(feature = "scripting"), allow(unused_mut))]
     let mut response_chunks = if route.streaming.is_some() {
         match storage.get_response_chunks(stored_recording.id).await {
             Ok(chunks) => Some(chunks).filter(|chunks| !chunks.is_empty()),
@@ -2959,6 +3040,7 @@ async fn response_from_stored_recording(
     } else {
         None
     };
+    #[cfg_attr(not(feature = "scripting"), allow(unused_mut))]
     let mut recording = stored_recording.recording;
 
     #[cfg(not(feature = "scripting"))]
@@ -3167,15 +3249,15 @@ async fn maybe_wait_for_record_rate_limit(
     state: &ProxyState,
     route: &ProxyRoute,
     upstream_uri: &Uri,
-) {
+) -> Result<(), RecordRateLimitRejection> {
     if route.mode != RouteMode::Record {
-        return;
+        return Ok(());
     }
     let Some(rate_limit) = route.rate_limit.as_ref() else {
-        return;
+        return Ok(());
     };
     let Some(upstream_authority) = upstream_authority_for_rate_limit_scope(upstream_uri) else {
-        return;
+        return Ok(());
     };
 
     let limiter = state.record_rate_limiters.limiter(
@@ -3185,9 +3267,9 @@ async fn maybe_wait_for_record_rate_limit(
         },
         rate_limit,
     );
-    let delay = limiter.reserve_delay().await;
+    let delay = limiter.reserve_delay().await?;
     if delay.is_zero() {
-        return;
+        return Ok(());
     }
 
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
@@ -3198,6 +3280,7 @@ async fn maybe_wait_for_record_rate_limit(
         "record mode rate limiter delayed upstream request"
     );
     tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 fn connect_tunnel_target(authority: &hyper::http::uri::Authority) -> String {
@@ -3699,6 +3782,30 @@ fn proxy_simple_response(status: StatusCode, message: &str) -> Response<ProxyBod
     let mut response = Response::new(boxed_full(Bytes::from(message.to_owned())));
     *response.status_mut() = status;
     response
+}
+
+fn record_rate_limit_rejection_response(error: RecordRateLimitRejection) -> Response<ProxyBody> {
+    match error {
+        RecordRateLimitRejection::QueueDepthExceeded { queue_depth } => proxy_simple_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!(
+                "record mode rate limit queue is full (queue_depth={queue_depth}); retry later"
+            ),
+        ),
+        RecordRateLimitRejection::QueueTimeoutExceeded {
+            timeout,
+            required_delay,
+        } => {
+            let timeout_ms = timeout.as_millis();
+            let required_delay_ms = required_delay.as_millis();
+            proxy_simple_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                &format!(
+                    "record mode rate limit queue timeout (timeout_ms={timeout_ms}, required_delay_ms={required_delay_ms})"
+                ),
+            )
+        }
+    }
 }
 
 fn replay_miss_response(
@@ -4903,8 +5010,8 @@ mod tests {
         emit_proxy_request_log, format_route_ref, forward_proxy_upstream_uri,
         lookup_recording_for_request_with_subset_limit, mode_log_label,
         normalize_tunneled_https_request_uri, redact_recording_body_json, redact_recording_headers,
-        request_runtime_config_for_path, reserve_delay_for_bucket, response_chunks_for_storage,
-        sanitize_match_key, select_route, summarize_route_diff,
+        request_runtime_config_for_path, reserve_delay_for_bucket_with_limits,
+        response_chunks_for_storage, sanitize_match_key, select_route, summarize_route_diff,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
@@ -5010,8 +5117,10 @@ mod tests {
             last_refill: now,
         };
 
-        let first_delay = reserve_delay_for_bucket(&mut state, now, 2.0, 1.0);
-        let second_delay = reserve_delay_for_bucket(&mut state, now, 2.0, 1.0);
+        let first_delay =
+            reserve_delay_for_bucket_with_limits(&mut state, now, 2.0, 1.0, None, None).unwrap();
+        let second_delay =
+            reserve_delay_for_bucket_with_limits(&mut state, now, 2.0, 1.0, None, None).unwrap();
 
         assert_eq!(first_delay, Duration::ZERO);
         assert!(second_delay >= Duration::from_millis(499));
@@ -5025,10 +5134,76 @@ mod tests {
             last_refill: now,
         };
 
-        let delay =
-            reserve_delay_for_bucket(&mut state, now + Duration::from_millis(500), 2.0, 2.0);
+        let delay = reserve_delay_for_bucket_with_limits(
+            &mut state,
+            now + Duration::from_millis(500),
+            2.0,
+            2.0,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn reserve_delay_for_bucket_enforces_queue_depth_limit() {
+        let now = Instant::now();
+        let mut state = super::RecordTokenBucketState {
+            available_tokens: 1.0,
+            last_refill: now,
+        };
+
+        let first_delay =
+            reserve_delay_for_bucket_with_limits(&mut state, now, 1.0, 1.0, Some(1), None).unwrap();
+        let second_delay =
+            reserve_delay_for_bucket_with_limits(&mut state, now, 1.0, 1.0, Some(1), None).unwrap();
+        let third = reserve_delay_for_bucket_with_limits(&mut state, now, 1.0, 1.0, Some(1), None);
+
+        assert_eq!(first_delay, Duration::ZERO);
+        assert!(second_delay >= Duration::from_millis(999));
+        assert_eq!(
+            third,
+            Err(super::RecordRateLimitRejection::QueueDepthExceeded { queue_depth: 1 })
+        );
+    }
+
+    #[test]
+    fn reserve_delay_for_bucket_enforces_queue_timeout_limit() {
+        let now = Instant::now();
+        let mut state = super::RecordTokenBucketState {
+            available_tokens: 1.0,
+            last_refill: now,
+        };
+
+        let first_delay = reserve_delay_for_bucket_with_limits(
+            &mut state,
+            now,
+            1.0,
+            1.0,
+            Some(4),
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+        let second = reserve_delay_for_bucket_with_limits(
+            &mut state,
+            now,
+            1.0,
+            1.0,
+            Some(4),
+            Some(Duration::from_millis(100)),
+        );
+
+        assert_eq!(first_delay, Duration::ZERO);
+        assert_eq!(
+            second,
+            Err(super::RecordRateLimitRejection::QueueTimeoutExceeded {
+                timeout: Duration::from_millis(100),
+                required_delay: Duration::from_secs(1),
+            })
+        );
+        assert_eq!(state.available_tokens, 0.0);
     }
 
     #[test]

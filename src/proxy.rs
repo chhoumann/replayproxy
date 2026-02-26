@@ -18,7 +18,7 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use hyper::{
-    Request, Response, StatusCode, Uri,
+    Method, Request, Response, StatusCode, Uri,
     body::{Frame, Incoming},
     header::{self, HeaderName, HeaderValue},
     service::service_fn,
@@ -35,7 +35,7 @@ use serde_json_path::JsonPath;
 #[cfg(feature = "watch")]
 use tokio::sync::mpsc;
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, oneshot},
 };
 
@@ -195,7 +195,10 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
                         let _connection_guard = ActiveConnectionGuard::new(status);
                         let service = service_fn(move |req| proxy_handler(req, Arc::clone(&state)));
                         let builder = ConnectionBuilder::new(TokioExecutor::new());
-                        if let Err(err) = builder.serve_connection(io, service).await {
+                        if let Err(err) = builder
+                            .serve_connection_with_upgrades(io, service)
+                            .await
+                        {
                             tracing::debug!("connection error: {err}");
                         }
                     });
@@ -1476,7 +1479,7 @@ fn boxed_prefetched_incoming(prefetched: Vec<Bytes>, body: Incoming) -> ProxyBod
 }
 
 async fn proxy_handler(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
     state
@@ -1497,7 +1500,12 @@ async fn proxy_handler(
     let mut mode: Option<RouteMode> = None;
     let mut cache_outcome = CacheLogOutcome::Bypass;
     let mut replay_latency: Option<Duration> = None;
-    let request_runtime_config = state.request_runtime_config(req.uri().path());
+    let route_lookup_path = if req.method() == Method::CONNECT && req.uri().path().is_empty() {
+        "/"
+    } else {
+        req.uri().path()
+    };
+    let request_runtime_config = state.request_runtime_config(route_lookup_path);
     let max_body_bytes = request_runtime_config.max_body_bytes;
 
     macro_rules! respond {
@@ -1527,6 +1535,48 @@ async fn proxy_handler(
     };
     route_ref = Some(route.route_ref.as_str());
     mode = Some(route.mode);
+
+    if req.method() == Method::CONNECT {
+        let Some(authority) = req.uri().authority() else {
+            respond!(
+                None,
+                proxy_simple_response(
+                    StatusCode::BAD_REQUEST,
+                    "CONNECT request target must include authority",
+                )
+            );
+        };
+        let tunnel_target = connect_tunnel_target(authority);
+
+        state
+            .status
+            .upstream_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+        let upstream_started_at = Instant::now();
+        let upstream_stream = match TcpStream::connect(tunnel_target.as_str()).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let upstream_latency = upstream_started_at.elapsed();
+                tracing::debug!(target = %tunnel_target, "CONNECT upstream dial failed: {err}");
+                respond!(
+                    Some(upstream_latency),
+                    proxy_simple_response(StatusCode::BAD_GATEWAY, "CONNECT upstream dial failed",)
+                );
+            }
+        };
+        let upstream_latency = upstream_started_at.elapsed();
+
+        let on_upgrade = hyper::upgrade::on(&mut req);
+        tokio::spawn(async move {
+            if let Err(err) = tunnel_upgraded_connection(on_upgrade, upstream_stream).await {
+                tracing::debug!(target = %tunnel_target, "CONNECT tunnel finished: {err}");
+            }
+        });
+
+        let mut response = Response::new(boxed_full(Bytes::new()));
+        *response.status_mut() = StatusCode::OK;
+        respond!(Some(upstream_latency), response);
+    }
 
     let upstream_uri = if let Some(upstream_base) = route.upstream.as_ref() {
         match build_upstream_uri(upstream_base, req.uri()) {
@@ -2159,6 +2209,36 @@ fn forward_proxy_upstream_uri(original: &Uri) -> Option<Uri> {
         return None;
     }
     Some(original.clone())
+}
+
+fn connect_tunnel_target(authority: &hyper::http::uri::Authority) -> String {
+    if authority.port().is_some() {
+        return authority.as_str().to_owned();
+    }
+    let host = authority.host();
+    if host.contains(':') {
+        if host.starts_with('[') && host.ends_with(']') {
+            format!("{host}:443")
+        } else {
+            format!("[{host}]:443")
+        }
+    } else {
+        format!("{host}:443")
+    }
+}
+
+async fn tunnel_upgraded_connection(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    mut upstream_stream: TcpStream,
+) -> anyhow::Result<()> {
+    let upgraded = on_upgrade
+        .await
+        .map_err(|err| anyhow::anyhow!("upgrade client connection: {err}"))?;
+    let mut upgraded = TokioIo::new(upgraded);
+    tokio::io::copy_bidirectional(&mut upgraded, &mut upstream_stream)
+        .await
+        .map_err(|err| anyhow::anyhow!("copy tunnel bytes: {err}"))?;
+    Ok(())
 }
 
 fn set_host_header(headers: &mut hyper::HeaderMap, uri: &Uri) {
@@ -3416,8 +3496,8 @@ mod tests {
     };
 
     use super::{
-        CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, emit_proxy_request_log,
-        format_route_ref, forward_proxy_upstream_uri,
+        CacheLogOutcome, ProxyRoute, REDACTION_PLACEHOLDER, connect_tunnel_target,
+        emit_proxy_request_log, format_route_ref, forward_proxy_upstream_uri,
         lookup_recording_for_request_with_subset_limit, mode_log_label, redact_recording_body_json,
         redact_recording_headers, request_runtime_config_for_path, sanitize_match_key,
         select_route, summarize_route_diff,
@@ -3529,6 +3609,27 @@ mod tests {
         let request_uri: hyper::Uri = "/api/hello?x=1".parse().unwrap();
 
         assert!(forward_proxy_upstream_uri(&request_uri).is_none());
+    }
+
+    #[test]
+    fn connect_tunnel_target_preserves_explicit_port() {
+        let authority: hyper::http::uri::Authority = "example.test:8443".parse().unwrap();
+
+        assert_eq!(connect_tunnel_target(&authority), "example.test:8443");
+    }
+
+    #[test]
+    fn connect_tunnel_target_defaults_to_https_port_when_missing() {
+        let authority: hyper::http::uri::Authority = "example.test".parse().unwrap();
+
+        assert_eq!(connect_tunnel_target(&authority), "example.test:443");
+    }
+
+    #[test]
+    fn connect_tunnel_target_brackets_ipv6_authority_when_port_missing() {
+        let authority: hyper::http::uri::Authority = "[::1]".parse().unwrap();
+
+        assert_eq!(connect_tunnel_target(&authority), "[::1]:443");
     }
 
     #[test]

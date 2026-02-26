@@ -27,6 +27,7 @@ use replayproxy::storage::{Recording, Storage};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     time::{sleep, timeout},
@@ -196,6 +197,55 @@ path_prefix = "/"
 
     drop(sender);
     let _ = connection_task.await;
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn forward_proxy_connect_establishes_bidirectional_tunnel() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_connect_upstream().await;
+
+    let config = replayproxy::config::Config::from_toml_str(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/"
+"#,
+    )
+    .unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let connect_request = format!(
+        "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(connect_request.as_bytes()).await.unwrap();
+
+    let response_head = read_http_response_head(&mut stream).await;
+    assert!(
+        response_head.starts_with(b"HTTP/1.1 200"),
+        "unexpected CONNECT response: {}",
+        String::from_utf8_lossy(&response_head)
+    );
+
+    stream.write_all(b"hello").await.unwrap();
+    let mut first_reply = [0u8; 5];
+    stream.read_exact(&mut first_reply).await.unwrap();
+    assert_eq!(&first_reply, b"world");
+
+    stream.write_all(b"ping").await.unwrap();
+    let mut second_reply = [0u8; 4];
+    stream.read_exact(&mut second_reply).await.unwrap();
+    assert_eq!(&second_reply, b"pong");
+
+    let first_capture = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_capture.as_ref(), b"hello");
+    let second_capture = upstream_rx.recv().await.unwrap();
+    assert_eq!(second_capture.as_ref(), b"ping");
+
+    drop(stream);
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
 }
@@ -3853,6 +3903,43 @@ cache_miss = "forward"
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
+}
+
+async fn spawn_connect_upstream() -> (
+    SocketAddr,
+    mpsc::Receiver<Bytes>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel::<Bytes>(2);
+
+    let join = tokio::spawn(async move {
+        let (mut stream, _peer) = listener.accept().await.unwrap();
+
+        let mut first_message = vec![0u8; 5];
+        stream.read_exact(&mut first_message).await.unwrap();
+        tx.send(Bytes::from(first_message)).await.unwrap();
+        stream.write_all(b"world").await.unwrap();
+
+        let mut second_message = vec![0u8; 4];
+        stream.read_exact(&mut second_message).await.unwrap();
+        tx.send(Bytes::from(second_message)).await.unwrap();
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn read_http_response_head(stream: &mut TcpStream) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+        assert!(head.len() <= 16 * 1024, "response headers exceeded limit");
+    }
+    head
 }
 
 async fn spawn_upstream() -> (

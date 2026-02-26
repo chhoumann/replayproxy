@@ -51,7 +51,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::{
     ca,
     config::{
-        BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RedactConfig,
+        BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RateLimitConfig, RedactConfig,
         RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig,
     },
     matching,
@@ -168,6 +168,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let client = build_http_client()?;
     let mitm_tls = build_mitm_tls_state(config)?;
     let runtime_mode_override = Arc::new(RwLock::new(None));
+    let record_rate_limiters = Arc::new(RecordRateLimiterRegistry::default());
 
     let state = Arc::new(ProxyState::new(
         Arc::clone(&runtime_config),
@@ -176,6 +177,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         Arc::clone(&session_runtime),
         Arc::clone(&runtime_mode_override),
         mitm_tls,
+        Arc::clone(&record_rate_limiters),
     ));
     let config_reloader = config.source_path().map(|source_path| {
         Arc::new(ConfigReloader {
@@ -424,10 +426,26 @@ struct ProxyRoute {
     body_oversize: BodyOversizePolicy,
     match_config: Option<RouteMatchConfig>,
     streaming: Option<StreamingConfig>,
+    rate_limit: Option<RouteRateLimit>,
     // Consumed by upcoming redaction storage steps.
     #[allow(dead_code)]
     redact: Option<RedactConfig>,
     transform: RouteTransformScripts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteRateLimit {
+    requests_per_second: u64,
+    burst: u64,
+}
+
+impl RouteRateLimit {
+    fn from_config(config: &RateLimitConfig) -> Self {
+        Self {
+            requests_per_second: config.requests_per_second,
+            burst: config.burst.unwrap_or(config.requests_per_second),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -448,6 +466,108 @@ struct LoadedScript {
 struct ProxyRuntimeConfig {
     routes: Vec<ProxyRoute>,
     max_body_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RecordRateLimitKey {
+    route_ref: String,
+    upstream_authority: String,
+}
+
+#[derive(Debug)]
+struct RecordRateLimiterEntry {
+    limiter: Arc<RecordTokenBucket>,
+    config: RouteRateLimit,
+}
+
+#[derive(Debug, Default)]
+struct RecordRateLimiterRegistry {
+    entries: Mutex<BTreeMap<RecordRateLimitKey, RecordRateLimiterEntry>>,
+}
+
+impl RecordRateLimiterRegistry {
+    fn limiter(&self, key: RecordRateLimitKey, config: &RouteRateLimit) -> Arc<RecordTokenBucket> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(entry) = entries.get(&key)
+            && entry.config == *config
+        {
+            return Arc::clone(&entry.limiter);
+        }
+
+        let limiter = Arc::new(RecordTokenBucket::new(config));
+        entries.insert(
+            key,
+            RecordRateLimiterEntry {
+                limiter: Arc::clone(&limiter),
+                config: config.clone(),
+            },
+        );
+        limiter
+    }
+}
+
+#[derive(Debug)]
+struct RecordTokenBucket {
+    state: AsyncMutex<RecordTokenBucketState>,
+    tokens_per_second: f64,
+    burst_tokens: f64,
+}
+
+impl RecordTokenBucket {
+    fn new(config: &RouteRateLimit) -> Self {
+        let burst_tokens = config.burst as f64;
+        Self {
+            state: AsyncMutex::new(RecordTokenBucketState {
+                available_tokens: burst_tokens,
+                last_refill: Instant::now(),
+            }),
+            tokens_per_second: config.requests_per_second as f64,
+            burst_tokens,
+        }
+    }
+
+    async fn reserve_delay(&self) -> Duration {
+        let mut state = self.state.lock().await;
+        reserve_delay_for_bucket(
+            &mut state,
+            Instant::now(),
+            self.tokens_per_second,
+            self.burst_tokens,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct RecordTokenBucketState {
+    available_tokens: f64,
+    last_refill: Instant,
+}
+
+fn reserve_delay_for_bucket(
+    state: &mut RecordTokenBucketState,
+    now: Instant,
+    tokens_per_second: f64,
+    burst_tokens: f64,
+) -> Duration {
+    if !(tokens_per_second.is_finite() && tokens_per_second > 0.0) {
+        return Duration::ZERO;
+    }
+
+    let elapsed = now.saturating_duration_since(state.last_refill);
+    state.last_refill = now;
+
+    let replenished = elapsed.as_secs_f64() * tokens_per_second;
+    state.available_tokens = (state.available_tokens + replenished).min(burst_tokens);
+    state.available_tokens -= 1.0;
+    if state.available_tokens >= 0.0 {
+        return Duration::ZERO;
+    }
+
+    Duration::from_secs_f64(-state.available_tokens / tokens_per_second)
 }
 
 impl ProxyRuntimeConfig {
@@ -489,6 +609,7 @@ impl ProxyRuntimeConfig {
                 body_oversize: route.body_oversize.unwrap_or(BodyOversizePolicy::Error),
                 match_config: route.match_.clone(),
                 streaming: route.streaming.clone(),
+                rate_limit: route.rate_limit.as_ref().map(RouteRateLimit::from_config),
                 redact: route.redact.clone(),
                 transform: load_route_transform_scripts(
                     &route_ref,
@@ -1225,6 +1346,7 @@ fn proxy_route_configs_equal(current: &ProxyRoute, next: &ProxyRoute) -> bool {
         && current.body_oversize == next.body_oversize
         && route_match_configs_equal(current.match_config.as_ref(), next.match_config.as_ref())
         && streaming_configs_equal(current.streaming.as_ref(), next.streaming.as_ref())
+        && rate_limit_configs_equal(current.rate_limit.as_ref(), next.rate_limit.as_ref())
         && redact_configs_equal(current.redact.as_ref(), next.redact.as_ref())
         && current.transform == next.transform
 }
@@ -1266,6 +1388,17 @@ fn streaming_configs_equal(
     match (current, next) {
         (None, None) => true,
         (Some(current), Some(next)) => current.preserve_timing == next.preserve_timing,
+        _ => false,
+    }
+}
+
+fn rate_limit_configs_equal(
+    current: Option<&RouteRateLimit>,
+    next: Option<&RouteRateLimit>,
+) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(current), Some(next)) => current == next,
         _ => false,
     }
 }
@@ -1523,6 +1656,7 @@ struct ProxyState {
     status: Arc<RuntimeStatus>,
     runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
     mitm_tls: Option<Arc<MitmTlsState>>,
+    record_rate_limiters: Arc<RecordRateLimiterRegistry>,
 }
 
 #[derive(Debug)]
@@ -1538,6 +1672,7 @@ impl ProxyState {
         session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
         runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
         mitm_tls: Option<Arc<MitmTlsState>>,
+        record_rate_limiters: Arc<RecordRateLimiterRegistry>,
     ) -> Self {
         Self {
             runtime_config,
@@ -1546,6 +1681,7 @@ impl ProxyState {
             status,
             runtime_mode_override,
             mitm_tls,
+            record_rate_limiters,
         }
     }
 
@@ -2050,6 +2186,7 @@ async fn proxy_handler(
             "bypassing cache for oversized request body"
         );
 
+        maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
         parts.uri = upstream_uri.clone();
         set_host_header(&mut parts.headers, &upstream_uri);
         let upstream_req = Request::from_parts(parts, boxed_incoming(body));
@@ -2093,6 +2230,7 @@ async fn proxy_handler(
                     "bypassing cache after request body exceeded configured limit mid-stream"
                 );
 
+                maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
                 parts.uri = upstream_uri.clone();
                 set_host_header(&mut parts.headers, &upstream_uri);
                 let upstream_req =
@@ -2286,6 +2424,7 @@ async fn proxy_handler(
     let record_match_key = should_record.then(|| match_key.unwrap_or_default());
     let record_request_body = should_record.then(|| body_bytes.to_vec());
 
+    maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
     parts.uri = upstream_uri.clone();
     set_host_header(&mut parts.headers, &upstream_uri);
 
@@ -2761,6 +2900,49 @@ fn forward_proxy_upstream_uri(original: &Uri) -> Option<Uri> {
     }
     original.authority()?;
     Some(original.clone())
+}
+
+fn upstream_authority_for_rate_limit_scope(upstream_uri: &Uri) -> Option<String> {
+    upstream_uri
+        .authority()
+        .map(|authority| authority.as_str().to_ascii_lowercase())
+}
+
+async fn maybe_wait_for_record_rate_limit(
+    state: &ProxyState,
+    route: &ProxyRoute,
+    upstream_uri: &Uri,
+) {
+    if route.mode != RouteMode::Record {
+        return;
+    }
+    let Some(rate_limit) = route.rate_limit.as_ref() else {
+        return;
+    };
+    let Some(upstream_authority) = upstream_authority_for_rate_limit_scope(upstream_uri) else {
+        return;
+    };
+
+    let limiter = state.record_rate_limiters.limiter(
+        RecordRateLimitKey {
+            route_ref: route.route_ref.clone(),
+            upstream_authority: upstream_authority.clone(),
+        },
+        rate_limit,
+    );
+    let delay = limiter.reserve_delay().await;
+    if delay.is_zero() {
+        return;
+    }
+
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    tracing::debug!(
+        route = %route.route_ref,
+        upstream = %upstream_authority,
+        delay_ms,
+        "record mode rate limiter delayed upstream request"
+    );
+    tokio::time::sleep(delay).await;
 }
 
 fn connect_tunnel_target(authority: &hyper::http::uri::Authority) -> String {
@@ -4167,7 +4349,7 @@ mod tests {
     use std::{
         fs,
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::{
@@ -4175,8 +4357,8 @@ mod tests {
         emit_proxy_request_log, format_route_ref, forward_proxy_upstream_uri,
         lookup_recording_for_request_with_subset_limit, mode_log_label,
         normalize_tunneled_https_request_uri, redact_recording_body_json, redact_recording_headers,
-        request_runtime_config_for_path, response_chunks_for_storage, sanitize_match_key,
-        select_route, summarize_route_diff,
+        request_runtime_config_for_path, reserve_delay_for_bucket, response_chunks_for_storage,
+        sanitize_match_key, select_route, summarize_route_diff,
     };
     use crate::config::{
         BodyOversizePolicy, CacheMissPolicy, Config, RedactConfig, RouteConfig, RouteMatchConfig,
@@ -4202,6 +4384,7 @@ mod tests {
             body_oversize: BodyOversizePolicy::Error,
             match_config: None,
             streaming: None,
+            rate_limit: None,
             redact: None,
             transform: super::RouteTransformScripts::default(),
         }
@@ -4271,6 +4454,35 @@ mod tests {
 
         assert_eq!(snapshot.max_body_bytes, 256);
         assert_eq!(route.path_exact.as_deref(), Some("/v2/snapshot"));
+    }
+
+    #[test]
+    fn reserve_delay_for_bucket_allows_burst_then_queues() {
+        let now = Instant::now();
+        let mut state = super::RecordTokenBucketState {
+            available_tokens: 1.0,
+            last_refill: now,
+        };
+
+        let first_delay = reserve_delay_for_bucket(&mut state, now, 2.0, 1.0);
+        let second_delay = reserve_delay_for_bucket(&mut state, now, 2.0, 1.0);
+
+        assert_eq!(first_delay, Duration::ZERO);
+        assert!(second_delay >= Duration::from_millis(499));
+    }
+
+    #[test]
+    fn reserve_delay_for_bucket_refills_tokens_over_time() {
+        let now = Instant::now();
+        let mut state = super::RecordTokenBucketState {
+            available_tokens: 0.0,
+            last_refill: now,
+        };
+
+        let delay =
+            reserve_delay_for_bucket(&mut state, now + Duration::from_millis(500), 2.0, 2.0);
+
+        assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]

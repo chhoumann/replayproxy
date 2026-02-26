@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -4462,6 +4462,163 @@ cache_miss = "forward"
         .query_row("SELECT COUNT(*) FROM recordings;", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn record_mode_rate_limit_delays_second_request() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream_with_responses(vec![
+        Bytes::from_static(b"first-upstream"),
+        Bytes::from_static(b"second-upstream"),
+    ])
+    .await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.rate_limit]
+requests_per_second = 4
+burst = 1
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/first", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(first_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::CREATED);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"first-upstream");
+
+    let second_uri: Uri = format!("http://{}/api/second", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let second_req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let second_started_at = Instant::now();
+    let second_res = client.request(second_req).await.unwrap();
+    let second_elapsed = second_started_at.elapsed();
+    assert_eq!(second_res.status(), StatusCode::CREATED);
+    let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&second_body[..], b"second-upstream");
+
+    assert!(
+        second_elapsed >= Duration::from_millis(180),
+        "expected record-mode limiter to delay second request; elapsed={second_elapsed:?}"
+    );
+
+    let first_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_captured.uri.path(), "/api/first");
+    let second_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(second_captured.uri.path(), "/api/second");
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn record_mode_rate_limit_scope_isolated_per_route() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream_with_responses(vec![
+        Bytes::from_static(b"route-a-upstream"),
+        Bytes::from_static(b"route-b-upstream"),
+    ])
+    .await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+name = "route-a"
+path_exact = "/api/a"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.rate_limit]
+requests_per_second = 1
+burst = 1
+
+[[routes]]
+name = "route-b"
+path_exact = "/api/b"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.rate_limit]
+requests_per_second = 1
+burst = 1
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let first_uri: Uri = format!("http://{}/api/a", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(first_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::CREATED);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"route-a-upstream");
+
+    let second_uri: Uri = format!("http://{}/api/b", proxy.listen_addr)
+        .parse()
+        .unwrap();
+    let second_req = Request::builder()
+        .method(Method::GET)
+        .uri(second_uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let second_started_at = Instant::now();
+    let second_res = client.request(second_req).await.unwrap();
+    let second_elapsed = second_started_at.elapsed();
+    assert_eq!(second_res.status(), StatusCode::CREATED);
+    let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&second_body[..], b"route-b-upstream");
+
+    assert!(
+        second_elapsed < Duration::from_millis(700),
+        "second route should not share first route's limiter; elapsed={second_elapsed:?}"
+    );
+
+    let first_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_captured.uri.path(), "/api/a");
+    let second_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(second_captured.uri.path(), "/api/b");
 
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;

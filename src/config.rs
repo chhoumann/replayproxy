@@ -362,6 +362,10 @@ pub struct StorageConfig {
     pub active_session: Option<String>,
     #[serde(default)]
     pub max_recordings: Option<u64>,
+    #[serde(default)]
+    pub max_age_days: Option<u64>,
+    #[serde(default)]
+    pub max_age_hours: Option<u64>,
 }
 
 impl StorageConfig {
@@ -376,8 +380,39 @@ impl StorageConfig {
         if self.max_recordings == Some(0) {
             bail!("`storage.max_recordings` must be greater than 0");
         }
+        if self.max_age_days == Some(0) {
+            bail!("`storage.max_age_days` must be greater than 0");
+        }
+        if self.max_age_hours == Some(0) {
+            bail!("`storage.max_age_hours` must be greater than 0");
+        }
+        if self.max_age_days.is_some() && self.max_age_hours.is_some() {
+            bail!("`storage.max_age_days` and `storage.max_age_hours` are mutually exclusive");
+        }
+        self.max_age_ms()?;
 
         Ok(())
+    }
+
+    pub(crate) fn max_age_ms(&self) -> anyhow::Result<Option<i64>> {
+        const MILLIS_PER_HOUR: u64 = 60 * 60 * 1_000;
+        const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
+
+        let (value, multiplier, field_name) = match (self.max_age_days, self.max_age_hours) {
+            (Some(_), Some(_)) => {
+                bail!("`storage.max_age_days` and `storage.max_age_hours` are mutually exclusive")
+            }
+            (Some(days), None) => (days, MILLIS_PER_DAY, "storage.max_age_days"),
+            (None, Some(hours)) => (hours, MILLIS_PER_HOUR, "storage.max_age_hours"),
+            (None, None) => return Ok(None),
+        };
+
+        let max_age_ms = value
+            .checked_mul(multiplier)
+            .ok_or_else(|| anyhow::anyhow!("`{field_name}` exceeds supported range"))?;
+        let max_age_ms = i64::try_from(max_age_ms)
+            .map_err(|_| anyhow::anyhow!("`{field_name}` exceeds supported range"))?;
+        Ok(Some(max_age_ms))
     }
 }
 
@@ -1058,6 +1093,7 @@ ca_key = "~/.replayproxy/ca/key.pem"
 path = "~/.replayproxy/sessions"
 active_session = "default"
 max_recordings = 500
+max_age_days = 30
 
 [logging]
 level = "info"
@@ -1175,6 +1211,20 @@ recording_mode = "server-only"
                 .as_ref()
                 .and_then(|storage| storage.max_recordings),
             Some(500)
+        );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_age_days),
+            Some(30)
+        );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_age_hours),
+            None
         );
 
         let logging = config.logging.as_ref().unwrap();
@@ -1976,6 +2026,20 @@ path = "/tmp/replayproxy-tests"
                 .and_then(|storage| storage.max_recordings),
             None
         );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_age_days),
+            None
+        );
+        assert_eq!(
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_age_hours),
+            None
+        );
     }
 
     #[test]
@@ -1995,6 +2059,71 @@ max_recordings = 0
         assert!(
             err.to_string()
                 .contains("`storage.max_recordings` must be greater than 0"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_storage_max_age_days() {
+        let err = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+max_age_days = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("`storage.max_age_days` must be greater than 0"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_storage_max_age_hours() {
+        let err = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+max_age_hours = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("`storage.max_age_hours` must be greater than 0"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_storage_max_age_days_and_hours_together() {
+        let err = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "/tmp/replayproxy-tests"
+max_age_days = 1
+max_age_hours = 24
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "`storage.max_age_days` and `storage.max_age_hours` are mutually exclusive"
+            ),
             "err: {err}"
         );
     }

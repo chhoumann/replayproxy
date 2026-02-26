@@ -775,6 +775,9 @@ path = "{storage_path}"
 active_session = "default"
 # optional: cap per-session recording count by evicting oldest rows on insert/import
 # max_recordings = 50000
+# optional: time-based retention window (choose one)
+# max_age_days = 30
+# max_age_hours = 12
 
 [logging]
 level = "info"

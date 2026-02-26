@@ -127,7 +127,7 @@ pub async fn import_session(
             SessionImportError::Internal(format!("join import parse task failed: {err}"))
         })??;
 
-    let recordings_imported = parsed_import.recordings.len();
+    let mut recordings_imported = 0usize;
     for parsed_recording in parsed_import.recordings {
         let source = parsed_recording.source;
         let recording_id = storage
@@ -139,6 +139,19 @@ pub async fn import_session(
                     source, session_name
                 ))
             })?;
+        let recording_retained = storage
+            .get_recording_by_id(recording_id)
+            .await
+            .map_err(|err| {
+                SessionImportError::Internal(format!(
+                    "confirm retention for recording from `{}` in session `{}`: {err}",
+                    source, session_name
+                ))
+            })?
+            .is_some();
+        if !recording_retained {
+            continue;
+        }
         if let Err(err) = storage
             .insert_response_chunks(recording_id, parsed_recording.response_chunks)
             .await
@@ -167,6 +180,7 @@ pub async fn import_session(
             )
             .await);
         }
+        recordings_imported += 1;
     }
 
     Ok(SessionImportResult {
@@ -519,6 +533,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
+        config::Config,
         session_export::SessionExportFormat,
         storage::{
             Recording, ResponseChunk, SessionManager, WebSocketFrame, WebSocketFrameDirection,
@@ -814,6 +829,65 @@ mod tests {
             }
             other => panic!("expected internal import error, got {other:?}"),
         }
+        assert_eq!(recording_count(&manager, "staging").await, 0);
+    }
+
+    #[tokio::test]
+    async fn import_session_skips_recordings_pruned_by_ttl_retention() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+max_age_hours = 1
+"#,
+            temp_dir.path().join("sessions").display()
+        ))
+        .expect("config should parse");
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager should initialize")
+            .expect("storage config should be present");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should exist");
+
+        let import_dir = temp_dir.path().join("bundle-ttl-prune");
+        let stale_created_at = Recording::now_unix_ms().unwrap() - (2 * 60 * 60 * 1_000);
+        let chunks = vec![ResponseChunk {
+            chunk_index: 0,
+            offset_ms: 0,
+            chunk_body: b"chunk".to_vec(),
+        }];
+        let frames = vec![WebSocketFrame {
+            frame_index: 0,
+            offset_ms: 0,
+            direction: WebSocketFrameDirection::ServerToClient,
+            message_type: WebSocketMessageType::Text,
+            payload: b"frame".to_vec(),
+        }];
+        write_json_import_bundle(
+            &import_dir,
+            10,
+            recording_fixture("ttl-prune", "/ttl", stale_created_at),
+            chunks,
+            frames,
+        );
+
+        let result = import_session(
+            &manager,
+            SessionImportRequest {
+                session_name: "staging".to_owned(),
+                in_dir: import_dir,
+            },
+        )
+        .await
+        .expect("ttl-pruned import should still complete");
+
+        assert_eq!(result.recordings_imported, 0);
         assert_eq!(recording_count(&manager, "staging").await, 0);
     }
 }

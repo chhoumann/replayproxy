@@ -17,13 +17,28 @@ const QUERY_SUBSET_CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMS - 1;
 #[derive(Debug, Clone)]
 pub struct Storage {
     db_path: PathBuf,
-    max_recordings: Option<u64>,
+    retention: StorageRetentionPolicy,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     base_path: PathBuf,
+    retention: StorageRetentionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StorageRetentionPolicy {
     max_recordings: Option<u64>,
+    max_age_ms: Option<i64>,
+}
+
+impl StorageRetentionPolicy {
+    fn from_config(storage: &crate::config::StorageConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            max_recordings: storage.max_recordings,
+            max_age_ms: storage.max_age_ms()?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,29 +187,37 @@ impl Storage {
             .unwrap_or(session::DEFAULT_SESSION_NAME);
         let db_path = session::resolve_session_db_path(&storage.path, session_name)
             .map_err(|err| anyhow::anyhow!("resolve storage session `{session_name}`: {err}"))?;
-        Ok(Some(Self::open_with_max_recordings(
-            db_path,
-            storage.max_recordings,
-        )?))
+        let retention = StorageRetentionPolicy::from_config(storage)?;
+        Ok(Some(Self::open_with_retention(db_path, retention)?))
     }
 
     pub fn open(db_path: PathBuf) -> anyhow::Result<Self> {
-        Self::open_with_max_recordings(db_path, None)
+        Self::open_with_retention(db_path, StorageRetentionPolicy::default())
     }
 
     pub fn open_with_max_recordings(
         db_path: PathBuf,
         max_recordings: Option<u64>,
     ) -> anyhow::Result<Self> {
+        Self::open_with_retention(
+            db_path,
+            StorageRetentionPolicy {
+                max_recordings,
+                max_age_ms: None,
+            },
+        )
+    }
+
+    fn open_with_retention(
+        db_path: PathBuf,
+        retention: StorageRetentionPolicy,
+    ) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create storage dir {}", parent.display()))?;
         }
 
-        let storage = Self {
-            db_path,
-            max_recordings,
-        };
+        let storage = Self { db_path, retention };
         storage.init()?;
         Ok(storage)
     }
@@ -213,9 +236,9 @@ impl Storage {
         request_query_norm: Option<String>,
     ) -> anyhow::Result<i64> {
         let db_path = self.db_path.clone();
-        let max_recordings = self.max_recordings;
+        let retention = self.retention;
         tokio::task::spawn_blocking(move || {
-            insert_recording_blocking(&db_path, recording, request_query_norm, max_recordings)
+            insert_recording_blocking(&db_path, recording, request_query_norm, retention)
         })
         .await
         .context("join insert_recording task")?
@@ -468,20 +491,21 @@ impl SessionManager {
         fs::create_dir_all(&storage.path)
             .with_context(|| format!("create sessions dir {}", storage.path.display()))?;
 
-        Ok(Some(Self::new_with_max_recordings(
+        let retention = StorageRetentionPolicy::from_config(storage)?;
+        Ok(Some(Self::new_with_retention(
             storage.path.clone(),
-            storage.max_recordings,
+            retention,
         )))
     }
 
     pub fn new(base_path: PathBuf) -> Self {
-        Self::new_with_max_recordings(base_path, None)
+        Self::new_with_retention(base_path, StorageRetentionPolicy::default())
     }
 
-    fn new_with_max_recordings(base_path: PathBuf, max_recordings: Option<u64>) -> Self {
+    fn new_with_retention(base_path: PathBuf, retention: StorageRetentionPolicy) -> Self {
         Self {
             base_path,
-            max_recordings,
+            retention,
         }
     }
 
@@ -521,9 +545,9 @@ impl SessionManager {
     pub async fn open_session_storage(&self, name: &str) -> Result<Storage, SessionManagerError> {
         let base_path = self.base_path.clone();
         let name = name.to_owned();
-        let max_recordings = self.max_recordings;
+        let retention = self.retention;
         tokio::task::spawn_blocking(move || {
-            open_session_storage_blocking(&base_path, &name, max_recordings)
+            open_session_storage_blocking(&base_path, &name, retention)
         })
         .await
         .map_err(|err| {
@@ -897,7 +921,7 @@ fn delete_session_blocking(base_path: &Path, name: &str) -> Result<(), SessionMa
 fn open_session_storage_blocking(
     base_path: &Path,
     name: &str,
-    max_recordings: Option<u64>,
+    retention: StorageRetentionPolicy,
 ) -> Result<Storage, SessionManagerError> {
     let session_dir =
         session::resolve_session_dir(base_path, name).map_err(invalid_session_name)?;
@@ -908,7 +932,7 @@ fn open_session_storage_blocking(
         return Err(SessionManagerError::NotFound(name.to_owned()));
     }
 
-    Storage::open_with_max_recordings(db_path, max_recordings)
+    Storage::open_with_retention(db_path, retention)
         .map_err(|err| SessionManagerError::Internal(format!("open session `{name}`: {err}")))
 }
 
@@ -1149,7 +1173,7 @@ fn insert_recording_blocking(
     path: &Path,
     recording: Recording,
     request_query_norm: Option<String>,
-    max_recordings: Option<u64>,
+    retention: StorageRetentionPolicy,
 ) -> anyhow::Result<i64> {
     let mut conn = open_connection(path)?;
     let match_key = recording.match_key.clone();
@@ -1209,12 +1233,23 @@ fn insert_recording_blocking(
         &request_query_norm,
         request_query_param_count,
     )?;
-    if let Some(max_recordings) = max_recordings {
-        enforce_max_recordings(&tx, max_recordings)?;
-    }
+    enforce_retention_policy(&tx, retention)?;
     tx.commit().context("commit recording insert transaction")?;
 
     Ok(recording_id)
+}
+
+fn enforce_retention_policy(
+    tx: &rusqlite::Transaction<'_>,
+    retention: StorageRetentionPolicy,
+) -> anyhow::Result<()> {
+    if let Some(max_recordings) = retention.max_recordings {
+        enforce_max_recordings(tx, max_recordings)?;
+    }
+    if let Some(max_age_ms) = retention.max_age_ms {
+        enforce_max_age(tx, max_age_ms)?;
+    }
+    Ok(())
 }
 
 fn enforce_max_recordings(
@@ -1236,6 +1271,20 @@ fn enforce_max_recordings(
         params![keep],
     )
     .context("enforce `storage.max_recordings` retention policy")?;
+    Ok(())
+}
+
+fn enforce_max_age(tx: &rusqlite::Transaction<'_>, max_age_ms: i64) -> anyhow::Result<()> {
+    let now_unix_ms = Recording::now_unix_ms()?;
+    let cutoff_unix_ms = now_unix_ms.saturating_sub(max_age_ms);
+    tx.execute(
+        r#"
+        DELETE FROM recordings
+        WHERE created_at_unix_ms < ?1
+        "#,
+        params![cutoff_unix_ms],
+    )
+    .context("enforce `storage.max_age_*` retention policy")?;
     Ok(())
 }
 
@@ -2212,6 +2261,74 @@ max_recordings = 1
         let summaries = storage.list_recordings(0, 10).await.unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].request_uri, "/two");
+    }
+
+    #[tokio::test]
+    async fn from_config_applies_max_age_hours_retention() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "default"
+max_age_hours = 1
+"#,
+            temp_dir.path().display()
+        ))
+        .unwrap();
+
+        let storage = Storage::from_config(&config).unwrap().unwrap();
+        let now_unix_ms = Recording::now_unix_ms().unwrap();
+        let stale = test_recording("/stale", now_unix_ms - (2 * 60 * 60 * 1_000));
+        let mut fresh = test_recording("/fresh", now_unix_ms - (5 * 60 * 1_000));
+        fresh.match_key = "retention-key-fresh".to_owned();
+
+        storage.insert_recording(stale).await.unwrap();
+        storage.insert_recording(fresh).await.unwrap();
+
+        let summaries = storage.list_recordings(0, 10).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].request_uri, "/fresh");
+    }
+
+    #[tokio::test]
+    async fn max_age_retention_preserves_newest_matching_recording() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "default"
+max_age_hours = 1
+"#,
+            temp_dir.path().display()
+        ))
+        .unwrap();
+
+        let storage = Storage::from_config(&config).unwrap().unwrap();
+        let now_unix_ms = Recording::now_unix_ms().unwrap();
+        let mut stale = test_recording("/stale", now_unix_ms - (2 * 60 * 60 * 1_000));
+        stale.match_key = "same-key".to_owned();
+        let mut fresh = stale.clone();
+        fresh.request_uri = "/fresh".to_owned();
+        fresh.response_body = b"/fresh".to_vec();
+        fresh.created_at_unix_ms = now_unix_ms - (5 * 60 * 1_000);
+
+        storage.insert_recording(stale).await.unwrap();
+        storage.insert_recording(fresh).await.unwrap();
+
+        let replay_match = storage
+            .get_recording_by_match_key("same-key")
+            .await
+            .unwrap()
+            .expect("fresh recording should remain after retention pruning");
+        assert_eq!(replay_match.request_uri, "/fresh");
     }
 
     #[tokio::test]
@@ -3803,5 +3920,38 @@ max_recordings = 1
         let summaries = storage.list_recordings(0, 10).await.unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].request_uri, "/two");
+    }
+
+    #[tokio::test]
+    async fn session_manager_from_config_propagates_max_age_hours() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+max_age_hours = 1
+"#,
+            temp_dir.path().display()
+        ))
+        .unwrap();
+
+        let manager = SessionManager::from_config(&config).unwrap().unwrap();
+        manager.create_session("default").await.unwrap();
+        let storage = manager.open_session_storage("default").await.unwrap();
+
+        let now_unix_ms = Recording::now_unix_ms().unwrap();
+        let stale = test_recording("/stale", now_unix_ms - (2 * 60 * 60 * 1_000));
+        let mut fresh = test_recording("/fresh", now_unix_ms - (10 * 60 * 1_000));
+        fresh.match_key = "manager-retention-fresh".to_owned();
+
+        storage.insert_recording(stale).await.unwrap();
+        storage.insert_recording(fresh).await.unwrap();
+
+        let summaries = storage.list_recordings(0, 10).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].request_uri, "/fresh");
     }
 }

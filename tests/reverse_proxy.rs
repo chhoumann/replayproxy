@@ -2055,7 +2055,7 @@ path_prefix = "/"
     let admin_client: Client<HttpConnector, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(admin_connector);
 
-    let failure_authorities = vec![
+    let failure_authorities = [
         format!("localhost:{unavailable_port}"),
         format!("127.0.0.1:{unavailable_port}"),
         format!("[::1]:{unavailable_port}"),

@@ -859,7 +859,7 @@ fn median_f64(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|left, right| left.partial_cmp(right).unwrap());
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]
@@ -871,7 +871,7 @@ fn median_u64(values: &[u64]) -> u64 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         let pair_sum = u128::from(sorted[mid - 1]) + u128::from(sorted[mid]);
         (pair_sum / 2).min(u128::from(u64::MAX)) as u64
     } else {

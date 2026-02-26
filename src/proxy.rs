@@ -49,7 +49,9 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 #[cfg(feature = "scripting")]
-use crate::scripting::{ScriptRequest, run_on_request_script};
+use crate::scripting::{
+    ScriptRequest, ScriptResponse, run_on_request_script, run_on_response_script,
+};
 use crate::{
     ca,
     config::{
@@ -2538,9 +2540,27 @@ async fn proxy_handler(
 
     let (mut parts, body) = upstream_res.into_parts();
     strip_hop_by_hop_headers(&mut parts.headers);
-    let record_response_status = should_record.then(|| parts.status.as_u16());
-    let record_response_headers = should_record.then(|| header_map_to_vec(&parts.headers));
-    if !should_record {
+    let has_on_response_transform = route.transform.on_response.is_some();
+    let should_buffer_response = should_record || has_on_response_transform;
+    let allow_response_oversize_bypass_cache =
+        route.body_oversize == BodyOversizePolicy::BypassCache && !has_on_response_transform;
+
+    #[cfg(not(feature = "scripting"))]
+    if route.transform.on_response.is_some() {
+        tracing::debug!(
+            route = %route.route_ref,
+            "on_response script is configured but scripting support is disabled"
+        );
+        respond!(
+            Some(upstream_latency),
+            proxy_simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "on_response script configured but this replayproxy build does not include scripting support",
+            )
+        );
+    }
+
+    if !should_buffer_response {
         respond!(
             Some(upstream_latency),
             Response::from_parts(parts, boxed_incoming(body))
@@ -2551,7 +2571,7 @@ async fn proxy_handler(
         .map(|len| len > bytes_limit_u64(max_body_bytes))
         .unwrap_or(false);
     if response_known_oversize {
-        if route.body_oversize == BodyOversizePolicy::BypassCache {
+        if allow_response_oversize_bypass_cache {
             tracing::debug!(
                 limit_bytes = max_body_bytes,
                 "bypassing cache for oversized upstream response body"
@@ -2559,6 +2579,13 @@ async fn proxy_handler(
             respond!(
                 Some(upstream_latency),
                 Response::from_parts(parts, boxed_incoming(body))
+            );
+        }
+        if has_on_response_transform && route.body_oversize == BodyOversizePolicy::BypassCache {
+            tracing::debug!(
+                route = %route.route_ref,
+                limit_bytes = max_body_bytes,
+                "rejecting oversized upstream response body because on_response transform requires buffering"
             );
         }
         respond!(
@@ -2582,7 +2609,7 @@ async fn proxy_handler(
             prefetched,
             remaining,
         }) => {
-            if route.body_oversize == BodyOversizePolicy::BypassCache {
+            if allow_response_oversize_bypass_cache {
                 tracing::debug!(
                     limit_bytes = max_body_bytes,
                     "bypassing cache after upstream response body exceeded configured limit mid-stream"
@@ -2590,6 +2617,13 @@ async fn proxy_handler(
                 respond!(
                     Some(upstream_latency),
                     Response::from_parts(parts, boxed_prefetched_incoming(prefetched, remaining))
+                );
+            }
+            if has_on_response_transform && route.body_oversize == BodyOversizePolicy::BypassCache {
+                tracing::debug!(
+                    route = %route.route_ref,
+                    limit_bytes,
+                    "rejecting oversized upstream response body because on_response transform requires buffering"
                 );
             }
             tracing::debug!(
@@ -2614,6 +2648,28 @@ async fn proxy_handler(
             );
         }
     };
+
+    #[cfg(feature = "scripting")]
+    let mut body_bytes = body_bytes;
+
+    #[cfg(feature = "scripting")]
+    if let Some(script) = route.transform.on_response.as_ref() {
+        if let Err(err) =
+            apply_on_response_script(&route.route_ref, script, &mut parts, &mut body_bytes)
+        {
+            tracing::debug!("failed to run on_response script: {err}");
+            respond!(
+                Some(upstream_latency),
+                proxy_simple_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "on_response script failed"
+                )
+            );
+        }
+    }
+
+    let record_response_status = should_record.then(|| parts.status.as_u16());
+    let record_response_headers = should_record.then(|| header_map_to_vec(&parts.headers));
 
     if let (
         true,
@@ -3214,7 +3270,7 @@ fn apply_on_request_script(
     let mut request = ScriptRequest::new(
         parts.method.to_string(),
         parts.uri.to_string(),
-        script_request_headers_from_http(&parts.headers)?,
+        script_headers_from_http(&parts.headers, "on_request")?,
         body_bytes.to_vec(),
     );
     run_on_request_script(
@@ -3230,7 +3286,7 @@ fn apply_on_request_script(
     parts.uri = request.url.parse::<Uri>().map_err(|err| {
         anyhow::anyhow!("apply transformed request URL for route `{route_ref}`: {err}")
     })?;
-    parts.headers = script_request_headers_to_http(request.headers)?;
+    parts.headers = script_headers_to_http(request.headers)?;
     strip_hop_by_hop_headers(&mut parts.headers);
     let content_length = HeaderValue::from_str(&request.body.len().to_string()).map_err(|err| {
         anyhow::anyhow!("set transformed request content-length for route `{route_ref}`: {err}")
@@ -3241,15 +3297,51 @@ fn apply_on_request_script(
 }
 
 #[cfg(feature = "scripting")]
-fn script_request_headers_from_http(
+fn apply_on_response_script(
+    route_ref: &str,
+    script: &LoadedScript,
+    parts: &mut hyper::http::response::Parts,
+    body_bytes: &mut Bytes,
+) -> anyhow::Result<()> {
+    let mut response = ScriptResponse::new(
+        parts.status.as_u16(),
+        script_headers_from_http(&parts.headers, "on_response")?,
+        body_bytes.to_vec(),
+    );
+    run_on_response_script(
+        route_ref,
+        &script.path.display().to_string(),
+        script.source.as_ref(),
+        &mut response,
+    )?;
+
+    parts.status = StatusCode::from_u16(response.status).map_err(|err| {
+        anyhow::anyhow!("apply transformed response status for route `{route_ref}`: {err}")
+    })?;
+    parts.headers = script_headers_to_http(response.headers)?;
+    strip_hop_by_hop_headers(&mut parts.headers);
+    let content_length =
+        HeaderValue::from_str(&response.body.len().to_string()).map_err(|err| {
+            anyhow::anyhow!(
+                "set transformed response content-length for route `{route_ref}`: {err}"
+            )
+        })?;
+    parts.headers.insert(header::CONTENT_LENGTH, content_length);
+    *body_bytes = Bytes::from(response.body);
+    Ok(())
+}
+
+#[cfg(feature = "scripting")]
+fn script_headers_from_http(
     headers: &hyper::HeaderMap,
+    hook_name: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for (name, value) in headers {
         let value = value.to_str().map_err(|err| {
             anyhow::anyhow!(
-                "cannot run on_request script with non-UTF-8 value for `{}`: {err}",
-                name.as_str()
+                "cannot run {hook_name} script with non-UTF-8 value for `{}`: {err}",
+                name.as_str(),
             )
         })?;
         out.insert(name.as_str().to_owned(), value.to_owned());
@@ -3258,9 +3350,7 @@ fn script_request_headers_from_http(
 }
 
 #[cfg(feature = "scripting")]
-fn script_request_headers_to_http(
-    headers: BTreeMap<String, String>,
-) -> anyhow::Result<hyper::HeaderMap> {
+fn script_headers_to_http(headers: BTreeMap<String, String>) -> anyhow::Result<hyper::HeaderMap> {
     let mut out = hyper::HeaderMap::new();
     for (name, value) in headers {
         let header_name = HeaderName::from_bytes(name.as_bytes())

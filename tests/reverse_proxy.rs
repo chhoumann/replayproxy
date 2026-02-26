@@ -235,6 +235,137 @@ on_request = "{}"
     let _ = upstream_shutdown().await;
 }
 
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn on_response_script_mutates_upstream_response_before_return_and_cache() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_upstream_without_binary_header().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    fs::create_dir_all(&storage_dir).unwrap();
+    let script_path = temp_dir.path().join("on_response.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(response)
+  response.status = 202
+  response.headers["x-resp-end"] = "scripted"
+  response.headers["x-scripted"] = "1"
+  response.body = "scripted-response"
+  return response
+end
+"#,
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+
+[routes.transform]
+on_response = "{}"
+"#,
+        storage_dir.display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let uri: Uri = format!("http://{}/api/cache", proxy.listen_addr)
+        .parse()
+        .unwrap();
+
+    let first_req = Request::builder()
+        .method(Method::GET)
+        .uri(uri.clone())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        first_res.headers().get("x-scripted").unwrap(),
+        &HeaderValue::from_static("1")
+    );
+    assert_eq!(
+        first_res.headers().get("x-resp-end").unwrap(),
+        &HeaderValue::from_static("scripted")
+    );
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"scripted-response");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/cache");
+    assert_eq!(&captured.body[..], b"");
+
+    let second_req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let second_res = client.request(second_req).await.unwrap();
+    assert_eq!(second_res.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        second_res.headers().get("x-scripted").unwrap(),
+        &HeaderValue::from_static("1")
+    );
+    assert_eq!(
+        second_res.headers().get("x-resp-end").unwrap(),
+        &HeaderValue::from_static("scripted")
+    );
+    let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&second_body[..], b"scripted-response");
+
+    assert!(
+        upstream_rx.recv().await.is_none(),
+        "second request should be replayed from cache without hitting upstream"
+    );
+
+    let db_path = storage_dir.join("default").join("recordings.db");
+    let conn = Connection::open(db_path).unwrap();
+    let (stored_status, stored_headers, stored_body): (u16, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT response_status, response_headers_json, response_body FROM recordings LIMIT 1;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_status, StatusCode::ACCEPTED.as_u16());
+    let stored_headers: Vec<(String, Vec<u8>)> = serde_json::from_str(&stored_headers).unwrap();
+    assert_eq!(
+        stored_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-scripted"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"1".as_slice())
+    );
+    assert_eq!(
+        stored_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-resp-end"))
+            .map(|(_, value)| value.as_slice()),
+        Some(b"scripted".as_slice())
+    );
+    assert_eq!(&stored_body[..], b"scripted-response");
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
 #[tokio::test]
 async fn forward_proxy_forwards_absolute_form_request_without_configured_upstream() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
@@ -5027,6 +5158,54 @@ async fn spawn_upstream() -> (
                     "x-resp-binary",
                     HeaderValue::from_bytes(BINARY_HEADER_VALUE).unwrap(),
                 );
+                Ok::<_, hyper::Error>(res)
+            }
+        });
+
+        let builder = ConnectionBuilder::new(TokioExecutor::new());
+        builder.serve_connection(io, service).await.unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn spawn_upstream_without_binary_header() -> (
+    SocketAddr,
+    mpsc::Receiver<CapturedRequest>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = mpsc::channel::<CapturedRequest>(1);
+
+    let join = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+        let tx = Arc::new(tx);
+        let service = service_fn(move |req: Request<Incoming>| {
+            let tx = Arc::clone(&tx);
+            async move {
+                let (parts, body) = req.into_parts();
+                let body_bytes = body.collect().await.unwrap().to_bytes();
+                tx.send(CapturedRequest {
+                    uri: parts.uri,
+                    headers: parts.headers,
+                    body: body_bytes,
+                })
+                .await
+                .unwrap();
+
+                let mut res = Response::new(Full::new(Bytes::from_static(b"upstream-body")));
+                *res.status_mut() = StatusCode::CREATED;
+                res.headers_mut().insert(
+                    header::CONNECTION,
+                    HeaderValue::from_static("close, x-resp-hop"),
+                );
+                res.headers_mut()
+                    .insert("x-resp-hop", HeaderValue::from_static("yes"));
+                res.headers_mut()
+                    .insert("x-resp-end", HeaderValue::from_static("ok"));
                 Ok::<_, hyper::Error>(res)
             }
         });

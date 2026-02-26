@@ -384,11 +384,11 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 
 - WebSocket capture/replay is not implemented yet.
 - gRPC capture/replay is not implemented yet.
-- Lua transform runtime currently applies `on_request`; `on_response`, `on_record`, and `on_replay` are not wired yet.
+- Lua transform runtime currently applies `on_request` and `on_response`; `on_record` and `on_replay` are not wired yet.
 - Session export/import moves recording objects but not streaming chunk metadata.
 - No built-in TTL/retention/eviction policy for stored recordings.
 - Query `subset` matching can fall back to scan-heavy behavior on very large candidate sets.
-- `body_oversize = "bypass-cache"` does not bypass in replay mode, and does not bypass when `on_request` transform is configured.
+- `body_oversize = "bypass-cache"` does not bypass in replay mode, and does not bypass when `on_request` or `on_response` transforms are configured.
 
 ## Additional docs
 

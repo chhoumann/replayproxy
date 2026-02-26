@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -85,6 +88,44 @@ impl hyper::body::Body for ChunkedBody {
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         Poll::Ready(self.chunks.pop_front().map(|chunk| Ok(Frame::data(chunk))))
+    }
+}
+
+#[derive(Debug)]
+struct ScriptedErrorBody {
+    frames: VecDeque<Result<Bytes, std::io::Error>>,
+}
+
+impl ScriptedErrorBody {
+    fn complete(bytes: Bytes) -> Self {
+        let mut frames = VecDeque::new();
+        frames.push_back(Ok(bytes));
+        Self { frames }
+    }
+
+    fn truncated(prefix: Bytes) -> Self {
+        let mut frames = VecDeque::new();
+        frames.push_back(Ok(prefix));
+        frames.push_back(Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated upstream body",
+        )));
+        Self { frames }
+    }
+}
+
+impl hyper::body::Body for ScriptedErrorBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(self.frames.pop_front().map(|next| match next {
+            Ok(chunk) => Ok(Frame::data(chunk)),
+            Err(err) => Err(err),
+        }))
     }
 }
 
@@ -324,6 +365,125 @@ mode = "record"
 
     proxy.shutdown().await;
     let _ = healthy_upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_http2_route_truncated_upstream_response_returns_502_and_recovers() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) =
+        spawn_grpc_upstream_truncated_then_success().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+admin_port = 0
+
+[[routes]]
+path_prefix = "/good"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+    let admin_addr = proxy
+        .admin_listen_addr
+        .expect("admin listener should be started");
+
+    let mut admin_connector = HttpConnector::new();
+    admin_connector.enforce_http(false);
+    let admin_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(admin_connector);
+
+    let stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let first_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05first");
+    let first_req = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/good/helloworld.Greeter/SayHello?attempt=1",
+            proxy.listen_addr
+        ))
+        .header(header::HOST, proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(first_payload.clone()))
+        .unwrap();
+    let first_res = sender.send_request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::BAD_GATEWAY);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        first_body.as_ref() == b"upstream request failed"
+            || first_body.as_ref() == b"failed to read upstream response body",
+        "unexpected truncated upstream failure body: {:?}",
+        String::from_utf8_lossy(&first_body)
+    );
+
+    let second_payload = Bytes::from_static(b"\x00\x00\x00\x00\x06second");
+    let second_req = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/good/helloworld.Greeter/SayHello?attempt=2",
+            proxy.listen_addr
+        ))
+        .header(header::HOST, proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(second_payload.clone()))
+        .unwrap();
+    let second_res = sender.send_request(second_req).await.unwrap();
+    assert_eq!(second_res.version(), hyper::Version::HTTP_2);
+    assert_eq!(second_res.status(), StatusCode::OK);
+    assert_eq!(
+        second_res.headers().get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        second_res.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&second_body[..], b"\x00\x00\x00\x00\x00");
+
+    let first_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(first_captured.version, hyper::Version::HTTP_2);
+    assert_eq!(
+        first_captured.uri.path(),
+        "/good/helloworld.Greeter/SayHello"
+    );
+    assert_eq!(first_captured.uri.query(), Some("attempt=1"));
+    assert_eq!(
+        first_captured.headers.get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(first_captured.body, first_payload);
+
+    let second_captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(second_captured.version, hyper::Version::HTTP_2);
+    assert_eq!(
+        second_captured.uri.path(),
+        "/good/helloworld.Greeter/SayHello"
+    );
+    assert_eq!(second_captured.uri.query(), Some("attempt=2"));
+    assert_eq!(
+        second_captured.headers.get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(second_captured.body, second_payload);
+
+    drop(sender);
+    let _ = connection_task.await;
+    wait_for_active_connections(&admin_client, admin_addr, 0, Duration::from_secs(2)).await;
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
 }
 
 #[tokio::test]
@@ -8018,6 +8178,76 @@ async fn spawn_grpc_upstream() -> (
 
         let builder = ConnectionBuilder::new(TokioExecutor::new());
         builder.serve_connection(io, service).await.unwrap();
+    });
+
+    (addr, rx, move || join)
+}
+
+async fn spawn_grpc_upstream_truncated_then_success() -> (
+    SocketAddr,
+    mpsc::Receiver<CapturedRequest>,
+    impl FnOnce() -> tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = mpsc::channel::<CapturedRequest>(2);
+
+    let join = tokio::spawn(async move {
+        let request_index = Arc::new(AtomicUsize::new(0));
+
+        loop {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let tx = tx.clone();
+            let request_index_for_conn = Arc::clone(&request_index);
+            let service = service_fn(move |req: Request<Incoming>| {
+                let tx = tx.clone();
+                let request_index = Arc::clone(&request_index_for_conn);
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body_bytes = body.collect().await.unwrap().to_bytes();
+                    tx.send(CapturedRequest {
+                        uri: parts.uri,
+                        version: parts.version,
+                        headers: parts.headers,
+                        body: body_bytes,
+                    })
+                    .await
+                    .unwrap();
+
+                    let response_number = request_index.fetch_add(1, Ordering::Relaxed);
+                    let mut res = if response_number == 0 {
+                        Response::new(ScriptedErrorBody::truncated(Bytes::from_static(
+                            b"\x00\x00\x00",
+                        )))
+                    } else {
+                        Response::new(ScriptedErrorBody::complete(Bytes::from_static(
+                            b"\x00\x00\x00\x00\x00",
+                        )))
+                    };
+                    *res.status_mut() = StatusCode::OK;
+                    res.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/grpc"),
+                    );
+                    res.headers_mut()
+                        .insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+                    if response_number > 0 {
+                        res.headers_mut()
+                            .insert("grpc-status", HeaderValue::from_static("0"));
+                    }
+                    Ok::<_, hyper::Error>(res)
+                }
+            });
+
+            let builder = ConnectionBuilder::new(TokioExecutor::new());
+            let _ = builder.serve_connection(io, service).await;
+
+            if request_index.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+        }
     });
 
     (addr, rx, move || join)

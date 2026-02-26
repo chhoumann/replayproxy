@@ -1,235 +1,77 @@
-# Live API Validation Runbook
+# Live API Validation
 
 ## Purpose
 
-Run an opt-in, release-hardening validation suite against real external APIs to confirm:
+Run opt-in end-to-end checks against real external APIs before release. This suite validates:
 
-- reverse proxy record/replay works over HTTP and HTTPS
-- forward proxy CONNECT + MITM works in `passthrough-cache`
-- configured request redaction is persisted in recordings
+- reverse proxy `record -> replay` on HTTP
+- reverse proxy `record -> replay` on HTTPS
+- forward proxy `passthrough-cache` over HTTPS CONNECT/MITM
+- redaction persistence in stored recordings for real captured payloads
 
-This runbook is intentionally manual and is not part of default CI.
+These tests are intentionally excluded from default CI and run only when explicitly enabled.
 
 ## Opt-In Environment Variables
 
-Set these before running the matrix:
+Required gate:
 
 ```bash
-export REPLAYPROXY_RUN_LIVE_API_TESTS=1
-export REPLAYPROXY_LIVE_HTTP_UPSTREAM="${REPLAYPROXY_LIVE_HTTP_UPSTREAM:-http://httpbin.org}"
-export REPLAYPROXY_LIVE_HTTPS_UPSTREAM="${REPLAYPROXY_LIVE_HTTPS_UPSTREAM:-https://httpbin.org}"
-export REPLAYPROXY_LIVE_FORWARD_URL="${REPLAYPROXY_LIVE_FORWARD_URL:-https://httpbin.org/post?case=forward-https-redaction}"
-export REPLAYPROXY_LIVE_SECRET_HEADER="${REPLAYPROXY_LIVE_SECRET_HEADER:-Bearer live-secret-token}"
-export REPLAYPROXY_LIVE_SECRET_BODY="${REPLAYPROXY_LIVE_SECRET_BODY:-live-body-secret}"
+export REPLAYPROXY_LIVE_TESTS=1
 ```
 
-Hard stop if not explicitly opted in:
+Optional overrides:
 
 ```bash
-test "${REPLAYPROXY_RUN_LIVE_API_TESTS:-0}" = "1" || {
-  echo "Refusing live validation: set REPLAYPROXY_RUN_LIVE_API_TESTS=1"
-  exit 1
-}
+# Defaults shown below:
+export REPLAYPROXY_LIVE_HTTP_ORIGIN="${REPLAYPROXY_LIVE_HTTP_ORIGIN:-http://httpbingo.org}"
+export REPLAYPROXY_LIVE_HTTPS_ORIGIN="${REPLAYPROXY_LIVE_HTTPS_ORIGIN:-https://httpbingo.org}"
+export REPLAYPROXY_LIVE_SECRET="${REPLAYPROXY_LIVE_SECRET:-live-secret-token}"
 ```
 
-## Test Matrix Coverage
+`REPLAYPROXY_LIVE_SECRET` is injected into live request headers/body and must never appear unredacted in stored recordings.
 
-| Case | Coverage | Expected outcome |
-| --- | --- | --- |
-| Reverse HTTP record/replay | Reverse proxy, upstream `http://...`, `record` then `replay` | Record request succeeds; replay hit succeeds; replay miss returns `502 Gateway Not Recorded` |
-| Reverse HTTPS record/replay | Reverse proxy, upstream `https://...`, `record` then `replay` | Same pass criteria as reverse HTTP, with TLS to upstream |
-| Forward HTTPS passthrough-cache + redaction | Forward proxy CONNECT/TLS MITM, `passthrough-cache`, request redaction | First request goes upstream, second is cache hit, recording stores redacted request header/body fields |
+## Matrix Coverage
 
-## Exact Command Examples
+| Test | Path | Mode(s) | Protocol | Verification |
+| --- | --- | --- | --- | --- |
+| `live_reverse_proxy_record_replay_http` | Reverse | `record`, `replay` | HTTP | Same request replays from storage; admin stats show replay cache hit and no upstream requests in replay run |
+| `live_reverse_proxy_record_replay_https` | Reverse | `record`, `replay` | HTTPS upstream | Same as HTTP case, over TLS upstream |
+| `live_forward_proxy_passthrough_cache_redacts_stored_payloads` | Forward (CONNECT/MITM) | `passthrough-cache` | HTTPS target | First request miss + upstream call; second request cache hit; SQLite recording confirms request/response redaction |
 
-Common setup:
+## Commands
+
+Run the full live suite:
 
 ```bash
-cargo build --release
-BIN=./target/release/replayproxy
-WORKDIR="$(mktemp -d)"
-trap 'pkill -P $$ || true; rm -rf "$WORKDIR"' EXIT
+REPLAYPROXY_LIVE_TESTS=1 cargo test --test live_api_validation -- --ignored
 ```
 
-### 1) Reverse HTTP record/replay
+Run a single case while iterating:
 
 ```bash
-cat >"$WORKDIR/reverse-http-record.toml" <<EOF
-[proxy]
-listen = "127.0.0.1:18080"
-mode = "record"
-
-[storage]
-path = "$WORKDIR/storage-http"
-active_session = "live-http"
-
-[[routes]]
-name = "live-http"
-path_prefix = "/"
-upstream = "$REPLAYPROXY_LIVE_HTTP_UPSTREAM"
-EOF
-
-$BIN serve --config "$WORKDIR/reverse-http-record.toml" >/tmp/replayproxy-live-http-record.log 2>&1 &
-PID=$!
-sleep 1
-HTTP_RECORD_CODE="$(curl -sS -o /tmp/live-http-record.out -w '%{http_code}' 'http://127.0.0.1:18080/get?case=reverse-http')"
-$BIN recording --config "$WORKDIR/reverse-http-record.toml" list
-kill "$PID"; wait "$PID" || true
-
-cat >"$WORKDIR/reverse-http-replay.toml" <<EOF
-[proxy]
-listen = "127.0.0.1:18080"
-mode = "replay"
-
-[storage]
-path = "$WORKDIR/storage-http"
-active_session = "live-http"
-
-[[routes]]
-name = "live-http"
-path_prefix = "/"
-upstream = "http://127.0.0.1:9"
-cache_miss = "error"
-EOF
-
-$BIN serve --config "$WORKDIR/reverse-http-replay.toml" >/tmp/replayproxy-live-http-replay.log 2>&1 &
-PID=$!
-sleep 1
-HTTP_REPLAY_HIT_CODE="$(curl -sS -o /tmp/live-http-replay-hit.out -w '%{http_code}' 'http://127.0.0.1:18080/get?case=reverse-http')"
-HTTP_REPLAY_MISS_CODE="$(curl -sS -o /tmp/live-http-replay-miss.out -w '%{http_code}' 'http://127.0.0.1:18080/get?case=reverse-http-miss')"
-kill "$PID"; wait "$PID" || true
+REPLAYPROXY_LIVE_TESTS=1 cargo test --test live_api_validation live_forward_proxy_passthrough_cache_redacts_stored_payloads -- --ignored --exact
 ```
 
-### 2) Reverse HTTPS record/replay
+If `REPLAYPROXY_LIVE_TESTS` is not set to a truthy value (`1`, `true`, `yes`), each live test intentionally fails fast.
 
-```bash
-cat >"$WORKDIR/reverse-https-record.toml" <<EOF
-[proxy]
-listen = "127.0.0.1:18081"
-mode = "record"
+## Release Checklist (Pass/Fail)
 
-[storage]
-path = "$WORKDIR/storage-https"
-active_session = "live-https"
+1. Opt-in gating
+- Pass: suite runs only with `REPLAYPROXY_LIVE_TESTS=1`.
+- Fail: live tests run unintentionally in default `cargo test` flow.
 
-[[routes]]
-name = "live-https"
-path_prefix = "/"
-upstream = "$REPLAYPROXY_LIVE_HTTPS_UPSTREAM"
-EOF
+2. Reverse HTTP record/replay
+- Pass: test `live_reverse_proxy_record_replay_http` succeeds.
+- Fail: test fails on status mismatch, replay mismatch, or cache/upstream counters.
 
-$BIN serve --config "$WORKDIR/reverse-https-record.toml" >/tmp/replayproxy-live-https-record.log 2>&1 &
-PID=$!
-sleep 1
-HTTPS_RECORD_CODE="$(curl -sS -o /tmp/live-https-record.out -w '%{http_code}' 'http://127.0.0.1:18081/get?case=reverse-https')"
-$BIN recording --config "$WORKDIR/reverse-https-record.toml" list
-kill "$PID"; wait "$PID" || true
+3. Reverse HTTPS record/replay
+- Pass: test `live_reverse_proxy_record_replay_https` succeeds.
+- Fail: test fails on TLS upstream behavior, replay mismatch, or cache/upstream counters.
 
-cat >"$WORKDIR/reverse-https-replay.toml" <<EOF
-[proxy]
-listen = "127.0.0.1:18081"
-mode = "replay"
+4. Forward HTTPS passthrough-cache correctness
+- Pass: test `live_forward_proxy_passthrough_cache_redacts_stored_payloads` records one miss, then one hit, with no additional upstream request on second call.
+- Fail: cache stats do not match expected miss/hit/upstream progression.
 
-[storage]
-path = "$WORKDIR/storage-https"
-active_session = "live-https"
-
-[[routes]]
-name = "live-https"
-path_prefix = "/"
-upstream = "http://127.0.0.1:9"
-cache_miss = "error"
-EOF
-
-$BIN serve --config "$WORKDIR/reverse-https-replay.toml" >/tmp/replayproxy-live-https-replay.log 2>&1 &
-PID=$!
-sleep 1
-HTTPS_REPLAY_HIT_CODE="$(curl -sS -o /tmp/live-https-replay-hit.out -w '%{http_code}' 'http://127.0.0.1:18081/get?case=reverse-https')"
-HTTPS_REPLAY_MISS_CODE="$(curl -sS -o /tmp/live-https-replay-miss.out -w '%{http_code}' 'http://127.0.0.1:18081/get?case=reverse-https-miss')"
-kill "$PID"; wait "$PID" || true
-```
-
-### 3) Forward HTTPS passthrough-cache + redaction
-
-```bash
-$BIN ca generate --ca-dir "$WORKDIR/ca"
-
-cat >"$WORKDIR/forward-https.toml" <<EOF
-[proxy]
-listen = "127.0.0.1:18082"
-admin_port = 18083
-mode = "passthrough-cache"
-
-[proxy.tls]
-enabled = true
-ca_cert = "$WORKDIR/ca/cert.pem"
-ca_key = "$WORKDIR/ca/key.pem"
-
-[storage]
-path = "$WORKDIR/storage-forward"
-active_session = "live-forward"
-
-[defaults.redact]
-headers = ["authorization"]
-body_json = ["$.api_key"]
-placeholder = "<REDACTED>"
-
-[[routes]]
-name = "forward-all"
-path_prefix = "/"
-mode = "passthrough-cache"
-cache_miss = "forward"
-
-[routes.redact]
-headers = ["authorization"]
-body_json = ["$.api_key"]
-EOF
-
-$BIN serve --config "$WORKDIR/forward-https.toml" >/tmp/replayproxy-live-forward.log 2>&1 &
-PID=$!
-sleep 1
-unset NO_PROXY no_proxy
-FORWARD_FIRST_CODE="$(curl -sS --proxy http://127.0.0.1:18082 --cacert "$WORKDIR/ca/cert.pem" \
-  -H "Authorization: $REPLAYPROXY_LIVE_SECRET_HEADER" \
-  -H 'Content-Type: application/json' \
-  -d "{\"api_key\":\"$REPLAYPROXY_LIVE_SECRET_BODY\",\"prompt\":\"cache me\"}" \
-  -o /tmp/live-forward-first.out -w '%{http_code}' "$REPLAYPROXY_LIVE_FORWARD_URL")"
-FORWARD_SECOND_CODE="$(curl -sS --proxy http://127.0.0.1:18082 --cacert "$WORKDIR/ca/cert.pem" \
-  -H "Authorization: $REPLAYPROXY_LIVE_SECRET_HEADER" \
-  -H 'Content-Type: application/json' \
-  -d "{\"api_key\":\"$REPLAYPROXY_LIVE_SECRET_BODY\",\"prompt\":\"cache me\"}" \
-  -o /tmp/live-forward-second.out -w '%{http_code}' "$REPLAYPROXY_LIVE_FORWARD_URL")"
-STATUS_JSON="$(curl -sS 'http://127.0.0.1:18083/_admin/status')"
-RECORDING_JSON="$(curl -sS 'http://127.0.0.1:18083/_admin/sessions/live-forward/recordings/1')"
-kill "$PID"; wait "$PID" || true
-```
-
-## Release Checklist (Explicit Pass/Fail)
-
-Use this checklist for release sign-off:
-
-1. Opt-in gate  
-Pass: `REPLAYPROXY_RUN_LIVE_API_TESTS=1` was set before running commands.  
-Fail: Gate variable not set.
-
-2. Reverse HTTP record/replay  
-Pass: `HTTP_RECORD_CODE=200`, `HTTP_REPLAY_HIT_CODE=200`, `HTTP_REPLAY_MISS_CODE=502`.  
-Fail: Any status differs, `recording list` is empty, or replay miss is not `502`.
-
-3. Reverse HTTPS record/replay  
-Pass: `HTTPS_RECORD_CODE=200`, `HTTPS_REPLAY_HIT_CODE=200`, `HTTPS_REPLAY_MISS_CODE=502`.  
-Fail: Any status differs, `recording list` is empty, or replay miss is not `502`.
-
-4. Forward HTTPS passthrough-cache behavior  
-Pass: `FORWARD_FIRST_CODE=200`, `FORWARD_SECOND_CODE=200`, and `STATUS_JSON` includes:
-- `"upstream_requests_total":1`
-- `"cache_misses_total":1`
-- `"cache_hits_total":1`  
-Fail: Any status differs or counters do not match exactly.
-
-5. Forward HTTPS redaction persisted  
-Pass: `RECORDING_JSON` includes these byte signatures:
-- header redaction: `"authorization",[60,82,69,68,65,67,84,69,68,62]`
-- body redaction: `97,112,105,95,107,101,121,34,58,34,60,82,69,68,65,67,84,69,68,62,34`  
-Fail: Either signature missing.
-
+5. Redaction persistence with real payloads
+- Pass: same forward test confirms SQLite recording stores redacted request authorization/token and redacted response fields.
+- Fail: any secret value remains in persisted request/response recording artifacts.

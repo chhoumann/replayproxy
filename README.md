@@ -322,6 +322,18 @@ Notes:
 - Reload response includes `changed`, `routes_before/routes_after`, and route diff counts; use it to confirm whether anything was actually applied.
 - Automatic file watching is enabled in default builds and reloads are debounced (~250ms), so rapid edits may apply as a single update.
 
+## Live API validation (opt-in)
+
+Run the release-hardening live suite (external HTTP/HTTPS APIs, reverse+forward paths, and
+redaction checks) only when explicitly enabled:
+
+```bash
+REPLAYPROXY_LIVE_TESTS=1 cargo test --test live_api_validation -- --ignored
+```
+
+Detailed environment variables, matrix coverage, and release pass/fail checklist are documented in
+`docs/live-api-validation.md`.
+
 ## Common commands
 
 ```bash

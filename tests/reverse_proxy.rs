@@ -293,6 +293,174 @@ path_prefix = "/"
     let _ = upstream_shutdown().await;
 }
 
+#[tokio::test]
+async fn grpc_opaque_record_then_replay_matches_on_raw_request_bytes() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+    let record_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+mode = "record"
+"#,
+        storage_dir.path().display()
+    );
+    let record_config = replayproxy::config::Config::from_toml_str(&record_config_toml).unwrap();
+    let record_proxy = replayproxy::proxy::serve(&record_config).await.unwrap();
+
+    let stream = TcpStream::connect(record_proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let recorded_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let record_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/helloworld.Greeter/SayHello",
+            record_proxy.listen_addr
+        ))
+        .header(header::HOST, record_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(recorded_payload.clone()))
+        .unwrap();
+    let record_response = sender.send_request(record_request).await.unwrap();
+    assert_eq!(record_response.status(), StatusCode::OK);
+    assert_eq!(
+        record_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        record_response.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let record_body = record_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&record_body[..], b"\x00\x00\x00\x00\x00");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.version, hyper::Version::HTTP_2);
+    assert_eq!(captured.uri.path(), "/helloworld.Greeter/SayHello");
+    assert_eq!(captured.body, recorded_payload.clone());
+
+    drop(sender);
+    let _ = connection_task.await;
+    record_proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let replay_config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+mode = "replay"
+cache_miss = "error"
+"#,
+        storage_dir.path().display()
+    );
+    let replay_config = replayproxy::config::Config::from_toml_str(&replay_config_toml).unwrap();
+    let replay_proxy = replayproxy::proxy::serve(&replay_config).await.unwrap();
+
+    let stream = TcpStream::connect(replay_proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let replay_hit_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/helloworld.Greeter/SayHello",
+            replay_proxy.listen_addr
+        ))
+        .header(header::HOST, replay_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(recorded_payload.clone()))
+        .unwrap();
+    let replay_hit_response = sender.send_request(replay_hit_request).await.unwrap();
+    assert_eq!(replay_hit_response.status(), StatusCode::OK);
+    assert_eq!(
+        replay_hit_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        replay_hit_response.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let replay_hit_body = replay_hit_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&replay_hit_body[..], b"\x00\x00\x00\x00\x00");
+
+    let replay_miss_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05jello");
+    let replay_miss_request = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/helloworld.Greeter/SayHello",
+            replay_proxy.listen_addr
+        ))
+        .header(header::HOST, replay_proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(replay_miss_payload))
+        .unwrap();
+    let replay_miss_response = sender.send_request(replay_miss_request).await.unwrap();
+    assert_eq!(replay_miss_response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        replay_miss_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let miss_body = response_json(replay_miss_response).await;
+    assert_eq!(miss_body["error"], "Gateway Not Recorded");
+    assert_eq!(miss_body["route"], "routes[0] path_prefix=/");
+    assert_eq!(miss_body["session"], "default");
+    let match_key = miss_body["match_key"].as_str().unwrap();
+    assert_eq!(match_key.len(), 64);
+    assert!(match_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    drop(sender);
+    let _ = connection_task.await;
+    replay_proxy.shutdown().await;
+}
+
 #[cfg(feature = "scripting")]
 #[tokio::test]
 async fn on_request_script_mutates_request_before_matching_and_forwarding() {

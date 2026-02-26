@@ -207,6 +207,84 @@ path_prefix = "/"
 }
 
 #[tokio::test]
+async fn forward_proxy_supports_http_proxy_environment_variable() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let helper_binary = std::env::current_exe().unwrap();
+    let proxy_url = format!("http://{}", proxy.listen_addr);
+    let target_url = "http://example.invalid/forward/hello?x=1".to_owned();
+    let helper_output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(helper_binary)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("http_client_honors_http_proxy_env_for_forward_proxy_helper")
+            .env("REPLAYPROXY_HTTP_PROXY_TEST_HELPER", "1")
+            .env("REPLAYPROXY_HTTP_PROXY_TEST_URL", &target_url)
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        helper_output.status.success(),
+        "helper client failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        helper_output.status.code(),
+        String::from_utf8_lossy(&helper_output.stdout),
+        String::from_utf8_lossy(&helper_output.stderr),
+    );
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/forward/hello");
+    assert_eq!(captured.uri.query(), Some("x=1"));
+    assert_eq!(
+        captured.headers.get("x-end").unwrap(),
+        &HeaderValue::from_static("kept")
+    );
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[test]
+#[ignore = "invoked by forward_proxy_supports_http_proxy_environment_variable"]
+fn http_client_honors_http_proxy_env_for_forward_proxy_helper() {
+    if std::env::var_os("REPLAYPROXY_HTTP_PROXY_TEST_HELPER").is_none() {
+        return;
+    }
+
+    let target_url = std::env::var("REPLAYPROXY_HTTP_PROXY_TEST_URL").unwrap();
+    let client = reqwest::blocking::Client::builder().build().unwrap();
+    let response = client
+        .get(target_url)
+        .header("x-end", "kept")
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body = response.bytes().unwrap();
+    assert_eq!(body.as_ref(), b"upstream-body");
+}
+
+#[tokio::test]
 async fn forward_proxy_connect_establishes_bidirectional_tunnel() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_connect_upstream().await;
 

@@ -571,7 +571,7 @@ curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 
 - gRPC proto-aware matching (`routes.grpc.match_fields`) requires a build with `--features grpc`; without it, matching falls back to opaque request-body behavior.
 - No built-in TTL/retention/eviction policy for stored recordings.
-- Query `subset` matching can still scan heavily on very large candidate sets (fallback scans are indexed and bounded by query param count).
+- Query `subset` matching fallback uses a per-param inverted index, but extremely broad buckets can still trigger additional candidate scanning.
 
 ## Additional docs
 

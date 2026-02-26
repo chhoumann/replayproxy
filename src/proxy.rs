@@ -4242,7 +4242,7 @@ async fn run_subset_lookup_fallback_scan(
         subset_candidate_limit,
         request_query_param_count,
         fallback_reason,
-        "subset lookup falling back to recording scan"
+        "subset lookup falling back to index-assisted candidate scan"
     );
 
     let fallback_result = storage
@@ -4258,7 +4258,7 @@ async fn run_subset_lookup_fallback_scan(
         fallback_reason,
         matched = fallback_result.recording.is_some(),
         scanned_rows = fallback_result.scanned_rows,
-        "completed subset lookup fallback recording scan"
+        "completed subset lookup fallback candidate scan"
     );
     Ok(fallback_result.recording)
 }

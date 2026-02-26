@@ -219,6 +219,36 @@ pub(crate) fn stored_query_norm_param_count(stored_query_norm: &str) -> usize {
     query_param_count(Some(stored_query_norm))
 }
 
+pub(crate) fn query_param_fingerprint_counts(query: Option<&str>) -> Vec<(String, usize)> {
+    let mut grouped: Vec<(String, usize)> = Vec::new();
+    for (name, value) in query_params_sorted(query) {
+        let fingerprint = query_param_fingerprint(name, value);
+        if let Some((prev_fingerprint, count)) = grouped.last_mut()
+            && prev_fingerprint == &fingerprint
+        {
+            *count += 1;
+        } else {
+            grouped.push((fingerprint, 1));
+        }
+    }
+    grouped
+}
+
+pub(crate) fn stored_query_norm_fingerprints(stored_query_norm: &str) -> Vec<String> {
+    let normalized = normalize_stored_query_norm_to_fingerprint(stored_query_norm);
+    let Some(segments) = normalized.strip_prefix(QUERY_NORM_FINGERPRINT_PREFIX) else {
+        return Vec::new();
+    };
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    segments
+        .split('&')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn normalized_query_from_sorted(sorted: &[(&str, &str)]) -> String {
     let mut normalized = String::new();
     for (idx, (name, value)) in sorted.iter().enumerate() {

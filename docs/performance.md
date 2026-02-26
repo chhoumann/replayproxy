@@ -121,6 +121,8 @@ Hotspot identified:
 Optimization implemented:
 - `subset_normalized_query_matches_parsed_request` now uses ordered matching directly on normalized
   query strings and only falls back to the legacy parser for unsorted legacy rows.
+- Fallback subset lookup now prefilters candidates through `recording_query_param_index`, which
+  reduces large `match_key` bucket scans before semantic verification.
 
 ## Performance Guardrails
 

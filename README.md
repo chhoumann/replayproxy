@@ -1,33 +1,81 @@
 # replayproxy
 
-`replayproxy` is a local reverse proxy that can record upstream HTTP responses and replay them later from local storage.
+`replayproxy` is an HTTP capture-and-replay proxy for deterministic local development and testing.
 
-## Build and install
+It sits between your client and upstream APIs, stores responses in SQLite, and can replay them later by request match key.
 
-Prerequisite: Rust toolchain (stable) with Cargo.
+## Why replayproxy
 
-```bash
-# build a release binary
-cargo build --release
+- Record once, replay many times without calling upstream services.
+- Isolate recordings by session (cassette-like workflow).
+- Redact secrets before data is persisted.
+- Switch runtime mode/session from CLI or admin API.
+- Support reverse-proxy and forward-proxy (including HTTPS MITM) workflows.
 
-# run from the built binary
-./target/release/replayproxy --help
+## Architecture
+
+```text
+Client traffic
+    |
+    v
++---------------------+        +-------------------------------+
+| replayproxy listener| -----> | Route match + mode resolution |
++---------------------+        +-------------------------------+
+                                          |         |
+                                          |         +--> Upstream HTTP(S)
+                                          |
+                                          +--> SQLite session storage
+
+Admin client (CLI/curl)
+    |
+    v
++---------------------+
+| admin listener      | --> status, mode override, session activation, reload, metrics
++---------------------+
 ```
 
-Optional local install:
+Runtime mode resolution is:
+
+1. `routes[].mode` (if set)
+2. `proxy.mode` (if set)
+3. fallback `passthrough-cache`
+
+## Install
+
+Prerequisite: stable Rust toolchain.
 
 ```bash
+# build
+cargo build --release
+
+# run directly
+./target/release/replayproxy --help
+
+# optional install to cargo bin dir
 cargo install --path .
 replayproxy --help
 ```
 
-## Minimal reverse proxy config
+## Config discovery and examples
 
-Create `replayproxy.toml` in the project root:
+When `--config` is omitted, replayproxy loads the first existing file from:
+
+1. `./replayproxy.toml`
+2. `~/.replayproxy/config.toml`
+
+Example configs:
+
+- [`examples/replayproxy.minimal.toml`](examples/replayproxy.minimal.toml)
+- [`examples/replayproxy.llm-redacted.toml`](examples/replayproxy.llm-redacted.toml)
+
+## Quickstart: record then replay (reverse proxy)
+
+Use this minimal config (`replayproxy.toml`):
 
 ```toml
 [proxy]
 listen = "127.0.0.1:8080"
+admin_port = 8081
 mode = "record"
 
 [storage]
@@ -36,146 +84,91 @@ active_session = "default"
 
 [[routes]]
 name = "httpbin"
-path_prefix = "/api"
+path_prefix = "/"
 upstream = "https://httpbin.org"
 ```
 
-Config discovery (if `--config` is omitted):
-- `./replayproxy.toml`
-- `~/.replayproxy/config.toml`
-
-## Example configs
-
-Sample configs are included in [`examples/`](examples):
-- [`examples/replayproxy.minimal.toml`](examples/replayproxy.minimal.toml): minimal reverse-proxy setup.
-- [`examples/replayproxy.llm-redacted.toml`](examples/replayproxy.llm-redacted.toml): LLM-focused setup with route matching and redaction.
-
-Try one directly:
+1. Start the proxy:
 
 ```bash
-cp ./examples/replayproxy.llm-redacted.toml ./replayproxy.toml
-./target/release/replayproxy serve --config ./replayproxy.toml
+replayproxy serve --config ./replayproxy.toml
 ```
 
-## Admin API safety
-
-If `proxy.admin_port` is configured, the admin listener binds to loopback by default
-(`127.0.0.1` for IPv4 configs, `::1` for IPv6 configs), so admin endpoints are local-only.
-
-To expose the admin listener intentionally, set `proxy.admin_bind`:
-
-```toml
-[proxy]
-listen = "0.0.0.0:8080"
-admin_port = 8081
-admin_bind = "0.0.0.0"
-```
-
-You can also require a shared secret header on all admin endpoints:
-
-```toml
-[proxy]
-listen = "127.0.0.1:8080"
-admin_port = 8081
-admin_api_token = "replace-with-strong-secret"
-```
-
-When `admin_api_token` is set, clients must send:
-- Header: `x-replayproxy-admin-token`
-- Value: exact token string from config
-
-## Quickstart: record then replay
-
-1. Start the proxy in record mode:
+2. Send a request through replayproxy:
 
 ```bash
-./target/release/replayproxy serve --config ./replayproxy.toml
+curl -i "http://127.0.0.1:8080/get?demo=1"
 ```
 
-2. In another terminal, send traffic through the proxy route:
+Expected: upstream success (`HTTP/1.1 200 OK`) and response body from httpbin.
+
+3. Confirm recording was stored:
 
 ```bash
-curl -sS http://127.0.0.1:8080/api/get?demo=1
+replayproxy recording list --config ./replayproxy.toml
 ```
 
-3. Confirm recordings were stored:
+Expected: output contains `session \`default\`` and at least one row in the `id method status uri` table.
+
+4. Switch runtime mode to replay:
 
 ```bash
-./target/release/replayproxy recording list --config ./replayproxy.toml
+replayproxy mode set replay --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
 ```
 
-4. Stop the proxy, change config to replay mode, then start again:
-
-```toml
-[proxy]
-listen = "127.0.0.1:8080"
-mode = "replay"
-```
-
-```bash
-./target/release/replayproxy serve --config ./replayproxy.toml
-```
+Expected: output like `set runtime mode override via admin 127.0.0.1:8081: \`replay\``.
 
 5. Send the same request again:
 
 ```bash
-curl -i http://127.0.0.1:8080/api/get?demo=1
+curl -i "http://127.0.0.1:8080/get?demo=1"
 ```
 
-The response should now come from local storage (no upstream call). If no recording matches, replay mode returns `502 Gateway Not Recorded`.
+Expected: same response served from local storage (no upstream call).
 
-## Forward proxy + HTTPS MITM (macOS/Linux)
+6. Send a request you did not record:
 
-Use forward proxy mode when clients should call original upstream URLs and route through `replayproxy` via `HTTP_PROXY`/`HTTPS_PROXY`.
+```bash
+curl -i "http://127.0.0.1:8080/get?not-recorded=1"
+```
 
-### 1) Generate local CA material
+Expected in replay mode: `502` with JSON body including `error`, `route`, `session`, and `match_key`.
+
+## Reverse proxy vs forward proxy
+
+Reverse proxy route (set `upstream`):
+
+- Incoming request path/query is forwarded to the configured upstream host.
+- Good for local endpoint remapping like `/api/* -> https://service.example`.
+
+Forward proxy route (omit `upstream`):
+
+- Client sends absolute-form URLs (and optionally CONNECT for HTTPS).
+- Route should use `path_prefix = "/"` so CONNECT/absolute-form requests match.
+- Good for tooling that supports `HTTP_PROXY` / `HTTPS_PROXY`.
+
+## Forward proxy with HTTPS MITM (macOS/Linux)
+
+1. Generate CA material:
 
 ```bash
 replayproxy ca generate
 ```
 
 Default output:
+
 - `~/.replayproxy/ca/cert.pem`
 - `~/.replayproxy/ca/key.pem`
 
-### 2) Trust the CA certificate
-
-macOS:
+2. Install trust (best effort):
 
 ```bash
 replayproxy ca install
 ```
 
-If automatic install falls back to manual mode, run:
+If automatic install does not complete, run the manual command printed by replayproxy.
 
-```bash
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.replayproxy/ca/cert.pem
-```
-
-Linux:
-
-```bash
-replayproxy ca install
-```
-
-On Debian/Ubuntu/Alpine, the automatic path copies the cert to
-`/usr/local/share/ca-certificates/replayproxy-ca.crt` and runs
-`update-ca-certificates`. If that does not complete, run:
-
-```bash
-sudo cp ~/.replayproxy/ca/cert.pem /usr/local/share/ca-certificates/replayproxy-ca.crt
-sudo update-ca-certificates
-```
-
-On Fedora/RHEL-family distros, install manually:
-
-```bash
-sudo trust anchor ~/.replayproxy/ca/cert.pem
-```
-
-### 3) Configure forward proxy routing
-
-Create `replayproxy.toml`:
+3. Configure forward proxy + TLS interception:
 
 ```toml
 [proxy]
@@ -196,196 +189,209 @@ name = "forward-all"
 path_prefix = "/"
 ```
 
-`path_prefix = "/"` is required so CONNECT and absolute-form proxy requests match a route.
-Leave `upstream` unset to allow forwarding to arbitrary hosts from client request targets.
-
-### 4) Run and route client traffic through the proxy
+4. Start proxy and route client traffic:
 
 ```bash
 replayproxy serve --config ./replayproxy.toml
-```
-
-In another terminal:
-
-```bash
 export HTTP_PROXY=http://127.0.0.1:8080
 export HTTPS_PROXY=http://127.0.0.1:8080
 curl https://example.com/
 ```
 
-If your client ignores proxy env vars, pass proxy settings explicitly in that client/tool.
+Notes:
 
-## Community presets
+- Without `[proxy.tls].enabled = true`, CONNECT is tunneled raw (no HTTPS body visibility).
+- If `ca_cert` and `ca_key` point to missing default filenames (`cert.pem`/`key.pem`), startup can auto-generate CA material.
 
-Bundled presets provide starting configs for common upstream APIs.
+## Session and recording operations
 
-Discover available presets and intended use:
+Session commands:
+
+```bash
+replayproxy session list --config ./replayproxy.toml
+replayproxy session create test-session --config ./replayproxy.toml
+replayproxy session switch test-session --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
+replayproxy session delete old-session --config ./replayproxy.toml
+```
+
+Export/import:
+
+```bash
+replayproxy session export default --format yaml --out ./exports/default --config ./replayproxy.toml
+replayproxy session import recovered --in ./exports/default --config ./replayproxy.toml
+```
+
+Recording commands:
+
+```bash
+replayproxy recording list --config ./replayproxy.toml
+replayproxy recording search "POST /v1/chat body:gpt" --config ./replayproxy.toml
+replayproxy recording delete 42 --config ./replayproxy.toml
+```
+
+Operational notes:
+
+- `session` and `recording` commands require `[storage].path`.
+- Session names are validated; path traversal and empty/invalid names are rejected.
+- Active session cannot be deleted.
+
+## Admin API and runtime operations
+
+Enable admin listener in config:
+
+```toml
+[proxy]
+listen = "127.0.0.1:8080"
+admin_port = 8081
+# optional: admin_bind = "0.0.0.0"
+# optional: admin_api_token = "replace-with-strong-secret"
+```
+
+Security behavior:
+
+- If `admin_bind` is omitted, admin binds to loopback.
+- If `admin_api_token` is set, all admin endpoints (including `/metrics`) require header:
+  - `x-replayproxy-admin-token: <token>`
+
+Core endpoints:
+
+- `GET /_admin/status`
+- `GET|POST /_admin/mode`
+- `POST /_admin/config/reload`
+- `GET|POST /_admin/sessions`
+- `POST /_admin/sessions/:name/activate`
+- `GET|DELETE /_admin/sessions/:name/recordings/:id`
+- `GET /_admin/sessions/:name/recordings`
+- `POST /_admin/sessions/:name/export`
+- `POST /_admin/sessions/:name/import`
+- `DELETE /_admin/sessions/:name`
+- `GET /metrics` (only when `[metrics].enabled = true`)
+
+Mode workflow from CLI:
+
+```bash
+replayproxy mode show --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
+replayproxy mode set replay --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
+replayproxy mode set record --config ./replayproxy.toml --admin-addr 127.0.0.1:8081 --persist
+```
+
+`mode set --persist` updates `proxy.mode` in the loaded config file.
+
+## Matching, redaction, and replay miss behavior
+
+Matching:
+
+- Match key is built from normalized method/path/query/headers/body rules.
+- Query mode `subset` excludes query from hash and resolves candidates at lookup time.
+- Recording lookup is latest-match wins.
+
+Redaction:
+
+- Redaction runs before persistence.
+- Supports header redaction and JSONPath body redaction.
+- Matching still uses pre-redaction request values.
+
+Replay miss behavior:
+
+- Default in `replay` mode is `cache_miss = "error"` -> `502 Gateway Not Recorded`.
+- Set `cache_miss = "forward"` on a route to forward upstream instead of returning `502`.
+
+## Metrics and observability
+
+When enabled:
+
+```toml
+[metrics]
+enabled = true
+```
+
+`GET /metrics` exposes Prometheus text metrics, including:
+
+- request totals
+- cache hit/miss totals
+- upstream/replay latency histograms
+- active connections
+- active-session recording totals
+
+`GET /_admin/status` returns runtime state (`uptime_ms`, `active_session`, listener addresses, route count, and counters).
+
+## Presets
+
+Bundled presets:
+
+- `openai`
+- `anthropic`
+
+Commands:
 
 ```bash
 replayproxy preset list
+replayproxy preset import openai
 ```
 
-Import behavior is **copy-only**:
-- `replayproxy preset import <name>` writes `~/.replayproxy/presets/<name>.toml`
-- Existing preset files at that path are overwritten
-- Your active `replayproxy.toml` is not merged or modified automatically
+Import behavior is copy-only:
 
-Typical workflow:
-1. Import a preset.
-2. Copy or adapt routes from `~/.replayproxy/presets/<name>.toml` into your project config.
-3. Start replayproxy with your project config as usual.
+- writes `~/.replayproxy/presets/<name>.toml`
+- overwrites existing file at that path
+- does not merge into your active project config
 
 ## Troubleshooting
 
-### `502 Gateway Not Recorded` in replay mode
+### `502 Gateway Not Recorded`
 
-Replay misses return `502` and include JSON fields like `error`, `route`, `session`, and `match_key`.
-
-Quick checks:
+Checks:
 
 ```bash
-# Verify current runtime mode (requires admin API)
 replayproxy mode show --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
-
-# Inspect recordings in the active session
 replayproxy recording list --config ./replayproxy.toml
-replayproxy recording search "GET /api/get?demo=1" --config ./replayproxy.toml
-
-# Inspect runtime counters (cache_misses_total, active_session, etc.)
+replayproxy recording search "GET /get" --config ./replayproxy.toml
 curl -sS http://127.0.0.1:8081/_admin/status
 ```
 
 Common fixes:
-- Record seed traffic first (`record` or `passthrough-cache`) so replay has matching entries.
-- Confirm you are querying the expected session (`storage.active_session` or `session switch`).
-- Ensure method/path/query/body/header matching config has not drifted from recorded traffic.
-- For replay fallback behavior, set route `cache_miss = "forward"` instead of returning `502`.
 
-### Oversized requests with `on_request` transforms
+- Seed recordings first in `record` or `passthrough-cache` mode.
+- Confirm active session is the one you expect.
+- Confirm route match settings (method/path/query/headers/body) still match the traffic.
+- Use `cache_miss = "forward"` if replay misses should fall back upstream.
 
-If a route config sets both:
-- `body_oversize = "bypass-cache"`
-- `routes.transform.on_request = "..."`
+### `mode` or `session switch` commands fail
 
-then oversized request bodies still return `413` (`request body exceeds configured proxy.max_body_bytes`).
-This is intentional: `on_request` requires a fully buffered request body, so replayproxy cannot switch
-that request to bypass-cache streaming mode.
+- Ensure admin listener is enabled via `proxy.admin_port` or pass explicit `--admin-addr`.
+- If `admin_api_token` is configured, send the matching token.
+- `mode set --persist` requires a config file path source.
 
-### TLS/CA trust and cert/key errors
+### CA/TLS issues
 
-If TLS is enabled but CA paths are missing, startup fails fast with config errors:
-- `proxy.tls.ca_cert` is required when `proxy.tls.enabled = true`
-- `proxy.tls.ca_key` is required when `proxy.tls.enabled = true`
-
-Use an explicit TLS block:
-
-```toml
-[proxy.tls]
-enabled = true
-ca_cert = "~/.replayproxy/ca/cert.pem"
-ca_key = "~/.replayproxy/ca/key.pem"
-```
-
-When both configured paths end in `cert.pem` and `key.pem` and both files are absent, `serve` auto-generates local CA material at startup using the same secure code path as `replayproxy ca generate`.
-
-For custom file names or partially missing files, generate material explicitly and verify both files exist/readable:
+- Generate CA first: `replayproxy ca generate`.
+- Install trust: `replayproxy ca install` (or run manual instructions shown).
+- Verify CA files:
 
 ```bash
 ls -l ~/.replayproxy/ca/cert.pem ~/.replayproxy/ca/key.pem
 ```
 
-If clients report trust failures (for example, unknown authority), make sure the client trusts the configured CA certificate. For quick local checks with `curl`, you can point directly at the CA:
-
-```bash
-curl --cacert ~/.replayproxy/ca/cert.pem https://example.test
-```
-
-### Forward proxy + CA install failures
-
-`replayproxy ca install` prints either an installed method or:
-
-```text
-automatic CA install did not complete
-```
-
-Follow the platform-specific manual command printed after that line.
-
-Common failures and fixes:
-- `CA certificate not found ... run replayproxy ca generate first`: run `replayproxy ca generate` before install/export.
-- `permission denied writing /usr/local/share/ca-certificates/replayproxy-ca.crt`: rerun Linux trust steps with `sudo`.
-- `update-ca-certificates` command not found: install CA certificates tooling for your distro, or use distro-specific manual trust commands.
-- `TLS handshake for CONNECT authority ... ensure client trust includes the replayproxy CA certificate`: client does not trust the replayproxy CA yet; complete install and restart the client process.
-- `incomplete proxy.tls CA material` or `missing proxy.tls CA material`: verify both configured files exist and point to matching `cert.pem` + `key.pem`.
-- Requests are not hitting replayproxy at all: clear or adjust `NO_PROXY`/`no_proxy` so your target host is not bypassing proxy env vars.
-
-### Config reload not applying
-
-Manual reload endpoint:
+### Config reload not applied
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8081/_admin/config/reload
 ```
 
-Notes:
-- `409` + `config reload unavailable` means proxy was not started from a config file path. Start with `serve --config ./replayproxy.toml`.
-- `400` parse errors indicate invalid TOML/route parsing in the updated config file.
-- Reload response includes `changed`, `routes_before/routes_after`, and route diff counts; use it to confirm whether anything was actually applied.
-- Automatic file watching is enabled in default builds and reloads are debounced (~250ms), so rapid edits may apply as a single update.
+- `409 config reload unavailable` means replayproxy does not have a config source path.
+- Default builds include file-watch reload with debounce; multiple rapid edits may coalesce.
 
-## Live API validation (opt-in)
+## Known limitations (current)
 
-Run the release-hardening live suite (external HTTP/HTTPS APIs, reverse+forward paths, and
-redaction checks) only when explicitly enabled:
+- WebSocket capture/replay is not implemented yet.
+- gRPC capture/replay is not implemented yet.
+- Lua transform runtime currently applies `on_request`; `on_response`, `on_record`, and `on_replay` are not wired yet.
+- Session export/import moves recording objects but not streaming chunk metadata.
+- No built-in TTL/retention/eviction policy for stored recordings.
+- Query `subset` matching can fall back to scan-heavy behavior on very large candidate sets.
+- `body_oversize = "bypass-cache"` does not bypass in replay mode, and does not bypass when `on_request` transform is configured.
 
-```bash
-REPLAYPROXY_LIVE_TESTS=1 cargo test --test live_api_validation -- --ignored
-```
+## Additional docs
 
-Detailed environment variables, matrix coverage, and release pass/fail checklist are documented in
-`docs/live-api-validation.md`.
-
-## Performance harness (opt-in)
-
-Run the benchmark-style harness for record/replay/passthrough-cache scenarios:
-
-```bash
-cargo test --test performance_harness -- --ignored --nocapture
-```
-
-Configuration knobs, output fields, and guardrail guidance are documented in
-`docs/performance.md`.
-
-## Common commands
-
-```bash
-# sessions
-replayproxy session list --config ./replayproxy.toml
-replayproxy session create test-session --config ./replayproxy.toml
-
-# mode (requires admin API to be enabled)
-replayproxy mode show --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
-replayproxy mode set replay --config ./replayproxy.toml --admin-addr 127.0.0.1:8081
-replayproxy mode set record --config ./replayproxy.toml --admin-addr 127.0.0.1:8081 --persist
-
-# recordings
-replayproxy recording list --config ./replayproxy.toml
-replayproxy recording search "GET /api/get" --config ./replayproxy.toml
-
-# local CA management
-replayproxy ca generate
-replayproxy ca install
-replayproxy ca export --out ./replayproxy-ca.pem
-
-# bundled presets
-replayproxy preset list
-replayproxy preset import openai
-```
-
-`mode set` changes the running proxy immediately through `/_admin/mode`; `--persist` also writes
-`proxy.mode` back to the loaded config file.
-
-## Session export format
-
-The stable on-disk export contract for `session export` is documented in
-`docs/session-export-format.md` (layout, required fields, and deterministic
-recording filename rules).
+- [`docs/session-export-format.md`](docs/session-export-format.md)
+- [`docs/live-api-validation.md`](docs/live-api-validation.md)
+- [`docs/performance.md`](docs/performance.md)

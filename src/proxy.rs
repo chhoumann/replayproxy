@@ -40,6 +40,7 @@ use tokio::{
 };
 
 use crate::{
+    ca,
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RedactConfig,
         RouteMatchConfig, RouteMode,
@@ -106,6 +107,8 @@ impl ProxyHandle {
 }
 
 pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
+    validate_tls_ca_material(config)?;
+
     let listener = TcpListener::bind(config.proxy.listen)
         .await
         .map_err(|err| anyhow::anyhow!("bind {}: {err}", config.proxy.listen))?;
@@ -256,6 +259,26 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
         config_watcher_shutdown_tx,
         config_watcher_join,
     })
+}
+
+fn validate_tls_ca_material(config: &Config) -> anyhow::Result<()> {
+    let Some(tls) = config.proxy.tls.as_ref() else {
+        return Ok(());
+    };
+
+    if !tls.enabled {
+        return Ok(());
+    }
+
+    let cert_path = tls.ca_cert.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("`proxy.tls.ca_cert` is required when `proxy.tls.enabled = true`")
+    })?;
+    let key_path = tls.ca_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("`proxy.tls.ca_key` is required when `proxy.tls.enabled = true`")
+    })?;
+
+    ca::validate_ca_material(cert_path, key_path)
+        .map_err(|err| anyhow::anyhow!("invalid `proxy.tls` CA material: {err}"))
 }
 
 async fn active_session_recordings_total(
@@ -2205,9 +2228,7 @@ fn forward_proxy_upstream_uri(original: &Uri) -> Option<Uri> {
     if !matches!(original.scheme_str(), Some("http" | "https")) {
         return None;
     }
-    if original.authority().is_none() {
-        return None;
-    }
+    original.authority()?;
     Some(original.clone())
 }
 
@@ -3726,6 +3747,38 @@ upstream = "http://127.0.0.1:1"
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid `path_regex` expression"));
+    }
+
+    #[tokio::test]
+    async fn serve_fails_fast_when_tls_ca_material_is_mismatched() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let first = crate::ca::generate_ca(&temp_dir.path().join("first"), false)
+            .expect("first CA should generate");
+        let second = crate::ca::generate_ca(&temp_dir.path().join("second"), false)
+            .expect("second CA should generate");
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+"#,
+            first.cert_path.display(),
+            second.key_path.display()
+        ))
+        .expect("config should parse");
+
+        let err = super::serve(&config)
+            .await
+            .expect_err("serve should fail with mismatched CA cert/key");
+
+        assert!(
+            err.to_string().contains("do not match"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

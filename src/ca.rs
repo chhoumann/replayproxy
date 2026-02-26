@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
 
 pub const DEFAULT_CA_SUBDIR: &str = ".replayproxy/ca";
 pub const CA_CERT_FILE_NAME: &str = "cert.pem";
@@ -110,6 +111,51 @@ pub fn generate_ca(ca_dir: &Path, force: bool) -> anyhow::Result<CaMaterialPaths
     )?;
 
     Ok(paths)
+}
+
+pub fn validate_ca_material(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
+    let cert_pem = fs::read(cert_path)
+        .with_context(|| format!("read CA certificate {}", cert_path.display()))?;
+    let key_pem = fs::read_to_string(key_path)
+        .with_context(|| format!("read CA private key {}", key_path.display()))?;
+
+    let key_pair = KeyPair::from_pem(&key_pem)
+        .with_context(|| format!("parse CA private key PEM {}", key_path.display()))?;
+
+    let (_, pem_block) = parse_x509_pem(&cert_pem).map_err(|err| {
+        anyhow::anyhow!("parse CA certificate PEM {}: {err}", cert_path.display())
+    })?;
+    if pem_block.label != "CERTIFICATE" {
+        bail!(
+            "parse CA certificate PEM {}: expected CERTIFICATE block, got {}",
+            cert_path.display(),
+            pem_block.label
+        );
+    }
+
+    let (_, certificate) = parse_x509_certificate(&pem_block.contents).map_err(|err| {
+        anyhow::anyhow!(
+            "parse CA certificate DER payload {}: {err}",
+            cert_path.display()
+        )
+    })?;
+
+    let cert_public_key = certificate
+        .tbs_certificate
+        .subject_pki
+        .subject_public_key
+        .data
+        .as_ref();
+    let key_public_key = key_pair.public_key_raw();
+    if cert_public_key != key_public_key {
+        bail!(
+            "CA certificate {} and private key {} do not match",
+            cert_path.display(),
+            key_path.display()
+        );
+    }
+
+    Ok(())
 }
 
 pub fn export_ca_cert(ca_dir: &Path, out_path: &Path, force: bool) -> anyhow::Result<PathBuf> {
@@ -408,7 +454,7 @@ mod tests {
 
     use super::{
         DEFAULT_CA_SUBDIR, default_ca_dir_from_home, export_ca_cert, generate_ca,
-        linux_manual_install_instructions,
+        linux_manual_install_instructions, validate_ca_material,
     };
     use tempfile::tempdir;
 
@@ -512,6 +558,47 @@ mod tests {
         let source = fs::read(&generated.cert_path).expect("source cert readable");
         let exported = fs::read(&export_path).expect("exported cert readable");
         assert_eq!(source, exported);
+    }
+
+    #[test]
+    fn validate_ca_material_accepts_matching_cert_and_key() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let ca_dir = temp_dir.path().join("ca");
+        let generated = generate_ca(&ca_dir, false).expect("CA generation should succeed");
+
+        validate_ca_material(&generated.cert_path, &generated.key_path)
+            .expect("matching CA certificate/key should validate");
+    }
+
+    #[test]
+    fn validate_ca_material_rejects_mismatched_cert_and_key() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let first_dir = temp_dir.path().join("first");
+        let second_dir = temp_dir.path().join("second");
+        let first = generate_ca(&first_dir, false).expect("first CA generation should succeed");
+        let second = generate_ca(&second_dir, false).expect("second CA generation should succeed");
+
+        let err = validate_ca_material(&first.cert_path, &second.key_path)
+            .expect_err("mismatched CA certificate/key should fail");
+        assert!(
+            err.to_string().contains("do not match"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_ca_material_reports_missing_certificate() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let ca_dir = temp_dir.path().join("ca");
+        let generated = generate_ca(&ca_dir, false).expect("CA generation should succeed");
+        fs::remove_file(&generated.cert_path).expect("remove generated certificate");
+
+        let err = validate_ca_material(&generated.cert_path, &generated.key_path)
+            .expect_err("missing certificate should fail");
+        assert!(
+            err.to_string().contains("read CA certificate"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(target_os = "linux")]

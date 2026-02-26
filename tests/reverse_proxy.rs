@@ -146,6 +146,73 @@ upstream = "http://{upstream_addr}"
 }
 
 #[tokio::test]
+async fn reverse_proxy_forwards_direct_http2_to_h2c_upstream() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+path_prefix = "/"
+upstream = "http://{upstream_addr}"
+"#
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let stream = TcpStream::connect(proxy.listen_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let grpc_payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let req = Request::builder()
+        .method(Method::POST)
+        .version(hyper::Version::HTTP_2)
+        .uri(format!(
+            "http://{}/helloworld.Greeter/SayHello?x=1",
+            proxy.listen_addr
+        ))
+        .header(header::HOST, proxy.listen_addr.to_string())
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(grpc_payload.clone()))
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    assert_eq!(res.version(), hyper::Version::HTTP_2);
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(
+        res.headers().get("grpc-status").unwrap(),
+        &HeaderValue::from_static("0")
+    );
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body_bytes[..], b"\x00\x00\x00\x00\x00");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.version, hyper::Version::HTTP_2);
+    assert_eq!(captured.uri.path(), "/helloworld.Greeter/SayHello");
+    assert_eq!(captured.uri.query(), Some("x=1"));
+    assert_eq!(
+        captured.headers.get(header::CONTENT_TYPE).unwrap(),
+        &HeaderValue::from_static("application/grpc")
+    );
+    assert_eq!(captured.body, grpc_payload);
+
+    drop(sender);
+    let _ = connection_task.await;
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
 async fn forward_proxy_connect_tunnels_grpc_over_http2_passthrough() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
 

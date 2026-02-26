@@ -30,7 +30,7 @@ use hyper::{
 };
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
+    client::legacy::{Client, Error as LegacyClientError, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnectionBuilder,
 };
@@ -171,6 +171,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let session_manager = SessionManager::from_config(config)?;
 
     let client = build_http_client()?;
+    let h2_upstream_client = build_http2_only_client()?;
     let mitm_tls = build_mitm_tls_state(config)?;
     let runtime_mode_override = Arc::new(RwLock::new(None));
     let record_rate_limiters = Arc::new(RecordRateLimiterRegistry::default());
@@ -178,6 +179,7 @@ pub async fn serve(config: &Config) -> anyhow::Result<ProxyHandle> {
     let state = Arc::new(ProxyState::new(
         Arc::clone(&runtime_config),
         client,
+        h2_upstream_client,
         Arc::clone(&runtime_status),
         Arc::clone(&session_runtime),
         Arc::clone(&runtime_mode_override),
@@ -295,7 +297,7 @@ fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_http_client() -> anyhow::Result<HttpClient> {
+fn build_proxy_https_connector() -> anyhow::Result<ProxyHttpsConnector> {
     let connector = HttpsConnectorBuilder::new()
         .with_native_roots()
         .map_err(|err| anyhow::anyhow!("load native TLS root certificates: {err}"))?
@@ -303,7 +305,19 @@ fn build_http_client() -> anyhow::Result<HttpClient> {
         .enable_http1()
         .enable_http2()
         .build();
+    Ok(connector)
+}
+
+fn build_http_client() -> anyhow::Result<HttpClient> {
+    let connector = build_proxy_https_connector()?;
     Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+fn build_http2_only_client() -> anyhow::Result<HttpClient> {
+    let connector = build_proxy_https_connector()?;
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder.http2_only(true);
+    Ok(builder.build(connector))
 }
 
 fn build_mitm_tls_state(config: &Config) -> anyhow::Result<Option<Arc<MitmTlsState>>> {
@@ -1657,6 +1671,7 @@ fn absolute_watch_path(path: &std::path::Path) -> PathBuf {
 struct ProxyState {
     runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
     client: HttpClient,
+    h2_upstream_client: HttpClient,
     session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
     status: Arc<RuntimeStatus>,
     runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
@@ -1673,6 +1688,7 @@ impl ProxyState {
     fn new(
         runtime_config: Arc<RwLock<ProxyRuntimeConfig>>,
         client: HttpClient,
+        h2_upstream_client: HttpClient,
         status: Arc<RuntimeStatus>,
         session_runtime: Arc<RwLock<ActiveSessionRuntime>>,
         runtime_mode_override: Arc<RwLock<Option<RouteMode>>>,
@@ -1682,6 +1698,7 @@ impl ProxyState {
         Self {
             runtime_config,
             client,
+            h2_upstream_client,
             session_runtime,
             status,
             runtime_mode_override,
@@ -2208,7 +2225,7 @@ async fn proxy_handler(
             .upstream_requests_total
             .fetch_add(1, Ordering::Relaxed);
         let upstream_started_at = Instant::now();
-        let upstream_res = match state.client.request(upstream_req).await {
+        let upstream_res = match send_upstream_request(state.as_ref(), upstream_req).await {
             Ok(res) => res,
             Err(err) => {
                 let upstream_latency = upstream_started_at.elapsed();
@@ -2275,7 +2292,7 @@ async fn proxy_handler(
                     .upstream_requests_total
                     .fetch_add(1, Ordering::Relaxed);
                 let upstream_started_at = Instant::now();
-                let upstream_res = match state.client.request(upstream_req).await {
+                let upstream_res = match send_upstream_request(state.as_ref(), upstream_req).await {
                     Ok(res) => res,
                     Err(err) => {
                         let upstream_latency = upstream_started_at.elapsed();
@@ -2525,7 +2542,7 @@ async fn proxy_handler(
         .upstream_requests_total
         .fetch_add(1, Ordering::Relaxed);
     let upstream_started_at = Instant::now();
-    let upstream_res = match state.client.request(upstream_req).await {
+    let upstream_res = match send_upstream_request(state.as_ref(), upstream_req).await {
         Ok(res) => res,
         Err(err) => {
             let upstream_latency = upstream_started_at.elapsed();
@@ -3115,6 +3132,21 @@ fn resolve_upstream_uri_for_request(
         return build_upstream_uri(upstream_base, request_uri).map(Some);
     }
     Ok(forward_proxy_upstream_uri(request_uri))
+}
+
+fn use_http2_prior_knowledge_upstream(upstream_req: &Request<ProxyBody>) -> bool {
+    upstream_req.version() == hyper::Version::HTTP_2
+        && matches!(upstream_req.uri().scheme_str(), Some("http"))
+}
+
+async fn send_upstream_request(
+    state: &ProxyState,
+    upstream_req: Request<ProxyBody>,
+) -> Result<Response<Incoming>, LegacyClientError> {
+    if use_http2_prior_knowledge_upstream(&upstream_req) {
+        return state.h2_upstream_client.request(upstream_req).await;
+    }
+    state.client.request(upstream_req).await
 }
 
 fn forward_proxy_upstream_uri(original: &Uri) -> Option<Uri> {

@@ -2,10 +2,13 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
+    env,
     error::Error as StdError,
+    ffi::OsStr,
     fmt::Write as _,
     future::Future,
     net::SocketAddr,
+    path::Component,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -49,7 +52,7 @@ use crate::{
     ca,
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, QueryMatchMode, RedactConfig,
-        RouteMatchConfig, RouteMode, StreamingConfig,
+        RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
@@ -424,6 +427,21 @@ struct ProxyRoute {
     // Consumed by upcoming redaction storage steps.
     #[allow(dead_code)]
     redact: Option<RedactConfig>,
+    transform: RouteTransformScripts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RouteTransformScripts {
+    on_request: Option<LoadedScript>,
+    on_response: Option<LoadedScript>,
+    on_record: Option<LoadedScript>,
+    on_replay: Option<LoadedScript>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedScript {
+    path: PathBuf,
+    source: Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +454,7 @@ impl ProxyRuntimeConfig {
     fn from_config(config: &Config) -> anyhow::Result<Self> {
         let mut parsed_routes = Vec::with_capacity(config.routes.len());
         for (idx, route) in config.routes.iter().enumerate() {
+            let route_ref = format_route_ref(route, idx);
             let path_regex =
                 match route.path_regex.as_deref() {
                     Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
@@ -460,7 +479,7 @@ impl ProxyRuntimeConfig {
                 RouteMode::Record | RouteMode::PassthroughCache => CacheMissPolicy::Forward,
             });
             parsed_routes.push(ProxyRoute {
-                route_ref: format_route_ref(route, idx),
+                route_ref: route_ref.clone(),
                 path_prefix: route.path_prefix.clone(),
                 path_exact: route.path_exact.clone(),
                 path_regex,
@@ -471,6 +490,11 @@ impl ProxyRuntimeConfig {
                 match_config: route.match_.clone(),
                 streaming: route.streaming.clone(),
                 redact: route.redact.clone(),
+                transform: load_route_transform_scripts(
+                    &route_ref,
+                    route.transform.as_ref(),
+                    config.source_path(),
+                )?,
             });
         }
 
@@ -478,6 +502,107 @@ impl ProxyRuntimeConfig {
             routes: parsed_routes,
             max_body_bytes: config.proxy.max_body_bytes,
         })
+    }
+}
+
+fn load_route_transform_scripts(
+    route_ref: &str,
+    transform: Option<&TransformConfig>,
+    config_source_path: Option<&Path>,
+) -> anyhow::Result<RouteTransformScripts> {
+    let Some(transform) = transform else {
+        return Ok(RouteTransformScripts::default());
+    };
+
+    Ok(RouteTransformScripts {
+        on_request: load_transform_script_for_hook(
+            route_ref,
+            "on_request",
+            transform.on_request.as_deref(),
+            config_source_path,
+        )?,
+        on_response: load_transform_script_for_hook(
+            route_ref,
+            "on_response",
+            transform.on_response.as_deref(),
+            config_source_path,
+        )?,
+        on_record: load_transform_script_for_hook(
+            route_ref,
+            "on_record",
+            transform.on_record.as_deref(),
+            config_source_path,
+        )?,
+        on_replay: load_transform_script_for_hook(
+            route_ref,
+            "on_replay",
+            transform.on_replay.as_deref(),
+            config_source_path,
+        )?,
+    })
+}
+
+fn load_transform_script_for_hook(
+    route_ref: &str,
+    hook_name: &str,
+    script_path: Option<&str>,
+    config_source_path: Option<&Path>,
+) -> anyhow::Result<Option<LoadedScript>> {
+    let Some(script_path) = script_path else {
+        return Ok(None);
+    };
+
+    let script_path = script_path.trim();
+    if script_path.is_empty() {
+        anyhow::bail!("{route_ref}: `routes.transform.{hook_name}` must not be empty");
+    }
+
+    let resolved_path = resolve_transform_script_path(script_path, config_source_path)?;
+    let source = std::fs::read_to_string(&resolved_path).map_err(|err| {
+        anyhow::anyhow!(
+            "{route_ref}: load `routes.transform.{hook_name}` script {}: {err}",
+            resolved_path.display()
+        )
+    })?;
+
+    Ok(Some(LoadedScript {
+        path: resolved_path,
+        source: Arc::from(source),
+    }))
+}
+
+fn resolve_transform_script_path(
+    script_path: &str,
+    config_source_path: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let expanded = expand_tilde_path(Path::new(script_path))?;
+    if expanded.is_absolute() {
+        return Ok(expanded);
+    }
+
+    if let Some(config_source_path) = config_source_path
+        && let Some(config_dir) = config_source_path.parent()
+    {
+        return Ok(config_dir.join(expanded));
+    }
+
+    Ok(expanded)
+}
+
+fn expand_tilde_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(component)) if component == OsStr::new("~") => {
+            let home = env::var_os("HOME").ok_or_else(|| {
+                anyhow::anyhow!("cannot expand `~` in {}: HOME is not set", path.display())
+            })?;
+            let mut expanded = PathBuf::from(home);
+            for component in components {
+                expanded.push(component.as_os_str());
+            }
+            Ok(expanded)
+        }
+        _ => Ok(path.to_path_buf()),
     }
 }
 
@@ -1101,6 +1226,7 @@ fn proxy_route_configs_equal(current: &ProxyRoute, next: &ProxyRoute) -> bool {
         && route_match_configs_equal(current.match_config.as_ref(), next.match_config.as_ref())
         && streaming_configs_equal(current.streaming.as_ref(), next.streaming.as_ref())
         && redact_configs_equal(current.redact.as_ref(), next.redact.as_ref())
+        && current.transform == next.transform
 }
 
 fn route_match_configs_equal(
@@ -4039,6 +4165,7 @@ fn redaction_placeholder(redact: &RedactConfig) -> &str {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -4076,6 +4203,7 @@ mod tests {
             match_config: None,
             streaming: None,
             redact: None,
+            transform: super::RouteTransformScripts::default(),
         }
     }
 
@@ -4315,6 +4443,105 @@ upstream = "http://127.0.0.1:1"
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid `path_regex` expression"));
+    }
+
+    #[test]
+    fn runtime_config_loads_transform_scripts_relative_to_config_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir_all(&scripts_dir).expect("scripts dir should be created");
+        let request_script_path = scripts_dir.join("on_request.lua");
+        let response_script_path = scripts_dir.join("on_response.lua");
+        fs::write(
+            &request_script_path,
+            "function transform(request) return request end",
+        )
+        .expect("request script should be written");
+        fs::write(
+            &response_script_path,
+            "function transform(response) return response end",
+        )
+        .expect("response script should be written");
+        let config_path = temp_dir.path().join("replayproxy.toml");
+        fs::write(
+            &config_path,
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+name = "lua-route"
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+
+[routes.transform]
+on_request = "scripts/on_request.lua"
+on_response = "scripts/on_response.lua"
+"#,
+        )
+        .expect("config should be written");
+
+        let config = Config::from_path(&config_path).expect("config should parse");
+        let runtime = super::ProxyRuntimeConfig::from_config(&config)
+            .expect("runtime config should load scripts");
+        let route = runtime.routes.first().expect("expected one route");
+
+        let loaded_request = route
+            .transform
+            .on_request
+            .as_ref()
+            .expect("on_request should be loaded");
+        let loaded_response = route
+            .transform
+            .on_response
+            .as_ref()
+            .expect("on_response should be loaded");
+
+        assert_eq!(loaded_request.path, request_script_path);
+        assert_eq!(
+            loaded_request.source.as_ref(),
+            "function transform(request) return request end"
+        );
+        assert_eq!(loaded_response.path, response_script_path);
+        assert_eq!(
+            loaded_response.source.as_ref(),
+            "function transform(response) return response end"
+        );
+    }
+
+    #[test]
+    fn runtime_config_fails_fast_when_transform_script_is_missing() {
+        let config = Config::from_toml_str(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[[routes]]
+name = "lua-route"
+path_prefix = "/api"
+upstream = "http://127.0.0.1:1234"
+
+[routes.transform]
+on_request = "scripts/missing.lua"
+"#,
+        )
+        .expect("config should parse");
+
+        let err = super::ProxyRuntimeConfig::from_config(&config)
+            .expect_err("missing scripts should fail fast");
+        let message = err.to_string();
+        assert!(
+            message.contains("routes[0] (lua-route)"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("routes.transform.on_request"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("scripts/missing.lua"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]

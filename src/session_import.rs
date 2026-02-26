@@ -85,6 +85,7 @@ struct ImportRecordingDocument {
 
 #[derive(Debug)]
 struct ParsedImport {
+    manifest_path: PathBuf,
     format: SessionExportFormat,
     recordings: Vec<ParsedImportRecording>,
 }
@@ -111,16 +112,12 @@ pub async fn import_session(
         .await
         .map_err(SessionImportError::Session)?;
 
-    let manifest_path = in_dir.join("index.json");
     let in_dir_for_task = in_dir.clone();
-    let manifest_path_for_task = manifest_path.clone();
-    let parsed_import = tokio::task::spawn_blocking(move || {
-        parse_import_bundle(&in_dir_for_task, &manifest_path_for_task)
-    })
-    .await
-    .map_err(|err| {
-        SessionImportError::Internal(format!("join import parse task failed: {err}"))
-    })??;
+    let parsed_import = tokio::task::spawn_blocking(move || parse_import_bundle(&in_dir_for_task))
+        .await
+        .map_err(|err| {
+            SessionImportError::Internal(format!("join import parse task failed: {err}"))
+        })??;
 
     for parsed_recording in &parsed_import.recordings {
         storage
@@ -139,18 +136,16 @@ pub async fn import_session(
         session: session_name,
         format: parsed_import.format,
         input_dir: in_dir,
-        manifest_path,
+        manifest_path: parsed_import.manifest_path,
         recordings_imported: parsed_import.recordings.len(),
     })
 }
 
-fn parse_import_bundle(
-    in_dir: &Path,
-    manifest_path: &Path,
-) -> Result<ParsedImport, SessionImportError> {
+fn parse_import_bundle(in_dir: &Path) -> Result<ParsedImport, SessionImportError> {
     validate_input_dir(in_dir)?;
-    let manifest = read_manifest(manifest_path)?;
-    validate_manifest(&manifest)?;
+    let manifest_path = resolve_manifest_path(in_dir)?;
+    let manifest = read_manifest(&manifest_path)?;
+    validate_manifest(&manifest, &manifest_path)?;
 
     let mut recordings = Vec::with_capacity(manifest.recordings.len());
     let mut seen_recording_ids = HashSet::new();
@@ -161,8 +156,9 @@ fn parse_import_bundle(
                 entry.id
             )));
         }
+        validate_recording_file_extension(&entry.file, manifest.format)?;
         let recording_path = resolve_recording_path(in_dir, &entry.file)?;
-        let recording = read_recording_document(&recording_path, entry)?;
+        let recording = read_recording_document(&recording_path, entry, manifest.format)?;
         recordings.push(ParsedImportRecording {
             source: recording_path.to_string_lossy().into_owned(),
             recording,
@@ -170,6 +166,7 @@ fn parse_import_bundle(
     }
 
     Ok(ParsedImport {
+        manifest_path: manifest_path.to_path_buf(),
         format: manifest.format,
         recordings,
     })
@@ -198,16 +195,15 @@ fn validate_input_dir(in_dir: &Path) -> Result<(), SessionImportError> {
 }
 
 fn read_manifest(manifest_path: &Path) -> Result<ImportManifest, SessionImportError> {
-    let manifest_bytes = read_json_file(manifest_path, "manifest")?;
-    serde_json::from_slice(&manifest_bytes).map_err(|err| {
-        SessionImportError::InvalidRequest(format!(
-            "parse manifest `{}`: {err}",
-            manifest_path.display()
-        ))
-    })
+    let manifest_format = format_for_path(manifest_path, "manifest")?;
+    let manifest_bytes = read_bundle_file(manifest_path, "manifest")?;
+    deserialize_import_bytes(manifest_format, &manifest_bytes, "manifest", manifest_path)
 }
 
-fn validate_manifest(manifest: &ImportManifest) -> Result<(), SessionImportError> {
+fn validate_manifest(
+    manifest: &ImportManifest,
+    manifest_path: &Path,
+) -> Result<(), SessionImportError> {
     if manifest.version != 1 {
         return Err(SessionImportError::InvalidRequest(format!(
             "unsupported export manifest version `{}`; expected `1`",
@@ -215,10 +211,12 @@ fn validate_manifest(manifest: &ImportManifest) -> Result<(), SessionImportError
         )));
     }
 
-    if manifest.format != SessionExportFormat::Json {
+    let manifest_path_format = format_for_path(manifest_path, "manifest")?;
+    if manifest.format != manifest_path_format {
         return Err(SessionImportError::InvalidRequest(format!(
-            "unsupported export format `{:?}`; expected `json`",
-            manifest.format
+            "manifest format `{}` does not match `{}`",
+            manifest.format,
+            manifest_path.display()
         )));
     }
 
@@ -239,15 +237,11 @@ fn validate_manifest(manifest: &ImportManifest) -> Result<(), SessionImportError
 fn read_recording_document(
     recording_path: &Path,
     entry: &ImportManifestEntry,
+    format: SessionExportFormat,
 ) -> Result<Recording, SessionImportError> {
-    let recording_bytes = read_json_file(recording_path, "recording")?;
+    let recording_bytes = read_bundle_file(recording_path, "recording")?;
     let document: ImportRecordingDocument =
-        serde_json::from_slice(&recording_bytes).map_err(|err| {
-            SessionImportError::InvalidRequest(format!(
-                "parse recording `{}`: {err}",
-                recording_path.display()
-            ))
-        })?;
+        deserialize_import_bytes(format, &recording_bytes, "recording", recording_path)?;
 
     if document.id != entry.id {
         return Err(SessionImportError::InvalidRequest(format!(
@@ -335,7 +329,76 @@ fn resolve_recording_path(
     Ok(in_dir.join(relative))
 }
 
-fn read_json_file(path: &Path, label: &str) -> Result<Vec<u8>, SessionImportError> {
+fn resolve_manifest_path(in_dir: &Path) -> Result<PathBuf, SessionImportError> {
+    let json_path = in_dir.join(SessionExportFormat::Json.manifest_file_name());
+    let yaml_path = in_dir.join(SessionExportFormat::Yaml.manifest_file_name());
+
+    match (json_path.is_file(), yaml_path.is_file()) {
+        (true, false) => Ok(json_path),
+        (false, true) => Ok(yaml_path),
+        (false, false) => Err(SessionImportError::InvalidRequest(format!(
+            "manifest file `{}` or `{}` does not exist",
+            json_path.display(),
+            yaml_path.display()
+        ))),
+        (true, true) => Err(SessionImportError::InvalidRequest(format!(
+            "import input directory `{}` contains both `{}` and `{}`; keep only one manifest",
+            in_dir.display(),
+            SessionExportFormat::Json.manifest_file_name(),
+            SessionExportFormat::Yaml.manifest_file_name()
+        ))),
+    }
+}
+
+fn validate_recording_file_extension(
+    relative_path: &str,
+    format: SessionExportFormat,
+) -> Result<(), SessionImportError> {
+    let expected_ext = format.recording_file_extension();
+    let ext = Path::new(relative_path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            SessionImportError::InvalidRequest(format!(
+                "recording file `{relative_path}` must end with `.{expected_ext}`"
+            ))
+        })?;
+    if ext.eq_ignore_ascii_case(expected_ext) {
+        return Ok(());
+    }
+    Err(SessionImportError::InvalidRequest(format!(
+        "recording file `{relative_path}` must end with `.{expected_ext}`"
+    )))
+}
+
+fn format_for_path(path: &Path, label: &str) -> Result<SessionExportFormat, SessionImportError> {
+    match path.extension().and_then(OsStr::to_str) {
+        Some("json") => Ok(SessionExportFormat::Json),
+        Some("yaml") | Some("yml") => Ok(SessionExportFormat::Yaml),
+        _ => Err(SessionImportError::InvalidRequest(format!(
+            "{label} file `{}` must end with `.json` or `.yaml`",
+            path.display()
+        ))),
+    }
+}
+
+fn deserialize_import_bytes<T: for<'de> Deserialize<'de>>(
+    format: SessionExportFormat,
+    bytes: &[u8],
+    label: &str,
+    path: &Path,
+) -> Result<T, SessionImportError> {
+    match format {
+        SessionExportFormat::Json => serde_json::from_slice(bytes).map_err(|err| {
+            SessionImportError::InvalidRequest(format!("parse {label} `{}`: {err}", path.display()))
+        }),
+        SessionExportFormat::Yaml => serde_yaml::from_slice(bytes).map_err(|err| {
+            SessionImportError::InvalidRequest(format!("parse {label} `{}`: {err}", path.display()))
+        }),
+    }
+}
+
+fn read_bundle_file(path: &Path, label: &str) -> Result<Vec<u8>, SessionImportError> {
     fs::read(path).map_err(|err| match err.kind() {
         ErrorKind::NotFound => SessionImportError::InvalidRequest(format!(
             "{label} file `{}` does not exist",
@@ -349,7 +412,8 @@ fn read_json_file(path: &Path, label: &str) -> Result<Vec<u8>, SessionImportErro
 mod tests {
     use std::path::Path;
 
-    use super::resolve_recording_path;
+    use super::{resolve_manifest_path, resolve_recording_path};
+    use tempfile::tempdir;
 
     #[test]
     fn resolve_recording_path_rejects_non_recordings_prefix() {
@@ -362,5 +426,27 @@ mod tests {
         let err = resolve_recording_path(Path::new("/tmp/export"), "recordings/../../evil.json")
             .unwrap_err();
         assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn resolve_manifest_path_accepts_yaml_manifest() {
+        let dir = tempdir().expect("tempdir should be created");
+        let manifest_path = dir.path().join("index.yaml");
+        std::fs::write(&manifest_path, "version: 1").expect("manifest should be written");
+
+        let resolved = resolve_manifest_path(dir.path()).expect("manifest should resolve");
+        assert_eq!(resolved, manifest_path);
+    }
+
+    #[test]
+    fn resolve_manifest_path_rejects_ambiguous_manifests() {
+        let dir = tempdir().expect("tempdir should be created");
+        std::fs::write(dir.path().join("index.json"), "{}")
+            .expect("json manifest should be written");
+        std::fs::write(dir.path().join("index.yaml"), "{}")
+            .expect("yaml manifest should be written");
+
+        let err = resolve_manifest_path(dir.path()).expect_err("ambiguous manifests should fail");
+        assert!(err.to_string().contains("contains both"));
     }
 }

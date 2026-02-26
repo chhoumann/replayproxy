@@ -1538,7 +1538,7 @@ active_session = "default"
 }
 
 #[tokio::test]
-async fn admin_session_export_endpoint_exports_recordings_and_returns_json_result() {
+async fn admin_session_export_endpoint_honors_yaml_format_and_returns_json_result() {
     let storage_dir = tempfile::tempdir().unwrap();
     let session_name = "default";
     let session_db_path =
@@ -1589,6 +1589,7 @@ active_session = "{session_name}"
         .unwrap();
     let export_payload = serde_json::json!({
         "out_dir": output_dir.to_string_lossy(),
+        "format": "yaml",
     });
     let req = Request::builder()
         .method(Method::POST)
@@ -1604,19 +1605,20 @@ active_session = "{session_name}"
     assert_eq!(body["status"].as_str(), Some("completed"));
     assert_eq!(body["session"].as_str(), Some(session_name));
     assert_eq!(body["recordings_exported"].as_u64(), Some(1));
-    assert_eq!(body["format"].as_str(), Some("json"));
+    assert_eq!(body["format"].as_str(), Some("yaml"));
     assert_eq!(
         body["output_dir"].as_str().map(std::path::PathBuf::from),
         Some(output_dir.clone())
     );
 
     let manifest_path = body["manifest_path"].as_str().map(std::path::PathBuf::from);
-    assert_eq!(manifest_path, Some(output_dir.join("index.json")));
+    assert_eq!(manifest_path, Some(output_dir.join("index.yaml")));
     assert!(manifest_path.as_ref().unwrap().exists());
 
     let manifest_bytes = fs::read(manifest_path.unwrap()).unwrap();
-    let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let manifest: Value = serde_yaml::from_slice(&manifest_bytes).unwrap();
     assert_eq!(manifest["session"].as_str(), Some(session_name));
+    assert_eq!(manifest["format"].as_str(), Some("yaml"));
     assert_eq!(manifest["recordings"].as_array().map(Vec::len), Some(1));
 
     let recordings = fs::read_dir(output_dir.join("recordings"))
@@ -1624,6 +1626,13 @@ active_session = "{session_name}"
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(recordings.len(), 1);
+    assert_eq!(
+        recordings[0]
+            .path()
+            .extension()
+            .and_then(std::ffi::OsStr::to_str),
+        Some("yaml")
+    );
 
     let missing_export_uri: Uri = format!("http://{admin_addr}/_admin/sessions/missing/export")
         .parse()

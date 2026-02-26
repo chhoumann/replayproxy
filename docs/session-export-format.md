@@ -3,14 +3,16 @@
 This document defines the stable on-disk export format used by:
 
 ```bash
-replayproxy session export <name> --format json --out <dir>
+replayproxy session export <name> --format <json|yaml> --out <dir>
 ```
 
-Current format support is JSON only (`--format json`).
+Current format support is JSON (`--format json`) and YAML (`--format yaml`).
 
 ## Directory Layout
 
 Exports are written into a single output directory:
+
+JSON export:
 
 ```text
 <out>/
@@ -21,17 +23,28 @@ Exports are written into a single output directory:
     └── ...
 ```
 
+YAML export:
+
+```text
+<out>/
+├── index.yaml
+└── recordings/
+    ├── 0001-post-v1-chat-completions-id42.yaml
+    ├── 0002-get-v1-models-id43.yaml
+    └── ...
+```
+
 Notes:
 - `<out>` must either not exist (it will be created) or be an empty directory.
-- `index.json` is the manifest.
-- `recordings/` contains one JSON file per recording.
+- `index.json` or `index.yaml` is the manifest.
+- `recordings/` contains one file per recording in the selected format.
 
-## Manifest Schema (`index.json`)
+## Manifest Schema (`index.json` / `index.yaml`)
 
 Required top-level fields:
 - `version` (`number`): format version. Current value is `1`.
 - `session` (`string`): exported session name.
-- `format` (`string`): serialization format. Current value is `"json"`.
+- `format` (`string`): serialization format (`"json"` or `"yaml"`).
 - `exported_at_unix_ms` (`number`): export timestamp in Unix milliseconds.
 - `recordings` (`array`): ordered list of exported recording entries.
 
@@ -43,7 +56,7 @@ Each `recordings[]` entry contains:
 - `response_status` (`number`): HTTP response status code.
 - `created_at_unix_ms` (`number`): recording creation timestamp in Unix milliseconds.
 
-Example (abridged):
+Example (JSON, abridged):
 
 ```json
 {
@@ -64,9 +77,9 @@ Example (abridged):
 }
 ```
 
-## Recording File Schema (`recordings/*.json`)
+## Recording File Schema (`recordings/*.{json|yaml}`)
 
-Each recording file is a JSON object with required fields:
+Each recording file is an object with required fields:
 - `id`
 - `match_key`
 - `request_method`
@@ -80,7 +93,7 @@ Each recording file is a JSON object with required fields:
 
 `request_headers` and `response_headers` are arrays of `[name, value]` pairs where `value` is bytes.
 
-`request_body` and `response_body` are raw bytes serialized as JSON arrays of integers (`0..255`).
+`request_body` and `response_body` are raw bytes serialized in the selected format.
 
 ## Deterministic Ordering And Filenames
 
@@ -95,7 +108,7 @@ Filenames are deterministic and generated from:
 Format:
 
 ```text
-{index:04}-{method_slug}-{uri_slug}-id{id}.json
+{index:04}-{method_slug}-{uri_slug}-id{id}.{json|yaml}
 ```
 
 Rules:

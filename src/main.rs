@@ -74,17 +74,20 @@ enum SessionCommand {
         #[arg(long)]
         admin_addr: Option<SocketAddr>,
     },
-    /// Export a session into JSON files.
+    /// Export a session into JSON or YAML files.
     Export {
         name: String,
         /// Optional output directory. Must not already contain files.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Export format (`json` or `yaml`).
+        #[arg(long, default_value_t = SessionExportFormat::Json)]
+        format: SessionExportFormat,
     },
-    /// Import recordings from exported JSON files into an existing session.
+    /// Import recordings from exported files into an existing session.
     Import {
         name: String,
-        /// Input directory containing `index.json` and `recordings/`.
+        /// Input directory containing `index.json` or `index.yaml` and `recordings/`.
         #[arg(long = "in")]
         input: PathBuf,
     },
@@ -318,13 +321,13 @@ async fn run_session_command(
                 .await?;
             Ok(SessionCommandOutcome::Switched { name, admin_addr })
         }
-        SessionCommand::Export { name, out } => {
+        SessionCommand::Export { name, out, format } => {
             let result = session_export::export_session(
                 &session_manager,
                 SessionExportRequest {
                     session_name: name,
                     out_dir: out,
-                    format: SessionExportFormat::Json,
+                    format,
                 },
             )
             .await
@@ -964,6 +967,32 @@ admin_bind = "127.0.0.2"
             SessionCommand::Export {
                 name: "staging".to_owned(),
                 out: Some(PathBuf::from("./exports/staging")),
+                format: SessionExportFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn session_export_parses_with_yaml_format() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "session",
+            "export",
+            "staging",
+            "--format",
+            "yaml",
+        ])
+        .expect("cli parse should work");
+        let (_, action) = match cli.command {
+            Command::Session { config, action } => (config, action),
+            other => panic!("expected session command, got {other:?}"),
+        };
+        assert_eq!(
+            action,
+            SessionCommand::Export {
+                name: "staging".to_owned(),
+                out: None,
+                format: SessionExportFormat::Yaml,
             }
         );
     }
@@ -1367,6 +1396,7 @@ admin_bind = "127.0.0.2"
             SessionCommand::Export {
                 name: "default".to_owned(),
                 out: Some(export_dir.clone()),
+                format: SessionExportFormat::Json,
             },
         )
         .await
@@ -1437,6 +1467,7 @@ admin_bind = "127.0.0.2"
             SessionCommand::Export {
                 name: "default".to_owned(),
                 out: Some(export_dir.clone()),
+                format: SessionExportFormat::Json,
             },
         )
         .await
@@ -1480,6 +1511,62 @@ admin_bind = "127.0.0.2"
             imported_uris,
             vec!["/v1/chat/completions".to_owned(), "/v1/models".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn session_import_accepts_yaml_exports() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let config = config_with_storage(temp_dir.path(), Some("default"));
+        let manager = SessionManager::from_config(&config)
+            .expect("session manager should initialize")
+            .expect("storage should be configured");
+        manager
+            .create_session("default")
+            .await
+            .expect("default session should be created");
+        manager
+            .create_session("staging")
+            .await
+            .expect("staging session should be created");
+
+        let default_storage = manager
+            .open_session_storage("default")
+            .await
+            .expect("default storage should open");
+        let created_at = Recording::now_unix_ms().expect("timestamp should be available");
+        default_storage
+            .insert_recording(recording_fixture("a", "GET", "/v1/models", created_at))
+            .await
+            .expect("insert should succeed");
+
+        let export_dir = temp_dir.path().join("exports").join("default-yaml");
+        run_session_command(
+            &config,
+            SessionCommand::Export {
+                name: "default".to_owned(),
+                out: Some(export_dir.clone()),
+                format: SessionExportFormat::Yaml,
+            },
+        )
+        .await
+        .expect("session export should succeed");
+
+        let outcome = run_session_command(
+            &config,
+            SessionCommand::Import {
+                name: "staging".to_owned(),
+                input: export_dir.clone(),
+            },
+        )
+        .await
+        .expect("session import should succeed");
+        let result = match outcome {
+            SessionCommandOutcome::Imported { result } => result,
+            other => panic!("expected imported outcome, got {other:?}"),
+        };
+        assert_eq!(result.format, SessionExportFormat::Yaml);
+        assert_eq!(result.manifest_path, export_dir.join("index.yaml"));
+        assert_eq!(result.recordings_imported, 1);
     }
 
     #[tokio::test]

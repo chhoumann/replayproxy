@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +19,49 @@ const EXPORT_LIST_PAGE_SIZE: usize = 256;
 pub enum SessionExportFormat {
     #[default]
     Json,
+    #[serde(alias = "yml")]
+    Yaml,
+}
+
+impl SessionExportFormat {
+    pub fn manifest_file_name(self) -> &'static str {
+        match self {
+            Self::Json => "index.json",
+            Self::Yaml => "index.yaml",
+        }
+    }
+
+    pub fn recording_file_extension(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionExportFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json => f.write_str("json"),
+            Self::Yaml => f.write_str("yaml"),
+        }
+    }
+}
+
+impl FromStr for SessionExportFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("json") {
+            return Ok(Self::Json);
+        }
+        if value.eq_ignore_ascii_case("yaml") || value.eq_ignore_ascii_case("yml") {
+            return Ok(Self::Yaml);
+        }
+        Err(format!(
+            "unsupported export format `{value}`; expected one of: json, yaml"
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +245,7 @@ fn write_export(
             export_recording.id,
             &export_recording.recording.request_method,
             &export_recording.recording.request_uri,
+            format,
         );
         let relative_file = Path::new("recordings").join(&file_name);
         let file_path = output_dir.join(&relative_file);
@@ -214,7 +259,7 @@ fn write_export(
             id: export_recording.id,
             recording: export_recording.recording,
         };
-        let document_bytes = serde_json::to_vec_pretty(&document).map_err(|err| {
+        let document_bytes = serialize_export_bytes(format, &document).map_err(|err| {
             SessionExportError::Internal(format!(
                 "serialize recording `{}` for export: {err}",
                 document.id
@@ -244,8 +289,8 @@ fn write_export(
         exported_at_unix_ms,
         recordings: manifest_entries,
     };
-    let manifest_path = output_dir.join("index.json");
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|err| {
+    let manifest_path = output_dir.join(format.manifest_file_name());
+    let manifest_bytes = serialize_export_bytes(format, &manifest).map_err(|err| {
         SessionExportError::Internal(format!(
             "serialize export manifest for session `{session_name}`: {err}"
         ))
@@ -325,10 +370,34 @@ fn unix_timestamp_ms() -> i64 {
     }
 }
 
-fn recording_file_name(index: usize, id: i64, method: &str, uri: &str) -> String {
+fn serialize_export_bytes<T: Serialize>(
+    format: SessionExportFormat,
+    value: &T,
+) -> Result<Vec<u8>, String> {
+    match format {
+        SessionExportFormat::Json => {
+            serde_json::to_vec_pretty(value).map_err(|err| err.to_string())
+        }
+        SessionExportFormat::Yaml => serde_yaml::to_string(value)
+            .map(|value| value.into_bytes())
+            .map_err(|err| err.to_string()),
+    }
+}
+
+fn recording_file_name(
+    index: usize,
+    id: i64,
+    method: &str,
+    uri: &str,
+    format: SessionExportFormat,
+) -> String {
     let method_slug = slug_ascii(method, 16, "request");
     let uri_slug = slug_ascii(uri, 48, "path");
-    format!("{:04}-{method_slug}-{uri_slug}-id{id}.json", index + 1)
+    format!(
+        "{:04}-{method_slug}-{uri_slug}-id{id}.{}",
+        index + 1,
+        format.recording_file_extension()
+    )
 }
 
 fn slug_ascii(value: &str, max_len: usize, fallback: &str) -> String {
@@ -357,11 +426,17 @@ fn slug_ascii(value: &str, max_len: usize, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{recording_file_name, slug_ascii};
+    use super::{SessionExportFormat, recording_file_name, slug_ascii};
 
     #[test]
     fn recording_file_name_is_deterministic() {
-        let file_name = recording_file_name(0, 42, "POST", "/v1/chat/completions?stream=true");
+        let file_name = recording_file_name(
+            0,
+            42,
+            "POST",
+            "/v1/chat/completions?stream=true",
+            SessionExportFormat::Json,
+        );
         assert_eq!(
             file_name,
             "0001-post-v1-chat-completions-stream-true-id42.json"
@@ -369,8 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn recording_file_name_uses_format_extension() {
+        let file_name = recording_file_name(
+            0,
+            42,
+            "POST",
+            "/v1/chat/completions?stream=true",
+            SessionExportFormat::Yaml,
+        );
+        assert_eq!(
+            file_name,
+            "0001-post-v1-chat-completions-stream-true-id42.yaml"
+        );
+    }
+
+    #[test]
     fn recording_file_name_uses_fallback_slugs() {
-        let file_name = recording_file_name(3, 9, "***", "////");
+        let file_name = recording_file_name(3, 9, "***", "////", SessionExportFormat::Json);
         assert_eq!(file_name, "0004-request-path-id9.json");
     }
 

@@ -8,7 +8,7 @@ default = ["watch"]
 grpc = ["dep:prost", "dep:prost-reflect"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 scripting = ["dep:mlua"]
-tls = ["dep:rustls", "dep:rcgen"]
+tls = ["dep:rustls"]
 watch = ["dep:notify"]
 websocket = ["dep:tokio-tungstenite"]
 
@@ -25,7 +25,7 @@ mlua = { version = "0.11", default-features = false, features = ["luau", "vendor
 notify = { version = "8", optional = true }
 prost = { version = "0.14", optional = true }
 prost-reflect = { version = "0.16", optional = true }
-rcgen = { version = "0.14", optional = true }
+rcgen = "0.14"
 regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled"] }

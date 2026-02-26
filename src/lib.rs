@@ -1,3 +1,4 @@
+pub mod ca;
 pub mod config;
 pub(crate) mod legacy_redaction;
 pub mod logging;

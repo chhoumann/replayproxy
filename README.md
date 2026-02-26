@@ -204,6 +204,11 @@ replayproxy mode set record --config ./replayproxy.toml --admin-addr 127.0.0.1:8
 # recordings
 replayproxy recording list --config ./replayproxy.toml
 replayproxy recording search "GET /api/get" --config ./replayproxy.toml
+
+# local CA management
+replayproxy ca generate
+replayproxy ca install
+replayproxy ca export --out ./replayproxy-ca.pem
 ```
 
 `mode set` changes the running proxy immediately through `/_admin/mode`; `--persist` also writes

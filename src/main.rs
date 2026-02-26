@@ -15,6 +15,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use replayproxy::{
+    ca::{self, CaInstallResult},
     config::{Config, RouteMode},
     logging, session,
     session_export::{self, SessionExportFormat, SessionExportRequest, SessionExportResult},
@@ -70,6 +71,11 @@ enum Command {
         config: Option<PathBuf>,
         #[command(subcommand)]
         action: ModeCommand,
+    },
+    /// Manage local replayproxy CA material.
+    Ca {
+        #[command(subcommand)]
+        action: CaCommand,
     },
 }
 
@@ -165,6 +171,37 @@ enum ModeCommand {
     },
 }
 
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum CaCommand {
+    /// Generate a local root CA keypair.
+    Generate {
+        /// Optional CA directory. Defaults to `~/.replayproxy/ca`.
+        #[arg(long)]
+        ca_dir: Option<PathBuf>,
+        /// Overwrite existing CA material if present.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Best-effort trust-store installation for the generated CA cert.
+    Install {
+        /// Optional CA directory. Defaults to `~/.replayproxy/ca`.
+        #[arg(long)]
+        ca_dir: Option<PathBuf>,
+    },
+    /// Export the generated CA certificate for manual installation.
+    Export {
+        /// Optional CA directory. Defaults to `~/.replayproxy/ca`.
+        #[arg(long)]
+        ca_dir: Option<PathBuf>,
+        /// Output path for exported CA certificate.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite output path when it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionCommandOutcome {
     Listed {
@@ -222,6 +259,20 @@ enum ModeCommandOutcome {
         admin_addr: SocketAddr,
         state: AdminModeState,
         persisted_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CaCommandOutcome {
+    Generated {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
+    Installed {
+        result: CaInstallResult,
+    },
+    Exported {
+        output_path: PathBuf,
     },
 }
 
@@ -728,6 +779,30 @@ async fn run_mode_command(
     }
 }
 
+fn run_ca_command(command: CaCommand) -> anyhow::Result<CaCommandOutcome> {
+    match command {
+        CaCommand::Generate { ca_dir, force } => {
+            let ca_dir = ca::resolve_ca_dir(ca_dir.as_deref())?;
+            let generated = ca::generate_ca(&ca_dir, force)?;
+            Ok(CaCommandOutcome::Generated {
+                cert_path: generated.cert_path,
+                key_path: generated.key_path,
+            })
+        }
+        CaCommand::Install { ca_dir } => {
+            let ca_dir = ca::resolve_ca_dir(ca_dir.as_deref())?;
+            let result = ca::install_ca_cert(&ca_dir)?;
+            Ok(CaCommandOutcome::Installed { result })
+        }
+        CaCommand::Export { ca_dir, out, force } => {
+            let ca_dir = ca::resolve_ca_dir(ca_dir.as_deref())?;
+            let out_path = out.unwrap_or_else(|| PathBuf::from(ca::DEFAULT_EXPORT_CERT_FILE_NAME));
+            let output_path = ca::export_ca_cert(&ca_dir, &out_path, force)?;
+            Ok(CaCommandOutcome::Exported { output_path })
+        }
+    }
+}
+
 fn print_session_command_outcome(outcome: SessionCommandOutcome) {
     match outcome {
         SessionCommandOutcome::Listed {
@@ -795,6 +870,31 @@ fn print_mode_command_outcome(outcome: ModeCommandOutcome) {
                     persisted_path.display()
                 );
             }
+        }
+    }
+}
+
+fn print_ca_command_outcome(outcome: CaCommandOutcome) {
+    match outcome {
+        CaCommandOutcome::Generated {
+            cert_path,
+            key_path,
+        } => {
+            println!("generated CA certificate at {}", cert_path.display());
+            println!("generated CA private key at {}", key_path.display());
+        }
+        CaCommandOutcome::Installed { result } => match result {
+            CaInstallResult::Installed { method, details } => {
+                println!("{details}");
+                println!("installation method: `{method}`");
+            }
+            CaInstallResult::Manual { details } => {
+                println!("automatic CA install did not complete");
+                println!("{details}");
+            }
+        },
+        CaCommandOutcome::Exported { output_path } => {
+            println!("exported CA certificate to {}", output_path.display());
         }
     }
 }
@@ -880,6 +980,10 @@ async fn main() -> anyhow::Result<()> {
             let outcome = run_mode_command(&config, action).await?;
             print_mode_command_outcome(outcome);
         }
+        Command::Ca { action } => {
+            let outcome = run_ca_command(action)?;
+            print_ca_command_outcome(outcome);
+        }
     }
 
     Ok(())
@@ -945,8 +1049,8 @@ mod tests {
     };
 
     use super::{
-        Cli, Command, ModeCommand, ModeCommandOutcome, RecordingCommand, RecordingCommandOutcome,
-        SessionCommand, SessionCommandOutcome, encode_uri_path_segment,
+        CaCommand, Cli, Command, ModeCommand, ModeCommandOutcome, RecordingCommand,
+        RecordingCommandOutcome, SessionCommand, SessionCommandOutcome, encode_uri_path_segment,
         parse_recording_search_query, redact_active_session, redact_if_present,
         resolve_admin_addr_for_mode, resolve_admin_addr_for_switch, run_mode_command,
         run_recording_command, run_session_command, startup_summary, update_proxy_mode_in_toml,
@@ -1351,6 +1455,77 @@ admin_bind = "127.0.0.2"
                 mode: RouteMode::Replay,
                 admin_addr: Some("127.0.0.1:9090".parse().unwrap()),
                 persist: true,
+            }
+        );
+    }
+
+    #[test]
+    fn ca_generate_parses_with_dir_and_force() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "ca",
+            "generate",
+            "--ca-dir",
+            "/tmp/replayproxy/ca",
+            "--force",
+        ])
+        .expect("cli parse should work");
+        let action = match cli.command {
+            Command::Ca { action } => action,
+            other => panic!("expected ca command, got {other:?}"),
+        };
+        assert_eq!(
+            action,
+            CaCommand::Generate {
+                ca_dir: Some(PathBuf::from("/tmp/replayproxy/ca")),
+                force: true
+            }
+        );
+    }
+
+    #[test]
+    fn ca_install_parses_with_optional_dir() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "ca",
+            "install",
+            "--ca-dir",
+            "/tmp/replayproxy/ca",
+        ])
+        .expect("cli parse should work");
+        let action = match cli.command {
+            Command::Ca { action } => action,
+            other => panic!("expected ca command, got {other:?}"),
+        };
+        assert_eq!(
+            action,
+            CaCommand::Install {
+                ca_dir: Some(PathBuf::from("/tmp/replayproxy/ca"))
+            }
+        );
+    }
+
+    #[test]
+    fn ca_export_parses_with_out_and_force() {
+        let cli = Cli::try_parse_from([
+            "replayproxy",
+            "ca",
+            "export",
+            "--out",
+            "./replayproxy-ca.pem",
+            "--force",
+        ])
+        .expect("cli parse should work");
+        let action = match cli.command {
+            Command::Ca { action } => action,
+            other => panic!("expected ca command, got {other:?}"),
+        };
+        assert_eq!(
+            action,
+            CaCommand::Export {
+                ca_dir: None,
+                out: Some(PathBuf::from("./replayproxy-ca.pem")),
+                force: true
             }
         );
     }

@@ -25,7 +25,9 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnectionBuilder,
 };
-use replayproxy::storage::{Recording, ResponseChunk, Storage};
+use replayproxy::storage::{
+    Recording, ResponseChunk, Storage, WebSocketFrameDirection, WebSocketMessageType,
+};
 use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -462,6 +464,7 @@ cache_miss = "error"
 }
 
 #[tokio::test]
+#[cfg(feature = "grpc")]
 async fn grpc_proto_aware_record_then_replay_matches_selected_fields() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_grpc_upstream().await;
 
@@ -1481,6 +1484,87 @@ recording_mode = "bidirectional"
     ws_stream.close(None).await.unwrap();
     proxy.shutdown().await;
     let _ = upstream_shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_record_mode_server_only_records_only_server_to_client_frames() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_websocket_upstream().await;
+    let storage_dir = tempfile::tempdir().unwrap();
+    let session = "default";
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "{session}"
+
+[[routes]]
+path_prefix = "/ws"
+upstream = "http://{upstream_addr}"
+mode = "record"
+
+[routes.websocket]
+recording_mode = "server-only"
+"#,
+        storage_dir.path().display(),
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let ws_url = format!("ws://{}/ws/echo", proxy.listen_addr);
+    let (mut ws_stream, response) = connect_async(ws_url).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let Some(Ok(Message::Text(greeting))) = ws_stream.next().await else {
+        panic!("expected upstream greeting frame");
+    };
+    assert_eq!(greeting.to_string(), "upstream-ready");
+
+    ws_stream
+        .send(Message::Text("hello-proxy".into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(ack))) = ws_stream.next().await else {
+        panic!("expected upstream ack frame");
+    };
+    assert_eq!(ack.to_string(), "ack:hello-proxy");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured, "hello-proxy");
+
+    ws_stream.close(None).await.unwrap();
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+
+    let db_path = storage_dir.path().join(session).join("recordings.db");
+    let storage = Storage::open(db_path).unwrap();
+    let mut recordings = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..40 {
+        recordings = storage.list_recordings(0, 10).await.unwrap();
+        if let Some(recording) = recordings.first() {
+            frames = storage.get_websocket_frames(recording.id).await.unwrap();
+            if frames.len() == 2 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].frame_index, 0);
+    assert_eq!(frames[1].frame_index, 1);
+    assert!(frames[0].offset_ms <= frames[1].offset_ms);
+    assert_eq!(frames[0].direction, WebSocketFrameDirection::ServerToClient);
+    assert_eq!(frames[1].direction, WebSocketFrameDirection::ServerToClient);
+    assert_eq!(frames[0].message_type, WebSocketMessageType::Text);
+    assert_eq!(frames[1].message_type, WebSocketMessageType::Text);
+    assert_eq!(frames[0].payload, b"upstream-ready".to_vec());
+    assert_eq!(frames[1].payload, b"ack:hello-proxy".to_vec());
 }
 
 #[tokio::test]
@@ -6484,6 +6568,7 @@ async fn spawn_grpc_upstream() -> (
     (addr, rx, move || join)
 }
 
+#[cfg(feature = "grpc")]
 fn grpc_unary_frame(payload: &[u8]) -> Bytes {
     let mut framed = Vec::with_capacity(payload.len() + 5);
     framed.push(0);
@@ -6492,6 +6577,7 @@ fn grpc_unary_frame(payload: &[u8]) -> Bytes {
     Bytes::from(framed)
 }
 
+#[cfg(feature = "grpc")]
 fn encode_predict_request(model_name: &str, input_text: &str, trace_id: &str) -> Vec<u8> {
     let mut encoded = Vec::new();
     encode_proto_string_field(1, model_name, &mut encoded);
@@ -6500,12 +6586,14 @@ fn encode_predict_request(model_name: &str, input_text: &str, trace_id: &str) ->
     encoded
 }
 
+#[cfg(feature = "grpc")]
 fn encode_proto_string_field(field_number: u32, value: &str, out: &mut Vec<u8>) {
     encode_varint(((field_number << 3) | 2).into(), out);
     encode_varint(value.len() as u64, out);
     out.extend_from_slice(value.as_bytes());
 }
 
+#[cfg(feature = "grpc")]
 fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push((value as u8) | 0x80);

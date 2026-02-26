@@ -20,6 +20,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
@@ -62,14 +63,15 @@ use crate::{
     config::{
         BodyOversizePolicy, CacheMissPolicy, Config, GrpcConfig, QueryMatchMode, RateLimitConfig,
         RedactConfig, RouteMatchConfig, RouteMode, StreamingConfig, TransformConfig,
-        WebSocketConfig, grpc_match_field_to_json_path,
+        WebSocketConfig, WebSocketRecordingMode, grpc_match_field_to_json_path,
     },
     matching,
     session_export::{self, SessionExportError, SessionExportFormat, SessionExportRequest},
     session_import::{self, SessionImportError, SessionImportRequest},
     storage::{
         Recording, RecordingSearch, RecordingSummary, ResponseChunk, SessionManager,
-        SessionManagerError, Storage, StoredRecording,
+        SessionManagerError, Storage, StoredRecording, WebSocketFrame, WebSocketFrameDirection,
+        WebSocketMessageType,
     },
 };
 
@@ -1061,6 +1063,23 @@ impl CacheLogOutcome {
 struct ActiveSessionRuntime {
     active_session: String,
     storage: Option<Storage>,
+}
+
+#[derive(Debug, Clone)]
+struct WebSocketRecordingTarget {
+    storage: Storage,
+    recording_id: i64,
+    recording_mode: WebSocketRecordingMode,
+}
+
+#[derive(Debug)]
+struct PendingWebSocketRecording {
+    storage: Storage,
+    recording_mode: WebSocketRecordingMode,
+    match_key: String,
+    request_method: String,
+    request_uri: String,
+    request_headers: Vec<(String, Vec<u8>)>,
 }
 
 impl ActiveSessionRuntime {
@@ -2386,6 +2405,7 @@ fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
     media_type == "application/grpc" || media_type.starts_with("application/grpc+")
 }
 
+#[cfg(feature = "grpc")]
 fn grpc_path_service_and_method(path: &str) -> Option<(&str, &str)> {
     let path = path.strip_prefix('/')?;
     let mut segments = path.split('/');
@@ -2631,6 +2651,60 @@ async fn proxy_handler(
             );
         }
 
+        let websocket_recording_mode = route
+            .websocket
+            .as_ref()
+            .and_then(|websocket| websocket.recording_mode)
+            .unwrap_or(WebSocketRecordingMode::Bidirectional);
+        let pending_websocket_recording =
+            if matches!(route.mode, RouteMode::Record | RouteMode::PassthroughCache)
+                && websocket_recording_mode == WebSocketRecordingMode::ServerOnly
+            {
+                let ActiveSessionRuntime {
+                    active_session: _,
+                    storage: active_storage,
+                } = state.active_session_snapshot();
+                if let Some(storage) = active_storage {
+                    let websocket_match_key = match matching::compute_match_key(
+                        route.match_config.as_ref(),
+                        req.method(),
+                        req.uri(),
+                        req.headers(),
+                        &[],
+                    ) {
+                        Ok(match_key) => match_key,
+                        Err(err) => {
+                            tracing::debug!(error_kind = err.kind(), "failed to compute match key");
+                            let (status, message) = match err {
+                                matching::MatchKeyError::InvalidJsonBody(_) => (
+                                    StatusCode::BAD_REQUEST,
+                                    "invalid JSON request body for matching",
+                                ),
+                                matching::MatchKeyError::InvalidJsonPath { .. }
+                                | matching::MatchKeyError::SerializeJsonNode { .. } => (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "invalid route JSONPath matching configuration",
+                                ),
+                            };
+                            respond!(None, proxy_simple_response(status, message));
+                        }
+                    };
+
+                    Some(PendingWebSocketRecording {
+                        storage,
+                        recording_mode: websocket_recording_mode,
+                        match_key: websocket_match_key,
+                        request_method: req.method().to_string(),
+                        request_uri: request_uri_for_recording(req.uri()),
+                        request_headers: header_map_to_vec(req.headers()),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let upstream_uri = match resolve_upstream_uri_for_request(&route, req.uri()) {
             Ok(Some(uri)) => uri,
             Ok(None) => {
@@ -2688,12 +2762,80 @@ async fn proxy_handler(
         let upstream_latency = upstream_started_at.elapsed();
 
         if upstream_res.status() == StatusCode::SWITCHING_PROTOCOLS {
+            let websocket_recording_target =
+                if let Some(pending_websocket_recording) = pending_websocket_recording {
+                    let created_at_unix_ms = match Recording::now_unix_ms() {
+                        Ok(ts) => ts,
+                        Err(err) => {
+                            tracing::debug!("failed to compute recording timestamp: {err}");
+                            respond!(
+                                Some(upstream_latency),
+                                proxy_simple_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "failed to persist recording",
+                                )
+                            );
+                        }
+                    };
+
+                    let mut recording = Recording {
+                        match_key: pending_websocket_recording.match_key,
+                        request_method: pending_websocket_recording.request_method,
+                        request_uri: pending_websocket_recording.request_uri,
+                        request_headers: pending_websocket_recording.request_headers,
+                        request_body: Vec::new(),
+                        response_status: upstream_res.status().as_u16(),
+                        response_headers: header_map_to_vec(upstream_res.headers()),
+                        response_body: Vec::new(),
+                        created_at_unix_ms,
+                    };
+                    recording.request_headers =
+                        redact_recording_headers(recording.request_headers, route.redact.as_ref());
+                    recording.response_headers =
+                        redact_recording_headers(recording.response_headers, route.redact.as_ref());
+                    recording.request_body = redact_recording_body_json(
+                        recording.request_body.as_slice(),
+                        route.redact.as_ref(),
+                    );
+                    recording.response_body = redact_recording_body_json(
+                        recording.response_body.as_slice(),
+                        route.redact.as_ref(),
+                    );
+
+                    match pending_websocket_recording
+                        .storage
+                        .insert_recording(recording)
+                        .await
+                    {
+                        Ok(recording_id) => {
+                            state.status.increment_active_session_recordings_total();
+                            Some(WebSocketRecordingTarget {
+                                storage: pending_websocket_recording.storage,
+                                recording_id,
+                                recording_mode: pending_websocket_recording.recording_mode,
+                            })
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                route = %route.route_ref,
+                                "failed to persist websocket handshake recording: {err}",
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
             let upstream_on_upgrade = hyper::upgrade::on(&mut upstream_res);
             let websocket_route_ref = route.route_ref.clone();
             tokio::spawn(async move {
-                if let Err(err) =
-                    tunnel_websocket_upgraded_connections(client_on_upgrade, upstream_on_upgrade)
-                        .await
+                if let Err(err) = tunnel_websocket_upgraded_connections(
+                    client_on_upgrade,
+                    upstream_on_upgrade,
+                    websocket_recording_target,
+                )
+                .await
                 {
                     tracing::debug!(
                         route = %websocket_route_ref,
@@ -3900,6 +4042,7 @@ async fn tunnel_upgraded_connection(
 async fn tunnel_websocket_upgraded_connections(
     client_on_upgrade: hyper::upgrade::OnUpgrade,
     upstream_on_upgrade: hyper::upgrade::OnUpgrade,
+    websocket_recording: Option<WebSocketRecordingTarget>,
 ) -> anyhow::Result<()> {
     let client_upgraded = client_on_upgrade
         .await
@@ -3907,12 +4050,168 @@ async fn tunnel_websocket_upgraded_connections(
     let upstream_upgraded = upstream_on_upgrade
         .await
         .map_err(|err| anyhow::anyhow!("upgrade upstream websocket connection: {err}"))?;
-    let mut client_upgraded = TokioIo::new(client_upgraded);
-    let mut upstream_upgraded = TokioIo::new(upstream_upgraded);
-    tokio::io::copy_bidirectional(&mut client_upgraded, &mut upstream_upgraded)
-        .await
-        .map_err(|err| anyhow::anyhow!("copy websocket upgraded bytes: {err}"))?;
+    let mut client_websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(client_upgraded),
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    let mut upstream_websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(upstream_upgraded),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let recording_mode = websocket_recording
+        .as_ref()
+        .map(|recording| recording.recording_mode);
+    let mut recorded_frames = Vec::new();
+    let mut next_frame_index: u32 = 0;
+    let websocket_started_at = Instant::now();
+    let mut relay_error: Option<anyhow::Error> = None;
+
+    loop {
+        tokio::select! {
+            client_message = client_websocket.next() => {
+                let Some(client_message) = client_message else {
+                    break;
+                };
+                let client_message = match client_message {
+                    Ok(message) => message,
+                    Err(err) if websocket_is_closed_error(&err) => break,
+                    Err(err) => {
+                        relay_error = Some(anyhow::anyhow!("read client websocket message: {err}"));
+                        break;
+                    }
+                };
+                maybe_record_websocket_message(
+                    &mut recorded_frames,
+                    &mut next_frame_index,
+                    recording_mode,
+                    WebSocketFrameDirection::ClientToServer,
+                    websocket_started_at,
+                    &client_message,
+                );
+                let is_close = client_message.is_close();
+                if let Err(err) = upstream_websocket.send(client_message).await {
+                    if websocket_is_closed_error(&err) {
+                        break;
+                    }
+                    relay_error = Some(anyhow::anyhow!("write websocket message to upstream: {err}"));
+                    break;
+                }
+                if is_close {
+                    break;
+                }
+            }
+            upstream_message = upstream_websocket.next() => {
+                let Some(upstream_message) = upstream_message else {
+                    break;
+                };
+                let upstream_message = match upstream_message {
+                    Ok(message) => message,
+                    Err(err) if websocket_is_closed_error(&err) => break,
+                    Err(err) => {
+                        relay_error = Some(anyhow::anyhow!("read upstream websocket message: {err}"));
+                        break;
+                    }
+                };
+                maybe_record_websocket_message(
+                    &mut recorded_frames,
+                    &mut next_frame_index,
+                    recording_mode,
+                    WebSocketFrameDirection::ServerToClient,
+                    websocket_started_at,
+                    &upstream_message,
+                );
+                let is_close = upstream_message.is_close();
+                if let Err(err) = client_websocket.send(upstream_message).await {
+                    if websocket_is_closed_error(&err) {
+                        break;
+                    }
+                    relay_error = Some(anyhow::anyhow!("write websocket message to client: {err}"));
+                    break;
+                }
+                if is_close {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(websocket_recording) = websocket_recording
+        && let Err(err) = websocket_recording
+            .storage
+            .insert_websocket_frames(websocket_recording.recording_id, recorded_frames)
+            .await
+    {
+        tracing::debug!(
+            recording_id = websocket_recording.recording_id,
+            "failed to persist websocket frames: {err}",
+        );
+    }
+
+    if let Some(relay_error) = relay_error {
+        return Err(relay_error);
+    }
+
     Ok(())
+}
+
+fn websocket_is_closed_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+    matches!(
+        err,
+        tokio_tungstenite::tungstenite::Error::ConnectionClosed
+            | tokio_tungstenite::tungstenite::Error::AlreadyClosed
+    )
+}
+
+fn maybe_record_websocket_message(
+    recorded_frames: &mut Vec<WebSocketFrame>,
+    next_frame_index: &mut u32,
+    recording_mode: Option<WebSocketRecordingMode>,
+    direction: WebSocketFrameDirection,
+    websocket_started_at: Instant,
+    message: &tokio_tungstenite::tungstenite::Message,
+) {
+    let Some(recording_mode) = recording_mode else {
+        return;
+    };
+    if recording_mode == WebSocketRecordingMode::ServerOnly
+        && direction == WebSocketFrameDirection::ClientToServer
+    {
+        return;
+    }
+    let Some((message_type, payload)) = websocket_message_payload_for_recording(message) else {
+        return;
+    };
+
+    let frame_index = *next_frame_index;
+    *next_frame_index = next_frame_index.saturating_add(1);
+    let offset_ms = u64::try_from(websocket_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    recorded_frames.push(WebSocketFrame {
+        frame_index,
+        offset_ms,
+        direction,
+        message_type,
+        payload,
+    });
+}
+
+fn websocket_message_payload_for_recording(
+    message: &tokio_tungstenite::tungstenite::Message,
+) -> Option<(WebSocketMessageType, Vec<u8>)> {
+    match message {
+        tokio_tungstenite::tungstenite::Message::Text(text) => Some((
+            WebSocketMessageType::Text,
+            text.as_str().as_bytes().to_vec(),
+        )),
+        tokio_tungstenite::tungstenite::Message::Binary(payload) => {
+            Some((WebSocketMessageType::Binary, payload.to_vec()))
+        }
+        _ => None,
+    }
 }
 
 fn normalize_tunneled_https_request_uri(

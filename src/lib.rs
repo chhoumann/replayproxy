@@ -4,6 +4,8 @@ pub(crate) mod legacy_redaction;
 pub mod logging;
 pub mod matching;
 pub mod proxy;
+#[cfg(feature = "scripting")]
+pub mod scripting;
 pub mod session;
 pub mod session_export;
 pub mod session_import;

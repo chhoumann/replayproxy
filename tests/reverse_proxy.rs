@@ -144,6 +144,97 @@ upstream = "http://{upstream_addr}"
     let _ = upstream_shutdown().await;
 }
 
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn on_request_script_mutates_request_before_matching_and_forwarding() {
+    let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage_dir = temp_dir.path().join("storage");
+    fs::create_dir_all(&storage_dir).unwrap();
+    let script_path = temp_dir.path().join("on_request.lua");
+    fs::write(
+        &script_path,
+        r#"
+function transform(request)
+  request.headers["x-cache-key"] = "canonical"
+  request.body = "normalized-body"
+  return request
+end
+"#,
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[storage]
+path = "{}"
+active_session = "default"
+
+[[routes]]
+path_prefix = "/api"
+upstream = "http://{upstream_addr}"
+mode = "passthrough-cache"
+
+[routes.transform]
+on_request = "{}"
+"#,
+        storage_dir.display(),
+        script_path.display()
+    );
+    let config = replayproxy::config::Config::from_toml_str(&config_toml).unwrap();
+    let proxy = replayproxy::proxy::serve(&config).await.unwrap();
+
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let proxy_uri: Uri = format!("http://{}/api/cache", proxy.listen_addr)
+        .parse()
+        .unwrap();
+
+    let first_req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri.clone())
+        .header("x-cache-key", "first")
+        .body(Full::new(Bytes::from_static(b"client-body-a")))
+        .unwrap();
+    let first_res = client.request(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::CREATED);
+    let first_body = first_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], b"upstream-body");
+
+    let captured = upstream_rx.recv().await.unwrap();
+    assert_eq!(captured.uri.path(), "/api/cache");
+    assert_eq!(
+        captured.headers.get("x-cache-key").unwrap(),
+        &HeaderValue::from_static("canonical")
+    );
+    assert_eq!(&captured.body[..], b"normalized-body");
+
+    let second_req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy_uri)
+        .header("x-cache-key", "second")
+        .body(Full::new(Bytes::from_static(b"client-body-b")))
+        .unwrap();
+    let second_res = client.request(second_req).await.unwrap();
+    assert_eq!(second_res.status(), StatusCode::CREATED);
+    let second_body = second_res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&second_body[..], b"upstream-body");
+
+    assert!(
+        upstream_rx.recv().await.is_none(),
+        "second request should be replayed from cache without hitting upstream"
+    );
+
+    proxy.shutdown().await;
+    let _ = upstream_shutdown().await;
+}
+
 #[tokio::test]
 async fn forward_proxy_forwards_absolute_form_request_without_configured_upstream() {
     let (upstream_addr, mut upstream_rx, upstream_shutdown) = spawn_upstream().await;

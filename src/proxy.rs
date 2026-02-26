@@ -48,6 +48,8 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
+#[cfg(feature = "scripting")]
+use crate::scripting::{ScriptRequest, run_on_request_script};
 use crate::{
     ca,
     config::{
@@ -2136,35 +2138,14 @@ async fn proxy_handler(
         }
     }
 
-    let upstream_uri = if let Some(upstream_base) = route.upstream.as_ref() {
-        match build_upstream_uri(upstream_base, req.uri()) {
-            Ok(uri) => uri,
-            Err(err) => {
-                tracing::debug!("failed to build upstream uri: {err}");
-                respond!(
-                    None,
-                    proxy_simple_response(
-                        StatusCode::BAD_GATEWAY,
-                        "failed to build upstream request",
-                    )
-                );
-            }
-        }
-    } else if let Some(uri) = forward_proxy_upstream_uri(req.uri()) {
-        uri
-    } else {
-        respond!(
-            None,
-            proxy_simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
-        );
-    };
-
+    let has_on_request_transform = route.transform.on_request.is_some();
     let request_content_length = parse_content_length(req.headers());
     let request_known_oversize = request_content_length
         .map(|len| len > bytes_limit_u64(max_body_bytes))
         .unwrap_or(false);
-    let allow_oversize_bypass_cache =
-        route.body_oversize == BodyOversizePolicy::BypassCache && route.mode != RouteMode::Replay;
+    let allow_oversize_bypass_cache = route.body_oversize == BodyOversizePolicy::BypassCache
+        && route.mode != RouteMode::Replay
+        && !has_on_request_transform;
     let bypass_request_buffering = request_known_oversize && allow_oversize_bypass_cache;
     if request_known_oversize && !bypass_request_buffering {
         respond!(
@@ -2186,6 +2167,25 @@ async fn proxy_handler(
             "bypassing cache for oversized request body"
         );
 
+        let upstream_uri = match resolve_upstream_uri_for_request(&route, &parts.uri) {
+            Ok(Some(uri)) => uri,
+            Ok(None) => {
+                respond!(
+                    None,
+                    proxy_simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
+                );
+            }
+            Err(err) => {
+                tracing::debug!("failed to build upstream uri: {err}");
+                respond!(
+                    None,
+                    proxy_simple_response(
+                        StatusCode::BAD_GATEWAY,
+                        "failed to build upstream request",
+                    )
+                );
+            }
+        };
         maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
         parts.uri = upstream_uri.clone();
         set_host_header(&mut parts.headers, &upstream_uri);
@@ -2230,6 +2230,28 @@ async fn proxy_handler(
                     "bypassing cache after request body exceeded configured limit mid-stream"
                 );
 
+                let upstream_uri = match resolve_upstream_uri_for_request(&route, &parts.uri) {
+                    Ok(Some(uri)) => uri,
+                    Ok(None) => {
+                        respond!(
+                            None,
+                            proxy_simple_response(
+                                StatusCode::NOT_IMPLEMENTED,
+                                "route has no upstream",
+                            )
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!("failed to build upstream uri: {err}");
+                        respond!(
+                            None,
+                            proxy_simple_response(
+                                StatusCode::BAD_GATEWAY,
+                                "failed to build upstream request",
+                            )
+                        );
+                    }
+                };
                 maybe_wait_for_record_rate_limit(state.as_ref(), &route, &upstream_uri).await;
                 parts.uri = upstream_uri.clone();
                 set_host_header(&mut parts.headers, &upstream_uri);
@@ -2278,6 +2300,56 @@ async fn proxy_handler(
             respond!(
                 None,
                 proxy_simple_response(StatusCode::BAD_REQUEST, "failed to read request body",)
+            );
+        }
+    };
+    #[cfg(feature = "scripting")]
+    let mut body_bytes = body_bytes;
+
+    #[cfg(feature = "scripting")]
+    if let Some(script) = route.transform.on_request.as_ref() {
+        if let Err(err) =
+            apply_on_request_script(&route.route_ref, script, &mut parts, &mut body_bytes)
+        {
+            tracing::debug!("failed to run on_request script: {err}");
+            respond!(
+                None,
+                proxy_simple_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "on_request script failed"
+                )
+            );
+        }
+    }
+
+    #[cfg(not(feature = "scripting"))]
+    if route.transform.on_request.is_some() {
+        tracing::debug!(
+            route = %route.route_ref,
+            "on_request script is configured but scripting support is disabled"
+        );
+        respond!(
+            None,
+            proxy_simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "on_request script configured but this replayproxy build does not include scripting support",
+            )
+        );
+    }
+
+    let upstream_uri = match resolve_upstream_uri_for_request(&route, &parts.uri) {
+        Ok(Some(uri)) => uri,
+        Ok(None) => {
+            respond!(
+                None,
+                proxy_simple_response(StatusCode::NOT_IMPLEMENTED, "route has no upstream",)
+            );
+        }
+        Err(err) => {
+            tracing::debug!("failed to build upstream uri: {err}");
+            respond!(
+                None,
+                proxy_simple_response(StatusCode::BAD_GATEWAY, "failed to build upstream request",)
             );
         }
     };
@@ -2894,6 +2966,16 @@ fn build_upstream_uri(upstream_base: &Uri, original: &Uri) -> anyhow::Result<Uri
     Uri::from_parts(parts).map_err(|err| anyhow::anyhow!("construct upstream uri: {err}"))
 }
 
+fn resolve_upstream_uri_for_request(
+    route: &ProxyRoute,
+    request_uri: &Uri,
+) -> anyhow::Result<Option<Uri>> {
+    if let Some(upstream_base) = route.upstream.as_ref() {
+        return build_upstream_uri(upstream_base, request_uri).map(Some);
+    }
+    Ok(forward_proxy_upstream_uri(request_uri))
+}
+
 fn forward_proxy_upstream_uri(original: &Uri) -> Option<Uri> {
     if !matches!(original.scheme_str(), Some("http" | "https")) {
         return None;
@@ -3104,6 +3186,75 @@ fn set_host_header(headers: &mut hyper::HeaderMap, uri: &Uri) {
     if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
         headers.insert(header::HOST, value);
     }
+}
+
+#[cfg(feature = "scripting")]
+fn apply_on_request_script(
+    route_ref: &str,
+    script: &LoadedScript,
+    parts: &mut hyper::http::request::Parts,
+    body_bytes: &mut Bytes,
+) -> anyhow::Result<()> {
+    let mut request = ScriptRequest::new(
+        parts.method.to_string(),
+        parts.uri.to_string(),
+        script_request_headers_from_http(&parts.headers)?,
+        body_bytes.to_vec(),
+    );
+    run_on_request_script(
+        route_ref,
+        &script.path.display().to_string(),
+        script.source.as_ref(),
+        &mut request,
+    )?;
+
+    parts.method = Method::from_bytes(request.method.as_bytes()).map_err(|err| {
+        anyhow::anyhow!("apply transformed request method for route `{route_ref}`: {err}")
+    })?;
+    parts.uri = request.url.parse::<Uri>().map_err(|err| {
+        anyhow::anyhow!("apply transformed request URL for route `{route_ref}`: {err}")
+    })?;
+    parts.headers = script_request_headers_to_http(request.headers)?;
+    strip_hop_by_hop_headers(&mut parts.headers);
+    let content_length = HeaderValue::from_str(&request.body.len().to_string()).map_err(|err| {
+        anyhow::anyhow!("set transformed request content-length for route `{route_ref}`: {err}")
+    })?;
+    parts.headers.insert(header::CONTENT_LENGTH, content_length);
+    *body_bytes = Bytes::from(request.body);
+    Ok(())
+}
+
+#[cfg(feature = "scripting")]
+fn script_request_headers_from_http(
+    headers: &hyper::HeaderMap,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (name, value) in headers {
+        let value = value.to_str().map_err(|err| {
+            anyhow::anyhow!(
+                "cannot run on_request script with non-UTF-8 value for `{}`: {err}",
+                name.as_str()
+            )
+        })?;
+        out.insert(name.as_str().to_owned(), value.to_owned());
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "scripting")]
+fn script_request_headers_to_http(
+    headers: BTreeMap<String, String>,
+) -> anyhow::Result<hyper::HeaderMap> {
+    let mut out = hyper::HeaderMap::new();
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid transformed header name `{name}`: {err}"))?;
+        let header_value = HeaderValue::from_str(&value).map_err(|err| {
+            anyhow::anyhow!("invalid transformed header value for `{name}`: {err}")
+        })?;
+        out.insert(header_name, header_value);
+    }
+    Ok(out)
 }
 
 fn strip_hop_by_hop_headers(headers: &mut hyper::HeaderMap) {

@@ -24,7 +24,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features --locked
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
         run: cargo test --all-targets --all-features --locked

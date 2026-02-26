@@ -156,7 +156,7 @@ If TLS is enabled but CA paths are missing, startup fails fast with config error
 - `proxy.tls.ca_cert` is required when `proxy.tls.enabled = true`
 - `proxy.tls.ca_key` is required when `proxy.tls.enabled = true`
 
-Use an explicit TLS block and verify files exist/readable:
+Use an explicit TLS block:
 
 ```toml
 [proxy.tls]
@@ -164,6 +164,10 @@ enabled = true
 ca_cert = "~/.replayproxy/ca/cert.pem"
 ca_key = "~/.replayproxy/ca/key.pem"
 ```
+
+When both configured paths end in `cert.pem` and `key.pem` and both files are absent, `serve` auto-generates local CA material at startup using the same secure code path as `replayproxy ca generate`.
+
+For custom file names or partially missing files, generate material explicitly and verify both files exist/readable:
 
 ```bash
 ls -l ~/.replayproxy/ca/cert.pem ~/.replayproxy/ca/key.pem

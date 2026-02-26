@@ -5,7 +5,7 @@ use std::{
     error::Error as StdError,
     fmt::Write as _,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
@@ -277,8 +277,52 @@ fn validate_tls_ca_material(config: &Config) -> anyhow::Result<()> {
         anyhow::anyhow!("`proxy.tls.ca_key` is required when `proxy.tls.enabled = true`")
     })?;
 
+    maybe_autogenerate_tls_ca_material(cert_path, key_path)?;
+
     ca::validate_ca_material(cert_path, key_path)
         .map_err(|err| anyhow::anyhow!("invalid `proxy.tls` CA material: {err}"))
+}
+
+fn maybe_autogenerate_tls_ca_material(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
+    if cert_path.exists() && key_path.exists() {
+        return Ok(());
+    }
+
+    if cert_path.exists() || key_path.exists() {
+        anyhow::bail!(
+            "incomplete `proxy.tls` CA material: expected both {} and {} to exist",
+            cert_path.display(),
+            key_path.display()
+        );
+    }
+
+    let cert_file_name = cert_path.file_name().and_then(|name| name.to_str());
+    let key_file_name = key_path.file_name().and_then(|name| name.to_str());
+    let cert_parent = cert_path.parent();
+    let key_parent = key_path.parent();
+    if cert_file_name == Some(ca::CA_CERT_FILE_NAME)
+        && key_file_name == Some(ca::CA_KEY_FILE_NAME)
+        && cert_parent.is_some()
+        && cert_parent == key_parent
+    {
+        let ca_dir = cert_parent.expect("checked is_some");
+        let generated = ca::generate_ca(ca_dir, false)
+            .map_err(|err| anyhow::anyhow!("auto-generate TLS CA material: {err}"))?;
+        tracing::info!(
+            cert_path = %generated.cert_path.display(),
+            key_path = %generated.key_path.display(),
+            "generated local CA material for proxy TLS startup"
+        );
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "missing `proxy.tls` CA material at {} and {}; run `replayproxy ca generate --ca-dir <dir>` and point both paths to `<dir>/{}` and `<dir>/{}`",
+        cert_path.display(),
+        key_path.display(),
+        ca::CA_CERT_FILE_NAME,
+        ca::CA_KEY_FILE_NAME
+    )
 }
 
 async fn active_session_recordings_total(
@@ -3747,6 +3791,69 @@ upstream = "http://127.0.0.1:1"
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid `path_regex` expression"));
+    }
+
+    #[tokio::test]
+    async fn serve_autogenerates_missing_tls_ca_material_for_default_file_names() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let ca_dir = temp_dir.path().join("ca");
+        let cert_path = ca_dir.join(crate::ca::CA_CERT_FILE_NAME);
+        let key_path = ca_dir.join(crate::ca::CA_KEY_FILE_NAME);
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+"#,
+            cert_path.display(),
+            key_path.display()
+        ))
+        .expect("config should parse");
+
+        let proxy = super::serve(&config)
+            .await
+            .expect("serve should auto-generate CA material");
+        assert!(cert_path.exists(), "cert should be generated");
+        assert!(key_path.exists(), "key should be generated");
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn serve_fails_when_tls_ca_material_is_partially_missing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let ca_dir = temp_dir.path().join("ca");
+        std::fs::create_dir_all(&ca_dir).expect("CA dir should be created");
+        let cert_path = ca_dir.join(crate::ca::CA_CERT_FILE_NAME);
+        let key_path = ca_dir.join(crate::ca::CA_KEY_FILE_NAME);
+        std::fs::write(&cert_path, "not-a-certificate").expect("seed cert file");
+
+        let config = Config::from_toml_str(&format!(
+            r#"
+[proxy]
+listen = "127.0.0.1:0"
+
+[proxy.tls]
+enabled = true
+ca_cert = "{}"
+ca_key = "{}"
+"#,
+            cert_path.display(),
+            key_path.display()
+        ))
+        .expect("config should parse");
+
+        let err = super::serve(&config)
+            .await
+            .expect_err("serve should fail on partial CA material");
+        assert!(
+            err.to_string()
+                .contains("incomplete `proxy.tls` CA material"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
